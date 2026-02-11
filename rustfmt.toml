@@ -1,0 +1,13 @@
+# Rustfmt configuration for S4
+
+edition = "2021"
+max_width = 100
+tab_spaces = 4
+newline_style = "Unix"
+use_small_heuristics = "Default"
+
+# Import formatting (stable features only)
+reorder_imports = true
+
+# Other options (stable features only)
+chain_width = 80

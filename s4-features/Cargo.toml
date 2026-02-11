@@ -1,0 +1,33 @@
+[package]
+name = "s4-features"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Workspace dependencies
+s4-core = { path = "../s4-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+quick-xml = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# IAM dependencies
+argon2 = "0.5"
+jsonwebtoken = "9"
+nanoid = "0.4"
+subtle = "2.5"
+rand = "0.8"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[lints]
+workspace = true

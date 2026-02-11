@@ -1,0 +1,52 @@
+# Rust/Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+.tmp/
+cache/
+*cache*
+
+# Data directories (for local development)
+/data/
+/volumes/
+*.redb
+*.redb.lock
+
+# Coverage and profiling
+*.profraw
+*.profdata
+coverage/
+lcov.info
+tarpaulin-report.html
+
+# Frontend (Next.js)
+frontend/s4-console/.next/
+frontend/s4-console/out/
+frontend/s4-console/node_modules/
+frontend/s4-console/.env*.local
+
+# WARP test files
+scripts/warp-mixed*

@@ -1,0 +1,43 @@
+[package]
+name = "s4-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Workspace dependencies
+s4-core = { path = "../s4-core" }
+s4-features = { path = "../s4-features" }
+tokio = { workspace = true }
+axum = { workspace = true }
+hyper = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+rustls = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+quick-xml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+hmac = "0.12"
+hex = "0.4"
+base64 = "0.22"
+md5 = "0.7"
+async-trait = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+http-body-util = "0.1"
+tempfile = "3"
+
+[lints]
+workspace = true

@@ -1,0 +1,46 @@
+# Build artifacts
+target/
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
+.github/
+
+# Documentation
+*.md
+!README.md
+CLAUDE.md
+AGENTS.md
+docs/
+plans/
+ideas/
+assets/
+
+# Frontend (built separately)
+frontend/
+
+# Scripts (not needed in image)
+scripts/
+add_license.sh
+
+# Development files
+.env
+.env.*
+*.log
+tmp/
+
+# Test data
+test-data/
+*.redb
+*.dat
+volume_*.dat
+rustfmt.toml
+ci-github.yml
+perf_standards.json

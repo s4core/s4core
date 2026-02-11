@@ -1,0 +1,39 @@
+[package]
+name = "s4-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "s4-server"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace dependencies
+s4-core = { path = "../s4-core" }
+s4-api = { path = "../s4-api" }
+s4-features = { path = "../s4-features" }
+tokio = { workspace = true }
+axum = { workspace = true }
+axum-server = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+config = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[lints]
+workspace = true

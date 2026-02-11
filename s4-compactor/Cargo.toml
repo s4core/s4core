@@ -1,0 +1,21 @@
+[package]
+name = "s4-compactor"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Workspace dependencies
+s4-core = { path = "../s4-core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+config = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+
+[lints]
+workspace = true

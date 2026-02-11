@@ -1,0 +1,67 @@
+# S4 Full Stack - Docker Compose Configuration
+#
+# Usage:
+#   Server only:     docker compose up s4-server
+#   With console:    docker compose up
+#   Build & run:     docker compose up --build
+#
+# Environment variables:
+#   S4_ROOT_PASSWORD - Root admin password (required for IAM)
+#   S4_ACCESS_KEY_ID - S3 access key (optional, auto-generated if not set)
+#   S4_SECRET_ACCESS_KEY - S3 secret key (optional, auto-generated if not set)
+
+services:
+  # ============================================
+  # S4 Storage Server
+  # ============================================
+  s4-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9000:9000"
+    environment:
+      - S4_BIND=0.0.0.0:9000
+      - S4_DATA_DIR=/data
+      - S4_ROOT_USERNAME=root
+      - S4_ROOT_PASSWORD=password12345
+      - S4_ACCESS_KEY_ID=my-access-key-one
+      - S4_SECRET_ACCESS_KEY=my-secret-key-one
+      #- S4_JWT_SECRET=
+      #- S4_MAX_UPLOAD_SIZE=5GB
+      #- S4_LIFECYCLE_ENABLED=true
+      #- S4_LIFECYCLE_INTERVAL_HOURS=24
+      #- S4_METRICS_ENABLED=true
+      #- RUST_LOG="s4_api=info,s4_server=info"
+    volumes:
+      - s4-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --server-response --spider http://0.0.0.0:9000/ 2>&1 | grep -q -E 'HTTP/1.1 (200|403)' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # ============================================
+  # S4 Web Console (Admin UI)
+  # ============================================
+  s4-console:
+    build:
+      context: ./frontend/s4-console
+      dockerfile: Dockerfile
+      args:
+      - S4_BACKEND_URL=http://s4-server:9000
+    ports:
+      - "3000:3000"
+    environment:
+      - S4_BACKEND_URL=http://s4-server:9000
+      - NODE_ENV=production
+    depends_on:
+      s4-server:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  s4-data:
+    driver: local

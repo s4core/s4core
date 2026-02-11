@@ -1,0 +1,7 @@
+# Clippy configuration for S4
+
+# Allow some lints that are too strict for our use case
+avoid-breaking-exported-api = false
+
+# Deny warnings by default (enforced in CI)
+# Individual crates can override if needed

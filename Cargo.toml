@@ -1,0 +1,68 @@
+[workspace]
+members = [
+    "s4-core",
+    "s4-api",
+    "s4-features",
+    "s4-compactor",
+    "s4-server",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["S4 Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/org/s4"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+
+# Error handling
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Configuration
+config = "0.14"
+
+# Metrics
+metrics = "0.22"
+metrics-exporter-prometheus = "0.13"
+
+# Hashing
+blake3 = "1.5"
+sha2 = "0.10"
+
+# HTTP/Web
+axum = "0.7"
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+hyper = "1.0"
+rustls = "0.23"
+rustls-pemfile = "2.1"
+tower = { version = "0.4", features = ["util"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "normalize-path"] }
+
+# XML parsing (for S3 compatibility)
+quick-xml = { version = "0.31", features = ["serialize"] }
+
+# Database
+redb = "1.0"
+
+# Utilities
+anyhow = "1.0"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unused = { level = "warn", priority = -1 }
