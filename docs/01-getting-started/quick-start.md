@@ -2,7 +2,7 @@
 
 This guide walks you through basic S4 operations using the AWS CLI.
 
-## 1. Start the Server
+## 1.1 Start the Server
 
 ```bash
 export S4_ACCESS_KEY_ID=myaccesskey
@@ -10,6 +10,18 @@ export S4_SECRET_ACCESS_KEY=mysecretkey
 
 ./target/release/s4-server
 # Server listens on http://127.0.0.1:9000
+```
+
+# 1.2 Start the Server with docker
+
+```bash
+docker run -d \
+  --name s4-server \
+  -p 9000:9000 \
+  -v s4-data:/data \
+  -e S4_ACCESS_KEY_ID=myaccesskey \
+  -e S4_SECRET_ACCESS_KEY=mysecretkey \
+  s4-server:latest
 ```
 
 ## 2. Configure AWS CLI

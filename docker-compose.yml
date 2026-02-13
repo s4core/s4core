@@ -37,7 +37,11 @@ services:
       - s4-data:/data
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "wget --server-response --spider http://0.0.0.0:9000/ 2>&1 | grep -q -E 'HTTP/1.1 (200|403)' || exit 1"]
+      test:
+        [
+          "CMD-SHELL",
+          "wget --server-response --spider http://0.0.0.0:9000/ 2>&1 | grep -q -E 'HTTP/1.1 (200|403)' || exit 1",
+        ]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -47,11 +51,7 @@ services:
   # S4 Web Console (Admin UI)
   # ============================================
   s4-console:
-    build:
-      context: ./frontend/s4-console
-      dockerfile: Dockerfile
-      args:
-      - S4_BACKEND_URL=http://s4-server:9000
+    image: s4core/s4console:latest
     ports:
       - "3000:3000"
     environment:

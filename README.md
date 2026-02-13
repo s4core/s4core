@@ -2,6 +2,17 @@
 
 S4 is a high-performance, S3-compatible object storage server written in Rust. It solves the inode exhaustion problem common with traditional file-based storage systems and provides advanced features like atomic directory operations and content-addressable deduplication.
 
+![Demo environment](assets/screenshot.png)
+
+### 🔐 Demo Access
+
+| Service     | URL                                         | Login         | Password   |
+|-------------|---------------------------------------------|---------------|------------|
+| **S4CORE**  | `http://63.141.251.44:10117`               | `root`        | `password12345` |
+| **S4CONSOLE** | `http://63.141.251.44:24490`             | `root`        | `password12345` |
+
+> ⚠️ **Reset every 10 minutes**
+
 ## Features
 
 - **S3 API Compatible**: Full compatibility with AWS S3 API (AWS CLI, boto3, etc.)
@@ -120,7 +131,7 @@ services:
       - S4_SECRET_ACCESS_KEY=${S4_SECRET_ACCESS_KEY:-}
 
   s4-console:
-    build: ./frontend/s4-console
+    image: s4core/s4console:latest
     ports:
       - "3000:3000"
     environment:
@@ -137,7 +148,7 @@ S4 is configured through environment variables:
 
 | Variable | Description | Default | Example |
 |----------|-------------|---------|---------|
-| `S4_BIND` | S4 BIND host | `127.0.0.1` | `0.0.0.0` |
+| `S4_BIND` | S4 BIND host | `127.0.0.1:9000` | `0.0.0.0:9000` |
 | `S4_ROOT_USERNAME` | Root admin username | `root` | `admin` |
 | `S4_ROOT_PASSWORD` | Root admin password (enables IAM) | None (IAM disabled) | `password12345` |
 | `S4_JWT_SECRET` | Secret key for signing JWT tokens | Auto-generated at startup (dev mode only) | `256-bit-crypto-random-string-like-this-1234567890ABCDEF` |

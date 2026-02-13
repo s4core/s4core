@@ -75,6 +75,29 @@ docker run -d \
   s4-server:latest
 ```
 
+### With TLS
+
+```
+mkdir -p ~/certs && cd ~/certs
+
+openssl req -x509 -nodes -days 3650 -newkey rsa:4096 \
+  -keyout key.pem -out cert.pem \
+  -subj "/C=EN/ST=NY/L=NY/O=MyOrg/CN=s4-server.local"
+```
+
+```bash
+docker run -d \
+  --name s4-server \
+  -p 9000:9000 \
+  -v s4-data:/data \
+  -v /home/user/certs:/certs:ro \
+  -e S4_ACCESS_KEY_ID=myaccesskey \
+  -e S4_SECRET_ACCESS_KEY=mysecretkey \
+  -e S4_TLS_CERT=/certs/cert.pem \
+  -e S4_TLS_KEY=/certs/key.pem \
+  s4-server:latest
+```
+
 ### Docker Compose
 
 The project includes a `docker-compose.yml` that runs S4 server together with the web admin console.

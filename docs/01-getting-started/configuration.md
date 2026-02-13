@@ -4,22 +4,22 @@ S4 is configured through environment variables. All settings have sensible defau
 
 ## Environment Variables
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `S4_BIND` | Bind host address | `127.0.0.1` |
-| `S4_DATA_DIR` | Base directory for storage data | System temp dir |
-| `S4_ACCESS_KEY_ID` | Access key for S3 authentication | Auto-generated dev key |
-| `S4_SECRET_ACCESS_KEY` | Secret key for S3 authentication | Auto-generated dev key |
-| `S4_ROOT_USERNAME` | Root admin username | `root` |
-| `S4_ROOT_PASSWORD` | Root admin password (enables IAM) | None (IAM disabled) |
-| `S4_JWT_SECRET` | Secret key for signing JWT tokens | Auto-generated at startup |
-| `S4_MAX_UPLOAD_SIZE` | Maximum upload size per request | `5GB` |
-| `S4_TLS_CERT` | Path to TLS certificate (PEM) | None (HTTP mode) |
-| `S4_TLS_KEY` | Path to TLS private key (PEM) | None (HTTP mode) |
-| `S4_LIFECYCLE_ENABLED` | Enable lifecycle policy worker | `true` |
-| `S4_LIFECYCLE_INTERVAL_HOURS` | Lifecycle evaluation interval | `24` |
-| `S4_LIFECYCLE_DRY_RUN` | Dry-run mode (log without deleting) | `false` |
-| `S4_METRICS_ENABLED` | Enable Prometheus metrics | `true` |
+| Variable | Description | Default | Example |
+|----------|-------------|---------|---------|
+| `S4_BIND` | Bind host address | `127.0.0.1:9000` | `0.0.0.0:9000`
+| `S4_DATA_DIR` | Base directory for storage data | System temp dir | `/data` |
+| `S4_ACCESS_KEY_ID` | Access key for S3 authentication | Auto-generated dev key | `my-secret-key-id` |
+| `S4_SECRET_ACCESS_KEY` | Secret key for S3 authentication | Auto-generated dev key | `my-access-key` |
+| `S4_ROOT_USERNAME` | Root admin username | `root` | `user12345` |
+| `S4_ROOT_PASSWORD` | Root admin password (enables IAM) | None (IAM disabled) | `password12345` |
+| `S4_JWT_SECRET` | Secret key for signing JWT tokens | Auto-generated at startup | `AHusUYfsuYA18sgAS12937ACSgj1g2kjha` |
+| `S4_MAX_UPLOAD_SIZE` | Maximum upload size per request | `5GB` | `4MB` |
+| `S4_TLS_CERT` | Path to TLS certificate (PEM) | None (HTTP mode) | `/certs/key.pem` |
+| `S4_TLS_KEY` | Path to TLS private key (PEM) | None (HTTP mode) | `/certs/cert.pem` |
+| `S4_LIFECYCLE_ENABLED` | Enable lifecycle policy worker | `true` | `false` |
+| `S4_LIFECYCLE_INTERVAL_HOURS` | Lifecycle evaluation interval | `24` | `48` |
+| `S4_LIFECYCLE_DRY_RUN` | Dry-run mode (log without deleting) | `false` | `true` |
+| `S4_METRICS_ENABLED` | Enable Prometheus metrics | `true` | `false` |
 
 ### Size Format
 
@@ -45,7 +45,7 @@ export S4_DATA_DIR=/tmp/s4-data
 ## Example: Production Setup
 
 ```bash
-export S4_BIND=0.0.0.0
+export S4_BIND=0.0.0.0:9000
 export S4_DATA_DIR=/var/lib/s4
 export S4_ROOT_PASSWORD=your-strong-password
 export S4_JWT_SECRET=your-256-bit-crypto-random-string
