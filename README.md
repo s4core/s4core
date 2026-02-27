@@ -60,27 +60,27 @@ S4 provides official Docker images for easy deployment.
 ```bash
 # Run S4 server (basic)
 docker run -d \
-  --name s4-server \
+  --name s4core \
   -p 9000:9000 \
   -v s4-data:/data \
-  s4-server:latest
+  s4core/s4core:latest
 
 # Run with custom credentials
 docker run -d \
-  --name s4-server \
+  --name s4core \
   -p 9000:9000 \
   -v s4-data:/data \
   -e S4_ACCESS_KEY_ID=myaccesskey \
   -e S4_SECRET_ACCESS_KEY=mysecretkey \
-  s4-server:latest
+  s4core/s4core:latest
 
 # Run with IAM enabled
 docker run -d \
-  --name s4-server \
+  --name s4core \
   -p 9000:9000 \
   -v s4-data:/data \
   -e S4_ROOT_PASSWORD=password12345 \
-  s4-server:latest
+  s4core/s4core:latest
 
 # Build the image locally
 docker build -t s4-server .
@@ -112,7 +112,7 @@ After startup:
 
 ```yaml
 services:
-  s4-server:
+  s4core:
     build: .
     ports:
       - "9000:9000"
@@ -130,7 +130,7 @@ services:
     environment:
       - S4_BACKEND_URL=http://s4-server:9000
     depends_on:
-      - s4-server
+      - s4core
 ```
 
 For web console-only development, see [frontend/README.md](frontend/README.md).
