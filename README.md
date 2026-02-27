@@ -2,16 +2,9 @@
 
 S4 is a high-performance, S3-compatible object storage server written in Rust. It solves the inode exhaustion problem common with traditional file-based storage systems and provides advanced features like atomic directory operations and content-addressable deduplication.
 
-![Demo environment](assets/screenshot.png)
+![Demo](assets/screenshot.png)
 
-### 🔐 Demo Access
-
-| Service     | URL                                         | Login         | Password   |
-|-------------|---------------------------------------------|---------------|------------|
-| **S4CORE**  | `http://63.141.251.44:10117`               | `root`        | `password12345` |
-| **S4CONSOLE** | `http://63.141.251.44:24490`             | `root`        | `password12345` |
-
-> ⚠️ **Reset every 10 minutes**
+> **Demo**: [s4console](http://63.141.251.44:24490) · **Login**: `root` / `password12345` · Resets every 10 min
 
 ## Features
 
