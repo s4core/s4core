@@ -543,7 +543,7 @@ async fn test_object_lock_not_found() {
 }
 
 #[tokio::test]
-async fn test_retention_without_version_id_fails() {
+async fn test_retention_without_version_id_resolves_latest() {
     let (app, _temp_dir) = create_test_app().await;
     let bucket = "lock-test-no-version";
 
@@ -555,7 +555,7 @@ async fn test_retention_without_version_id_fails() {
     // Put an object
     put_object(&app, bucket, "test.txt", "test content").await;
 
-    // Try to set retention WITHOUT version ID - should fail
+    // Set retention WITHOUT version ID - should resolve to latest version
     let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <Retention>
     <Mode>GOVERNANCE</Mode>
@@ -572,8 +572,22 @@ async fn test_retention_without_version_id_fails() {
     let response = app.clone().oneshot(request).await.unwrap();
     assert_eq!(
         response.status(),
-        StatusCode::BAD_REQUEST,
-        "Should require versionId for retention operations"
+        StatusCode::OK,
+        "Should resolve to latest version when versionId is omitted"
+    );
+
+    // Verify retention was set by GET without versionId
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/{}/test.txt?retention", bucket))
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "GET retention without versionId should also resolve to latest version"
     );
 }
 

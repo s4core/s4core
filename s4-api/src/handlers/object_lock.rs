@@ -194,6 +194,32 @@ pub struct ObjectVersionQuery {
     pub version_id: Option<String>,
 }
 
+/// Resolves the version ID for an object.
+///
+/// If `version_id` is provided, uses it directly. Otherwise, resolves the
+/// latest version by calling `head_object` and extracting its `version_id`.
+/// For unversioned objects (where `version_id` is `None`), returns `"null"`
+/// which is the S3-standard sentinel for the current version.
+async fn resolve_version_id(
+    storage: &dyn s4_core::StorageEngine,
+    bucket: &str,
+    key: &str,
+    version_id: Option<String>,
+) -> Result<String, Response> {
+    match version_id {
+        Some(v) => Ok(v),
+        None => {
+            // Resolve latest version from head_object
+            let record = storage
+                .head_object(bucket, key)
+                .await
+                .map_err(|_| S3Error::NoSuchKey.into_response())?;
+            // For versioned objects use their version_id, for unversioned use "null"
+            Ok(record.version_id.unwrap_or_else(|| "null".to_string()))
+        }
+    }
+}
+
 /// Gets the retention configuration for a specific object version.
 ///
 /// S3 API: GET /{bucket}/{key}?retention&versionId=...
@@ -214,13 +240,10 @@ pub async fn get_object_retention(
 
     let storage = state.storage.read().await;
 
-    // Version ID is required
-    let version_id = match query.version_id {
-        Some(v) => v,
-        None => {
-            return S3Error::InvalidRequest("versionId is required for retention".to_string())
-                .into_response()
-        }
+    // Resolve version ID: use provided or fall back to latest version
+    let version_id = match resolve_version_id(&*storage, &bucket, &key, query.version_id).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
 
     // Get object metadata
@@ -289,13 +312,10 @@ pub async fn put_object_retention(
         }
     };
 
-    // Version ID is required
-    let version_id = match query.version_id {
-        Some(v) => v,
-        None => {
-            return S3Error::InvalidRequest("versionId is required for retention".to_string())
-                .into_response()
-        }
+    // Resolve version ID: use provided or fall back to latest version
+    let version_id = match resolve_version_id(&*storage, &bucket, &key, query.version_id).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
 
     // Parse retention XML
@@ -388,13 +408,10 @@ pub async fn get_object_legal_hold(
 
     let storage = state.storage.read().await;
 
-    // Version ID is required
-    let version_id = match query.version_id {
-        Some(v) => v,
-        None => {
-            return S3Error::InvalidRequest("versionId is required for legal hold".to_string())
-                .into_response()
-        }
+    // Resolve version ID: use provided or fall back to latest version
+    let version_id = match resolve_version_id(&*storage, &bucket, &key, query.version_id).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
 
     // Get object metadata
@@ -444,13 +461,10 @@ pub async fn put_object_legal_hold(
         }
     }
 
-    // Version ID is required
-    let version_id = match query.version_id {
-        Some(v) => v,
-        None => {
-            return S3Error::InvalidRequest("versionId is required for legal hold".to_string())
-                .into_response()
-        }
+    // Resolve version ID: use provided or fall back to latest version
+    let version_id = match resolve_version_id(&*storage, &bucket, &key, query.version_id).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
 
     // Parse legal hold XML
