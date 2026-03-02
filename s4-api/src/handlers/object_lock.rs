@@ -22,13 +22,14 @@
 use axum::{
     body::{Body, Bytes},
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use s4_core::{StorageEngine, VersioningStatus};
 use s4_features::object_lock::{
     legal_hold_to_xml, object_lock_to_xml, parse_legal_hold_xml, parse_object_lock_xml,
-    parse_retention_xml, retention_to_xml, LegalHoldStatus, ObjectLockConfiguration, RetentionMode,
+    parse_retention_xml_optional, retention_to_xml, LegalHoldStatus, ObjectLockConfiguration,
+    RetentionMode,
 };
 use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
@@ -294,6 +295,7 @@ pub async fn put_object_retention(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
     Query(query): Query<ObjectVersionQuery>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
     info!(
@@ -301,6 +303,7 @@ pub async fn put_object_retention(
         bucket, key, query.version_id
     );
 
+    let bypass_governance = is_bypass_governance(&headers);
     let storage = state.storage.read().await;
 
     // Validate Object Lock is enabled on bucket
@@ -318,9 +321,9 @@ pub async fn put_object_retention(
         Err(resp) => return resp,
     };
 
-    // Parse retention XML
+    // Parse retention XML (supports empty body for clearing retention)
     let xml = String::from_utf8_lossy(&body);
-    let retention = match parse_retention_xml(&xml) {
+    let retention = match parse_retention_xml_optional(&xml) {
         Ok(r) => r,
         Err(e) => {
             error!("Failed to parse retention XML: {:?}", e);
@@ -328,55 +331,70 @@ pub async fn put_object_retention(
         }
     };
 
-    // Validate retain-until-date is in future
-    let retain_until = match iso8601_to_timestamp(&retention.retain_until_date) {
-        Ok(ts) => ts,
-        Err(e) => {
-            error!("Invalid retain-until-date: {:?}", e);
-            return S3Error::InvalidRequest(format!("Invalid date format: {}", e)).into_response();
-        }
-    };
-
-    let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
-    if retain_until <= now {
-        return S3Error::InvalidRequest("Retain until date must be in future".to_string())
-            .into_response();
-    }
-
     // Get existing object version
     let mut record = match storage.head_object_version(&bucket, &key, &version_id).await {
         Ok(r) => r,
         Err(_) => return S3Error::NoSuchKey.into_response(),
     };
 
-    // CRITICAL SAFETY CHECK (Phase 3):
-    // Block ALL changes to COMPLIANCE mode retention
+    // Check existing retention mode for permission
     if let Some(existing_mode) = record.retention_mode {
         if existing_mode == RetentionMode::COMPLIANCE {
             warn!(
                 "Attempt to modify COMPLIANCE retention on {}/{} version {}",
                 bucket, key, version_id
             );
-            return S3Error::InvalidRequest(
-                "Cannot modify COMPLIANCE mode retention in Phase 3".to_string(),
-            )
-            .into_response();
+            return S3Error::AccessDenied.into_response();
+        }
+        // GOVERNANCE mode requires bypass header to modify/clear
+        if existing_mode == RetentionMode::GOVERNANCE && !bypass_governance {
+            warn!(
+                "Attempt to modify GOVERNANCE retention without bypass on {}/{} version {}",
+                bucket, key, version_id
+            );
+            return S3Error::AccessDenied.into_response();
         }
     }
 
-    // Update retention
-    record.retention_mode = Some(retention.mode);
-    record.retain_until_timestamp = Some(retain_until);
+    match retention {
+        None => {
+            // Clear retention
+            record.retention_mode = None;
+            record.retain_until_timestamp = None;
+            info!(
+                "Clearing retention for {}/{} version {}",
+                bucket, key, version_id
+            );
+        }
+        Some(ret) => {
+            // Validate retain-until-date is in future
+            let retain_until = match iso8601_to_timestamp(&ret.retain_until_date) {
+                Ok(ts) => ts,
+                Err(e) => {
+                    error!("Invalid retain-until-date: {:?}", e);
+                    return S3Error::InvalidRequest(format!("Invalid date format: {}", e))
+                        .into_response();
+                }
+            };
+
+            let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+            if retain_until <= now {
+                return S3Error::InvalidRequest("Retain until date must be in future".to_string())
+                    .into_response();
+            }
+
+            record.retention_mode = Some(ret.mode);
+            record.retain_until_timestamp = Some(retain_until);
+            info!(
+                "Setting retention for {}/{} version {}: mode={:?}, until={}",
+                bucket, key, version_id, ret.mode, ret.retain_until_date
+            );
+        }
+    }
 
     // Update metadata in storage
     match storage.update_object_metadata(&bucket, &key, &version_id, record).await {
-        Ok(_) => {
-            info!(
-                "Retention set for {}/{} version {}: mode={:?}, until={}",
-                bucket, key, version_id, retention.mode, retention.retain_until_date
-            );
-            StatusCode::OK.into_response()
-        }
+        Ok(_) => StatusCode::OK.into_response(),
         Err(e) => {
             error!("Failed to update object retention: {:?}", e);
             S3Error::InternalError(format!("Failed to update object retention: {}", e))
@@ -506,6 +524,15 @@ pub async fn put_object_legal_hold(
 // Helper Functions
 // ============================================================================
 
+/// Checks if the `x-amz-bypass-governance-retention` header is set to "true".
+pub fn is_bypass_governance(headers: &HeaderMap) -> bool {
+    headers
+        .get("x-amz-bypass-governance-retention")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 /// Gets the Object Lock configuration for a bucket (internal helper).
 ///
 /// Returns `None` if not configured.
@@ -567,4 +594,46 @@ fn iso8601_to_timestamp(date_str: &str) -> Result<u64, String> {
     }
 
     Ok(timestamp_secs as u64 * 1_000_000_000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_bypass_governance_true() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-bypass-governance-retention", "true".parse().unwrap());
+        assert!(is_bypass_governance(&headers));
+    }
+
+    #[test]
+    fn test_is_bypass_governance_true_mixed_case() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-bypass-governance-retention", "True".parse().unwrap());
+        assert!(is_bypass_governance(&headers));
+    }
+
+    #[test]
+    fn test_is_bypass_governance_false() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-amz-bypass-governance-retention",
+            "false".parse().unwrap(),
+        );
+        assert!(!is_bypass_governance(&headers));
+    }
+
+    #[test]
+    fn test_is_bypass_governance_missing() {
+        let headers = HeaderMap::new();
+        assert!(!is_bypass_governance(&headers));
+    }
+
+    #[test]
+    fn test_is_bypass_governance_invalid_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-bypass-governance-retention", "yes".parse().unwrap());
+        assert!(!is_bypass_governance(&headers));
+    }
 }

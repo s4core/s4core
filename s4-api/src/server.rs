@@ -517,7 +517,7 @@ async fn put_object_router(
         let version_query = handlers::object_lock::ObjectVersionQuery {
             version_id: params.version_id,
         };
-        handlers::put_object_retention(state, path, Query(version_query), body)
+        handlers::put_object_retention(state, path, Query(version_query), headers, body)
             .await
             .into_response()
     } else if params.legal_hold.is_some() {
@@ -537,6 +537,9 @@ async fn put_object_router(
         handlers::upload_part(state, path, Query(query), headers, body)
             .await
             .into_response()
+    } else if headers.get("x-amz-copy-source").is_some() {
+        // CopyObject
+        handlers::copy_object(state, path, headers).await.into_response()
     } else {
         // Default: PutObject
         handlers::put_object(state, path, headers, body).await.into_response()
@@ -548,6 +551,7 @@ async fn delete_object_router(
     state: State<AppState>,
     path: Path<(String, String)>,
     user: Option<Extension<User>>,
+    headers: HeaderMap,
     Query(params): Query<ObjectQueryParams>,
 ) -> axum::response::Response {
     // Check write permission (all DELETE object operations require write)
@@ -567,10 +571,13 @@ async fn delete_object_router(
             .into_response()
     } else {
         // Pass version_id to delete_object for versioning support
+        let bypass_governance = handlers::object_lock::is_bypass_governance(&headers);
         let version_query = handlers::ObjectVersionQuery {
             version_id: params.version_id,
         };
-        handlers::delete_object(state, path, Query(version_query)).await.into_response()
+        handlers::delete_object(state, path, Query(version_query), bypass_governance)
+            .await
+            .into_response()
     }
 }
 

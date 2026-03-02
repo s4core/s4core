@@ -211,6 +211,59 @@ pub fn parse_retention_xml(xml: &str) -> Result<ObjectRetention, String> {
     })
 }
 
+/// Parses object retention from S3-compatible XML, allowing empty retention.
+///
+/// Returns `Ok(None)` for empty `<Retention/>` or `<Retention></Retention>` (clear retention).
+/// Returns `Ok(Some(retention))` when both Mode and RetainUntilDate are present.
+/// Returns `Err` if only one of Mode/RetainUntilDate is present or XML is malformed.
+pub fn parse_retention_xml_optional(xml: &str) -> Result<Option<ObjectRetention>, String> {
+    let mut reader = Reader::from_str(xml);
+    reader.trim_text(true);
+
+    let mut current_element = String::new();
+    let mut buf = Vec::new();
+
+    let mut mode: Option<RetentionMode> = None;
+    let mut retain_until_date: Option<String> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
+                current_element = String::from_utf8_lossy(e.name().as_ref()).to_string();
+            }
+            Ok(Event::Text(e)) => {
+                let text = e.unescape().map_err(|_| "Invalid XML escape sequence")?.to_string();
+
+                match current_element.as_str() {
+                    "Mode" => {
+                        mode = RetentionMode::parse_str(&text);
+                        if mode.is_none() {
+                            return Err(format!("Invalid retention mode: {}", text));
+                        }
+                    }
+                    "RetainUntilDate" => {
+                        retain_until_date = Some(text);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return Err("Invalid XML".to_string()),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    match (mode, retain_until_date) {
+        (None, None) => Ok(None), // Empty retention = clear
+        (Some(m), Some(d)) => Ok(Some(ObjectRetention {
+            mode: m,
+            retain_until_date: d,
+        })),
+        _ => Err("Retention must have both Mode and RetainUntilDate, or neither".to_string()),
+    }
+}
+
 /// Generates S3-compatible XML for object retention.
 pub fn retention_to_xml(retention: &ObjectRetention) -> String {
     format!(
@@ -426,6 +479,36 @@ mod tests {
         let xml = r#"<Retention><Mode>GOVERNANCE</Mode></Retention>"#;
 
         assert!(parse_retention_xml(xml).is_err());
+    }
+
+    #[test]
+    fn test_parse_retention_xml_optional_empty() {
+        let xml = r#"<Retention></Retention>"#;
+        let result = parse_retention_xml_optional(xml).unwrap();
+        assert!(result.is_none());
+
+        let xml2 = r#"<Retention/>"#;
+        let result2 = parse_retention_xml_optional(xml2).unwrap();
+        assert!(result2.is_none());
+    }
+
+    #[test]
+    fn test_parse_retention_xml_optional_with_values() {
+        let xml = r#"<Retention>
+  <Mode>GOVERNANCE</Mode>
+  <RetainUntilDate>2026-12-31T23:59:59Z</RetainUntilDate>
+</Retention>"#;
+        let result = parse_retention_xml_optional(xml).unwrap();
+        assert!(result.is_some());
+        let retention = result.unwrap();
+        assert_eq!(retention.mode, RetentionMode::GOVERNANCE);
+        assert_eq!(retention.retain_until_date, "2026-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn test_parse_retention_xml_optional_partial() {
+        let xml = r#"<Retention><Mode>GOVERNANCE</Mode></Retention>"#;
+        assert!(parse_retention_xml_optional(xml).is_err());
     }
 
     #[test]

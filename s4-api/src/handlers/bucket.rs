@@ -35,9 +35,10 @@ use serde::Deserialize;
 use tracing::{debug, error, info};
 
 use crate::handlers::get_bucket_versioning_status;
+use crate::handlers::object_lock::is_bypass_governance;
 use crate::s3::{errors::S3Error, xml};
 use crate::server::AppState;
-use s4_features::object_lock::{object_lock_to_xml, ObjectLockConfiguration};
+use s4_features::object_lock::{object_lock_to_xml, ObjectLockConfiguration, RetentionMode};
 
 /// Query parameters for ListObjects (v1).
 #[derive(Debug, Deserialize, Default)]
@@ -538,6 +539,8 @@ pub async fn delete_objects(
         return S3Error::NoSuchBucket.into_response();
     }
 
+    let bypass_governance = is_bypass_governance(&headers);
+
     let mut result = DeleteObjectsResult {
         deleted: Vec::new(),
         errors: Vec::new(),
@@ -551,6 +554,7 @@ pub async fn delete_objects(
             &obj.key,
             obj.version_id.as_deref(),
             versioning_status,
+            bypass_governance,
         )
         .await
         {
@@ -575,9 +579,12 @@ async fn delete_single_object(
     key: &str,
     version_id: Option<&str>,
     versioning_status: s4_core::VersioningStatus,
+    bypass_governance: bool,
 ) -> Result<DeletedObject, DeleteError> {
     // Check Object Lock
-    if let Err(lock_error) = check_object_locks(storage, bucket, key, version_id).await {
+    if let Err(lock_error) =
+        check_object_locks(storage, bucket, key, version_id, bypass_governance).await
+    {
         return Err(DeleteError {
             key: key.to_string(),
             version_id: version_id.map(|s| s.to_string()),
@@ -631,6 +638,7 @@ async fn check_object_locks(
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
+    bypass_governance: bool,
 ) -> Result<(), String> {
     let record = if let Some(vid) = version_id {
         storage.head_object_version(bucket, key, vid).await
@@ -649,8 +657,7 @@ async fn check_object_locks(
         return Err("Object has legal hold enabled".to_string());
     }
 
-    if let (Some(_mode), Some(retain_until)) =
-        (record.retention_mode, record.retain_until_timestamp)
+    if let (Some(mode), Some(retain_until)) = (record.retention_mode, record.retain_until_timestamp)
     {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -658,10 +665,17 @@ async fn check_object_locks(
             .as_nanos() as u64;
 
         if now < retain_until {
-            return Err(format!(
-                "Object retention period active until {}",
-                retain_until
-            ));
+            // GOVERNANCE mode can be bypassed with the header
+            let blocked = match mode {
+                RetentionMode::GOVERNANCE => !bypass_governance,
+                RetentionMode::COMPLIANCE => true,
+            };
+            if blocked {
+                return Err(format!(
+                    "Object retention period active until {}",
+                    retain_until
+                ));
+            }
         }
     }
 

@@ -181,6 +181,149 @@ pub async fn put_object(
     }
 }
 
+/// Copies an object within or between buckets.
+///
+/// S3 API: PUT /{bucket}/{key} with `x-amz-copy-source` header
+///
+/// # Headers
+///
+/// - `x-amz-copy-source`: Source object in the form `bucket/key` or `/bucket/key`
+/// - `x-amz-metadata-directive`: `COPY` (default) or `REPLACE`
+///
+/// # Response
+///
+/// - 200 OK with CopyObjectResult XML
+/// - 404 Not Found if source object doesn't exist
+pub async fn copy_object(
+    State(state): State<AppState>,
+    Path((bucket, key)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Parse x-amz-copy-source header
+    let copy_source = match headers.get("x-amz-copy-source") {
+        Some(v) => v.to_str().unwrap_or(""),
+        None => {
+            return S3Error::InvalidRequest("Missing x-amz-copy-source header".to_string())
+                .into_response()
+        }
+    };
+
+    // URL-decode and strip leading slash
+    let copy_source_decoded = simple_url_decode(copy_source);
+    let copy_source_str = copy_source_decoded.trim_start_matches('/');
+
+    let (src_bucket, src_key): (String, String) = match copy_source_str.split_once('/') {
+        Some((b, k)) => (b.to_string(), k.to_string()),
+        None => {
+            return S3Error::InvalidRequest("Invalid x-amz-copy-source format".to_string())
+                .into_response()
+        }
+    };
+
+    info!(
+        "CopyObject: src_bucket={}, src_key={} -> dst_bucket={}, dst_key={}",
+        &src_bucket, &src_key, &bucket, &key
+    );
+
+    let storage = state.storage.read().await;
+
+    // Check destination bucket exists
+    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
+    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
+        return S3Error::NoSuchBucket.into_response();
+    }
+
+    // Get the source object
+    let (src_data, src_record) = match storage.get_object(&src_bucket, &src_key).await {
+        Ok(data) => data,
+        Err(_) => return S3Error::NoSuchKey.into_response(),
+    };
+
+    // Determine metadata: COPY (default) preserves source metadata, REPLACE uses request headers
+    let metadata_directive = headers
+        .get("x-amz-metadata-directive")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("COPY");
+
+    let (content_type, metadata) = if metadata_directive.eq_ignore_ascii_case("REPLACE") {
+        let ct = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let mut meta = HashMap::new();
+        for (name, value) in headers.iter() {
+            let name_str = name.as_str().to_lowercase();
+            if name_str.starts_with("x-amz-meta-") {
+                if let Ok(v) = value.to_str() {
+                    let meta_key = name_str.strip_prefix("x-amz-meta-").unwrap().to_string();
+                    meta.insert(meta_key, v.to_string());
+                }
+            }
+        }
+        (ct, meta)
+    } else {
+        (src_record.content_type.clone(), src_record.metadata.clone())
+    };
+
+    // Get versioning status for destination bucket
+    let versioning_status = get_bucket_versioning_status(&state, &bucket).await;
+
+    // Get bucket Object Lock configuration for default retention
+    let default_retention =
+        if let Some(lock_config) = get_object_lock_config_internal(&*storage, &bucket).await {
+            if lock_config.object_lock_enabled {
+                lock_config.default_retention
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+    // Store the copy
+    match storage
+        .put_object_with_retention(
+            &bucket,
+            &key,
+            &src_data,
+            &content_type,
+            &metadata,
+            versioning_status,
+            default_retention,
+        )
+        .await
+    {
+        Ok((etag, version_id)) => {
+            info!(
+                "Object copied: src={}/{} -> dst={}/{}, etag={}, version_id={:?}",
+                &src_bucket, &src_key, &bucket, &key, &etag, &version_id
+            );
+
+            let last_modified = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+            let xml = crate::s3::xml::copy_object_response(&etag, &last_modified);
+
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/xml");
+
+            if let Some(vid) = version_id {
+                builder = builder.header("x-amz-version-id", vid);
+            }
+
+            builder.body(Body::from(xml)).unwrap()
+        }
+        Err(e) => {
+            error!("Failed to copy object: {:?}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to copy object: {}", e),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Downloads an object from a bucket.
 ///
 /// S3 API: GET /{bucket}/{key}[?versionId=...]
@@ -337,6 +480,7 @@ pub async fn delete_object(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
     Query(query): Query<ObjectVersionQuery>,
+    bypass_governance: bool,
 ) -> impl IntoResponse {
     info!(
         "DeleteObject: bucket={}, key={}, version_id={:?}",
@@ -370,7 +514,7 @@ pub async fn delete_object(
                 }
 
                 // Check retention period
-                if let (Some(_mode), Some(retain_until)) =
+                if let (Some(mode), Some(retain_until)) =
                     (record.retention_mode, record.retain_until_timestamp)
                 {
                     let now = std::time::SystemTime::now()
@@ -379,11 +523,20 @@ pub async fn delete_object(
                         .as_nanos() as u64;
 
                     if now < retain_until {
-                        error!(
-                            "Cannot delete {}/{} version {}: retention until {}",
-                            bucket, key, version_id, retain_until
-                        );
-                        return S3Error::AccessDenied.into_response();
+                        // GOVERNANCE mode can be bypassed with the header
+                        let blocked = match mode {
+                            s4_features::object_lock::RetentionMode::GOVERNANCE => {
+                                !bypass_governance
+                            }
+                            s4_features::object_lock::RetentionMode::COMPLIANCE => true,
+                        };
+                        if blocked {
+                            error!(
+                                "Cannot delete {}/{} version {}: retention until {}",
+                                bucket, key, version_id, retain_until
+                            );
+                            return S3Error::AccessDenied.into_response();
+                        }
                     }
                 }
             }
@@ -415,7 +568,7 @@ pub async fn delete_object(
                 }
 
                 // Check retention period
-                if let (Some(_mode), Some(retain_until)) =
+                if let (Some(mode), Some(retain_until)) =
                     (record.retention_mode, record.retain_until_timestamp)
                 {
                     let now = std::time::SystemTime::now()
@@ -424,11 +577,20 @@ pub async fn delete_object(
                         .as_nanos() as u64;
 
                     if now < retain_until {
-                        error!(
-                            "Cannot delete {}/{}: retention until {}",
-                            bucket, key, retain_until
-                        );
-                        return S3Error::AccessDenied.into_response();
+                        // GOVERNANCE mode can be bypassed with the header
+                        let blocked = match mode {
+                            s4_features::object_lock::RetentionMode::GOVERNANCE => {
+                                !bypass_governance
+                            }
+                            s4_features::object_lock::RetentionMode::COMPLIANCE => true,
+                        };
+                        if blocked {
+                            error!(
+                                "Cannot delete {}/{}: retention until {}",
+                                bucket, key, retain_until
+                            );
+                            return S3Error::AccessDenied.into_response();
+                        }
                     }
                 }
             }
@@ -692,6 +854,31 @@ pub async fn get_object_tagging(
         .header(header::CONTENT_TYPE, "application/xml")
         .body(Body::from(xml))
         .unwrap()
+}
+
+/// Simple URL percent-decoding for x-amz-copy-source header values.
+fn simple_url_decode(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if hex.len() == 2 {
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    result.push(byte as char);
+                    continue;
+                }
+            }
+            result.push('%');
+            result.push_str(&hex);
+        } else if ch == '+' {
+            result.push(' ');
+        } else {
+            result.push(ch);
+        }
+    }
+    result
 }
 
 #[cfg(test)]

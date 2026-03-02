@@ -1,3 +1,10 @@
+# v0.0.1-alpha-20
+
+- Support x-amz-bypass-governance-retention and retention clearing
+- Add CopyObject (PUT with x-amz-copy-source) support
+- Implement server-side object copy with COPY/REPLACE metadata directives, versioning, and Object Lock default retention.
+- Route requests with x-amz-copy-source header to the new handler
+
 # Changelog
 
 All notable changes to S4 will be documented in this file.

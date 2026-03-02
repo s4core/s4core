@@ -221,6 +221,80 @@ async fn delete_object(
     response.status()
 }
 
+/// Deletes an object with the x-amz-bypass-governance-retention header.
+async fn delete_object_with_bypass(
+    app: &axum::Router,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> StatusCode {
+    let request = Request::builder()
+        .method(Method::DELETE)
+        .uri(format!("/{}/{}?versionId={}", bucket, key, version_id))
+        .header("x-amz-bypass-governance-retention", "true")
+        .body(Body::empty())
+        .unwrap();
+
+    let response = app.clone().oneshot(request).await.unwrap();
+    response.status()
+}
+
+/// Sets retention with optional bypass governance header.
+async fn set_retention_with_bypass(
+    app: &axum::Router,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    body_xml: &str,
+    bypass: bool,
+) -> StatusCode {
+    let mut builder = Request::builder()
+        .method(Method::PUT)
+        .uri(format!(
+            "/{}/{}?retention&versionId={}",
+            bucket, key, version_id
+        ))
+        .header(header::CONTENT_TYPE, "application/xml");
+
+    if bypass {
+        builder = builder.header("x-amz-bypass-governance-retention", "true");
+    }
+
+    let request = builder.body(Body::from(body_xml.to_string())).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    response.status()
+}
+
+/// Batch-deletes objects with optional bypass governance header.
+async fn delete_objects_batch(
+    app: &axum::Router,
+    bucket: &str,
+    objects_xml: &str,
+    bypass: bool,
+) -> (StatusCode, String) {
+    let body_bytes = objects_xml.as_bytes();
+    let digest = md5::compute(body_bytes);
+    let content_md5 =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest.as_ref());
+
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/{}?delete", bucket))
+        .header(header::CONTENT_TYPE, "application/xml")
+        .header("content-md5", content_md5);
+
+    if bypass {
+        builder = builder.header("x-amz-bypass-governance-retention", "true");
+    }
+
+    let request = builder.body(Body::from(objects_xml.to_string())).unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let body_str = String::from_utf8(body_bytes.to_vec()).unwrap();
+    (status, body_str)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -360,8 +434,8 @@ async fn test_cannot_modify_compliance_retention() {
     .await;
     assert_eq!(
         modify_status,
-        StatusCode::BAD_REQUEST,
-        "Should deny modification of COMPLIANCE retention in Phase 3"
+        StatusCode::FORBIDDEN,
+        "Should deny modification of COMPLIANCE retention (AccessDenied)"
     );
 }
 
@@ -636,5 +710,271 @@ async fn test_combined_retention_and_legal_hold() {
         delete_status2,
         StatusCode::FORBIDDEN,
         "Should deny deletion when retention still active"
+    );
+}
+
+// ============================================================================
+// Bypass Governance Retention Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_bypass_governance_delete() {
+    let (app, _temp_dir) = create_test_app().await;
+    let bucket = "lock-test-bypass-del";
+
+    // Setup
+    create_bucket(&app, bucket).await;
+    enable_versioning(&app, bucket).await;
+    enable_object_lock(&app, bucket, None).await;
+
+    // Put an object and set GOVERNANCE retention
+    let version_id = put_object(&app, bucket, "gov.txt", "test content").await;
+    let future_date = chrono::Utc::now() + chrono::Duration::days(1);
+    let retain_until = future_date.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let status = set_retention(
+        &app,
+        bucket,
+        "gov.txt",
+        &version_id,
+        "GOVERNANCE",
+        &retain_until,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Delete WITHOUT bypass header — should fail
+    let del_no_bypass = delete_object(&app, bucket, "gov.txt", &version_id).await;
+    assert_eq!(
+        del_no_bypass,
+        StatusCode::FORBIDDEN,
+        "GOVERNANCE delete without bypass should be denied"
+    );
+
+    // Delete WITH bypass header — should succeed
+    let del_bypass = delete_object_with_bypass(&app, bucket, "gov.txt", &version_id).await;
+    assert_eq!(
+        del_bypass,
+        StatusCode::NO_CONTENT,
+        "GOVERNANCE delete with bypass should succeed"
+    );
+}
+
+#[tokio::test]
+async fn test_bypass_governance_delete_does_not_bypass_compliance() {
+    let (app, _temp_dir) = create_test_app().await;
+    let bucket = "lock-test-bypass-compl-del";
+
+    // Setup
+    create_bucket(&app, bucket).await;
+    enable_versioning(&app, bucket).await;
+    enable_object_lock(&app, bucket, None).await;
+
+    // Put an object and set COMPLIANCE retention
+    let version_id = put_object(&app, bucket, "compl.txt", "test content").await;
+    let future_date = chrono::Utc::now() + chrono::Duration::days(1);
+    let retain_until = future_date.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let status = set_retention(
+        &app,
+        bucket,
+        "compl.txt",
+        &version_id,
+        "COMPLIANCE",
+        &retain_until,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Delete WITH bypass header — should STILL fail for COMPLIANCE
+    let del_bypass = delete_object_with_bypass(&app, bucket, "compl.txt", &version_id).await;
+    assert_eq!(
+        del_bypass,
+        StatusCode::FORBIDDEN,
+        "COMPLIANCE delete should be denied even with bypass header"
+    );
+}
+
+#[tokio::test]
+async fn test_bypass_governance_modify_retention() {
+    let (app, _temp_dir) = create_test_app().await;
+    let bucket = "lock-test-bypass-modify";
+
+    // Setup
+    create_bucket(&app, bucket).await;
+    enable_versioning(&app, bucket).await;
+    enable_object_lock(&app, bucket, None).await;
+
+    // Put an object and set GOVERNANCE retention
+    let version_id = put_object(&app, bucket, "gov.txt", "test content").await;
+    let future_date = chrono::Utc::now() + chrono::Duration::days(7);
+    let retain_until = future_date.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let status = set_retention(
+        &app,
+        bucket,
+        "gov.txt",
+        &version_id,
+        "GOVERNANCE",
+        &retain_until,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Modify WITHOUT bypass — should fail (403)
+    let new_date = chrono::Utc::now() + chrono::Duration::days(3);
+    let new_retain = new_date.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let modify_xml = format!(
+        r#"<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>{}</RetainUntilDate></Retention>"#,
+        new_retain
+    );
+    let status_no_bypass =
+        set_retention_with_bypass(&app, bucket, "gov.txt", &version_id, &modify_xml, false).await;
+    assert_eq!(
+        status_no_bypass,
+        StatusCode::FORBIDDEN,
+        "Modifying GOVERNANCE retention without bypass should be denied"
+    );
+
+    // Modify WITH bypass — should succeed
+    let status_bypass =
+        set_retention_with_bypass(&app, bucket, "gov.txt", &version_id, &modify_xml, true).await;
+    assert_eq!(
+        status_bypass,
+        StatusCode::OK,
+        "Modifying GOVERNANCE retention with bypass should succeed"
+    );
+}
+
+#[tokio::test]
+async fn test_bypass_governance_clear_retention() {
+    let (app, _temp_dir) = create_test_app().await;
+    let bucket = "lock-test-bypass-clear";
+
+    // Setup
+    create_bucket(&app, bucket).await;
+    enable_versioning(&app, bucket).await;
+    enable_object_lock(&app, bucket, None).await;
+
+    // Put an object and set GOVERNANCE retention
+    let version_id = put_object(&app, bucket, "gov.txt", "test content").await;
+    let future_date = chrono::Utc::now() + chrono::Duration::days(7);
+    let retain_until = future_date.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let status = set_retention(
+        &app,
+        bucket,
+        "gov.txt",
+        &version_id,
+        "GOVERNANCE",
+        &retain_until,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Clear retention with empty body + bypass header
+    let empty_xml = "<Retention></Retention>";
+    let clear_status =
+        set_retention_with_bypass(&app, bucket, "gov.txt", &version_id, empty_xml, true).await;
+    assert_eq!(
+        clear_status,
+        StatusCode::OK,
+        "Clearing GOVERNANCE retention with bypass should succeed"
+    );
+
+    // Now delete should succeed (no retention)
+    let del_status = delete_object(&app, bucket, "gov.txt", &version_id).await;
+    assert_eq!(
+        del_status,
+        StatusCode::NO_CONTENT,
+        "Delete should succeed after retention is cleared"
+    );
+}
+
+#[tokio::test]
+async fn test_bypass_governance_clear_compliance_denied() {
+    let (app, _temp_dir) = create_test_app().await;
+    let bucket = "lock-test-bypass-clear-compl";
+
+    // Setup
+    create_bucket(&app, bucket).await;
+    enable_versioning(&app, bucket).await;
+    enable_object_lock(&app, bucket, None).await;
+
+    // Put an object and set COMPLIANCE retention
+    let version_id = put_object(&app, bucket, "compl.txt", "test content").await;
+    let future_date = chrono::Utc::now() + chrono::Duration::days(7);
+    let retain_until = future_date.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    let status = set_retention(
+        &app,
+        bucket,
+        "compl.txt",
+        &version_id,
+        "COMPLIANCE",
+        &retain_until,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Clear with bypass — should STILL fail for COMPLIANCE
+    let empty_xml = "<Retention></Retention>";
+    let clear_status =
+        set_retention_with_bypass(&app, bucket, "compl.txt", &version_id, empty_xml, true).await;
+    assert_eq!(
+        clear_status,
+        StatusCode::FORBIDDEN,
+        "Clearing COMPLIANCE retention should be denied even with bypass"
+    );
+}
+
+#[tokio::test]
+async fn test_bypass_governance_batch_delete() {
+    let (app, _temp_dir) = create_test_app().await;
+    let bucket = "lock-test-bypass-batch";
+
+    // Setup
+    create_bucket(&app, bucket).await;
+    enable_versioning(&app, bucket).await;
+    enable_object_lock(&app, bucket, None).await;
+
+    // Put objects and set GOVERNANCE retention on both
+    let v1 = put_object(&app, bucket, "a.txt", "content a").await;
+    let v2 = put_object(&app, bucket, "b.txt", "content b").await;
+    let future_date = chrono::Utc::now() + chrono::Duration::days(1);
+    let retain_until = future_date.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+    set_retention(&app, bucket, "a.txt", &v1, "GOVERNANCE", &retain_until).await;
+    set_retention(&app, bucket, "b.txt", &v2, "GOVERNANCE", &retain_until).await;
+
+    let delete_xml = format!(
+        r#"<Delete>
+  <Object><Key>a.txt</Key><VersionId>{}</VersionId></Object>
+  <Object><Key>b.txt</Key><VersionId>{}</VersionId></Object>
+  <Quiet>false</Quiet>
+</Delete>"#,
+        v1, v2
+    );
+
+    // Batch delete WITHOUT bypass — both should fail
+    let (status, body) = delete_objects_batch(&app, bucket, &delete_xml, false).await;
+    assert_eq!(status, StatusCode::OK, "Batch delete always returns 200");
+    assert!(
+        body.contains("<Error>"),
+        "Should have errors for locked objects: {}",
+        body
+    );
+    assert!(
+        body.contains("AccessDenied"),
+        "Errors should be AccessDenied: {}",
+        body
+    );
+
+    // Batch delete WITH bypass — both should succeed
+    let (status2, body2) = delete_objects_batch(&app, bucket, &delete_xml, true).await;
+    assert_eq!(status2, StatusCode::OK);
+    assert!(
+        body2.contains("<Deleted>"),
+        "Should have deletions with bypass: {}",
+        body2
+    );
+    assert!(
+        !body2.contains("<Error>"),
+        "Should have no errors with bypass: {}",
+        body2
     );
 }

@@ -44,7 +44,8 @@ pub use multipart::{
     abort_multipart_upload, complete_multipart_upload, create_multipart_upload, upload_part,
 };
 pub use object::{
-    delete_object, get_object, get_object_tagging, head_object, put_object, ObjectVersionQuery,
+    copy_object, delete_object, get_object, get_object_tagging, head_object, put_object,
+    ObjectVersionQuery,
 };
 pub use object_lock::{
     get_bucket_object_lock_configuration, get_object_legal_hold, get_object_retention,
