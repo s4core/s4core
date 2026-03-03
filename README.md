@@ -66,6 +66,7 @@ docker run -d \
   --name s4core \
   -p 9000:9000 \
   -v s4-data:/data \
+  -e S4_BIND=0.0.0.0:9000 \
   s4core/s4core:latest
 
 # Run with custom credentials
@@ -73,6 +74,7 @@ docker run -d \
   --name s4core \
   -p 9000:9000 \
   -v s4-data:/data \
+  -e S4_BIND=0.0.0.0:9000 \
   -e S4_ACCESS_KEY_ID=myaccesskey \
   -e S4_SECRET_ACCESS_KEY=mysecretkey \
   s4core/s4core:latest
@@ -82,6 +84,7 @@ docker run -d \
   --name s4core \
   -p 9000:9000 \
   -v s4-data:/data \
+  -e S4_BIND=0.0.0.0:9000 \
   -e S4_ROOT_PASSWORD=password12345 \
   s4core/s4core:latest
 
@@ -122,6 +125,7 @@ services:
     volumes:
       - s4-data:/data
     environment:
+      - S4_BIND=0.0.0.0:9000
       - S4_ROOT_PASSWORD=${S4_ROOT_PASSWORD:-}
       - S4_ACCESS_KEY_ID=${S4_ACCESS_KEY_ID:-}
       - S4_SECRET_ACCESS_KEY=${S4_SECRET_ACCESS_KEY:-}
