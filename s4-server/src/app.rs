@@ -23,13 +23,72 @@
 use crate::config::Config;
 use crate::lifecycle_worker::LifecycleWorker;
 use anyhow::{Context, Result};
+use axum::http::Uri;
 use axum::ServiceExt;
 use s4_api::{create_router, AppState};
 use s4_core::storage::BitcaskStorageEngine;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
-use tower_http::normalize_path::NormalizePath;
+use tower::Service;
 use tracing::info;
+
+/// S3-aware path normalizer that only strips trailing slashes on bucket-level paths.
+///
+/// Unlike `NormalizePath::trim_trailing_slash`, this preserves trailing slashes on
+/// object key paths (2+ path segments) because the trailing slash is part of the S3
+/// object key. For example, `PUT /bucket/dir/` creates an object with key `dir/`.
+///
+/// Only single-segment paths (bucket operations like `/bucket/`) have their trailing
+/// slash removed, since those need to route to `/:bucket` handlers.
+#[derive(Clone)]
+struct S3NormalizePath<S> {
+    inner: S,
+}
+
+impl<S, B> Service<axum::http::Request<B>> for S3NormalizePath<S>
+where
+    S: Service<axum::http::Request<B>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut req: axum::http::Request<B>) -> Self::Future {
+        let path = req.uri().path();
+
+        // Only normalize trailing slash for single-segment paths (bucket-level routes).
+        // Multi-segment paths like /bucket/key/ keep their trailing slash because
+        // the slash is part of the S3 object key.
+        if path.ends_with('/') && path.len() > 1 {
+            let segments = path.split('/').filter(|s| !s.is_empty()).count();
+            if segments <= 1 {
+                if let Some(new_uri) = strip_trailing_slash(req.uri()) {
+                    *req.uri_mut() = new_uri;
+                }
+            }
+        }
+
+        self.inner.call(req)
+    }
+}
+
+/// Rebuild a URI with the trailing slash removed from the path.
+fn strip_trailing_slash(uri: &Uri) -> Option<Uri> {
+    let path = uri.path().trim_end_matches('/');
+    let path_and_query = if let Some(query) = uri.query() {
+        format!("{path}?{query}")
+    } else {
+        path.to_string()
+    };
+    Uri::builder().path_and_query(path_and_query).build().ok()
+}
 
 /// Main application.
 pub struct App {
@@ -204,8 +263,9 @@ async fn run_http_server(addr: SocketAddr, router: axum::Router) -> Result<()> {
     // Create TCP listener
     let listener = TcpListener::bind(addr).await?;
 
-    // Wrap with NormalizePath to trim trailing slashes (required for S3 client compatibility)
-    let app = NormalizePath::trim_trailing_slash(router);
+    // Normalize paths: strip trailing slashes only for bucket-level routes,
+    // preserving them for object keys (e.g., `dir/` is a valid S3 key).
+    let app = S3NormalizePath { inner: router };
 
     // Run server with graceful shutdown
     axum::serve(
@@ -235,8 +295,9 @@ async fn run_https_server(
         shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(30)));
     });
 
-    // Wrap with NormalizePath to trim trailing slashes (required for S3 client compatibility)
-    let app = NormalizePath::trim_trailing_slash(router);
+    // Normalize paths: strip trailing slashes only for bucket-level routes,
+    // preserving them for object keys (e.g., `dir/` is a valid S3 key).
+    let app = S3NormalizePath { inner: router };
 
     // Run HTTPS server
     axum_server::bind_rustls(addr, rustls_config)

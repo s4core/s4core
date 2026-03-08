@@ -49,7 +49,7 @@ pub struct ListObjectsQuery {
     pub delimiter: Option<String>,
     /// Sets the maximum number of keys returned in the response.
     #[serde(rename = "max-keys")]
-    pub max_keys: Option<usize>,
+    pub max_keys: Option<String>,
     /// Marker is where you want S3 to start listing from.
     pub marker: Option<String>,
     /// List type: "2" for ListObjectsV2, otherwise ListObjects v1.
@@ -69,13 +69,16 @@ pub struct ListObjectVersionsQuery {
     pub delimiter: Option<String>,
     /// Sets the maximum number of keys returned in the response.
     #[serde(rename = "max-keys")]
-    pub max_keys: Option<usize>,
+    pub max_keys: Option<String>,
     /// Specifies the key to start with when listing objects in a bucket.
     #[serde(rename = "key-marker")]
     pub key_marker: Option<String>,
     /// Specifies the object version to start with.
     #[serde(rename = "version-id-marker")]
     pub version_id_marker: Option<String>,
+    /// Encoding type for keys in the response.
+    #[serde(rename = "encoding-type")]
+    pub encoding_type: Option<String>,
 }
 
 /// Request body for DeleteObjects API.
@@ -283,6 +286,17 @@ pub async fn delete_bucket(
         return S3Error::InternalError("Failed to delete bucket".to_string()).into_response();
     }
 
+    // Clean up bucket configurations
+    let config_keys = [
+        format!("__s4_bucket_cors_{}", bucket),
+        format!("__s4_bucket_versioning_{}", bucket),
+        format!("__s4_bucket_lifecycle_{}", bucket),
+        format!("__s4_bucket_policy_{}", bucket),
+    ];
+    for key in &config_keys {
+        let _ = storage.delete_object("__system__", key).await;
+    }
+
     info!("Bucket deleted: {}", bucket);
     StatusCode::NO_CONTENT.into_response()
 }
@@ -369,7 +383,18 @@ pub async fn list_objects(
     }
 
     let prefix = params.prefix.unwrap_or_default();
-    let max_keys = params.max_keys.unwrap_or(1000).min(1000);
+    let max_keys = match &params.max_keys {
+        Some(s) => match s.parse::<isize>() {
+            Ok(n) if n >= 0 => (n as usize).min(1000),
+            _ => {
+                return S3Error::InvalidArgument(
+                    "Argument max-keys must be an integer between 0 and 2147483647".to_string(),
+                )
+                .into_response()
+            }
+        },
+        None => 1000,
+    };
 
     // Fetch max_keys + 1 to determine if there are more results (proper truncation detection)
     let fetch_limit = max_keys + 1;
@@ -446,6 +471,25 @@ pub async fn list_object_versions(
 ) -> impl IntoResponse {
     debug!("ListObjectVersions: bucket={}, params={:?}", bucket, params);
 
+    // Validate: version-id-marker requires key-marker
+    if params.version_id_marker.is_some() && params.key_marker.is_none() {
+        return S3Error::InvalidArgument(
+            "A version-id marker cannot be specified without a key marker.".to_string(),
+        )
+        .into_response();
+    }
+
+    // Validate encoding-type
+    if let Some(ref encoding_type) = params.encoding_type {
+        if !encoding_type.is_empty() && encoding_type != "url" {
+            return S3Error::InvalidArgument(format!(
+                "Invalid Encoding Method specified in Request: {}",
+                encoding_type
+            ))
+            .into_response();
+        }
+    }
+
     let storage = state.storage.read().await;
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
 
@@ -455,10 +499,21 @@ pub async fn list_object_versions(
     }
 
     let prefix = params.prefix.unwrap_or_default();
-    let max_keys = params.max_keys.unwrap_or(1000).min(1000);
+    let max_keys = match &params.max_keys {
+        Some(s) => match s.parse::<isize>() {
+            Ok(n) if n >= 0 => (n as usize).min(1000),
+            _ => {
+                return S3Error::InvalidArgument(
+                    "Argument max-keys must be an integer between 0 and 2147483647".to_string(),
+                )
+                .into_response()
+            }
+        },
+        None => 1000,
+    };
 
     // List object versions
-    let result = match storage
+    let mut result = match storage
         .list_object_versions(
             &bucket,
             &prefix,
@@ -479,7 +534,38 @@ pub async fn list_object_versions(
         }
     };
 
-    let xml_response = xml::list_object_versions_response(&bucket, &prefix, max_keys, &result);
+    // Apply delimiter filtering: group keys into common prefixes
+    let delimiter = params.delimiter.as_deref();
+    if let Some(delim) = delimiter {
+        let mut common_prefixes = std::collections::BTreeSet::new();
+
+        result.versions.retain(|v| {
+            let after_prefix = &v.key[prefix.len()..];
+            if let Some(pos) = after_prefix.find(delim) {
+                let cp = format!("{}{}", prefix, &after_prefix[..pos + delim.len()]);
+                common_prefixes.insert(cp);
+                false
+            } else {
+                true
+            }
+        });
+
+        result.delete_markers.retain(|dm| {
+            let after_prefix = &dm.key[prefix.len()..];
+            if let Some(pos) = after_prefix.find(delim) {
+                let cp = format!("{}{}", prefix, &after_prefix[..pos + delim.len()]);
+                common_prefixes.insert(cp);
+                false
+            } else {
+                true
+            }
+        });
+
+        result.common_prefixes = common_prefixes.into_iter().collect();
+    }
+
+    let xml_response =
+        xml::list_object_versions_response(&bucket, &prefix, delimiter, max_keys, &result);
 
     Response::builder()
         .status(StatusCode::OK)
@@ -638,6 +724,9 @@ async fn check_object_locks(
     version_id: Option<&str>,
     bypass_governance: bool,
 ) -> Result<(), String> {
+    // Normalize "null" version ID to None (unversioned objects use "null" in ListObjectVersions)
+    let version_id = version_id.filter(|v| *v != "null");
+
     let record = if let Some(vid) = version_id {
         storage.head_object_version(bucket, key, vid).await
     } else {
@@ -647,7 +736,8 @@ async fn check_object_locks(
     let record = match record {
         Ok(r) => r,
         Err(s4_core::StorageError::ObjectNotFound { .. })
-        | Err(s4_core::StorageError::DeleteMarker { .. }) => return Ok(()),
+        | Err(s4_core::StorageError::DeleteMarker { .. })
+        | Err(s4_core::StorageError::VersionNotFound { .. }) => return Ok(()),
         Err(e) => return Err(format!("Failed to check locks: {}", e)),
     };
 
@@ -682,17 +772,14 @@ async fn check_object_locks(
 
 /// Validates Content-MD5 header against request body.
 #[allow(clippy::result_large_err)]
-fn validate_content_md5(headers: &HeaderMap, body: &[u8]) -> Result<(), Response> {
+pub fn validate_content_md5(headers: &HeaderMap, body: &[u8]) -> Result<(), Response> {
     if let Some(content_md5) = headers.get("content-md5") {
         let provided = content_md5.to_str().unwrap_or("");
         let digest = md5::compute(body);
         let computed = base64::engine::general_purpose::STANDARD.encode(digest.as_ref());
 
         if provided != computed {
-            return Err(S3Error::InvalidRequest(
-                "Content-MD5 header does not match body".to_string(),
-            )
-            .into_response());
+            return Err(S3Error::BadDigest.into_response());
         }
     }
     Ok(())
@@ -739,10 +826,13 @@ fn strip_version_ids_from_keys(
         }
     }
 
+    // Re-sort by key to restore lexicographic order (HashMap iteration is unordered)
+    result.sort_by(|a, b| a.0.cmp(&b.0));
+
     result
 }
 
-/// Validates bucket name according to S3 rules.
+/// Validates bucket name according to S3 rules .
 fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
     if name.len() < 3 || name.len() > 63 {
         return Err(S3Error::InvalidRequest(
@@ -761,10 +851,14 @@ fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
         ));
     }
 
-    // Only lowercase letters, numbers, and hyphens
-    if !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+    // Only lowercase letters, numbers, hyphens, and dots
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+    {
         return Err(S3Error::InvalidRequest(
-            "Bucket name can only contain lowercase letters, numbers, and hyphens".to_string(),
+            "Bucket name can only contain lowercase letters, numbers, hyphens, and dots"
+                .to_string(),
         ));
     }
 

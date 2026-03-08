@@ -12,12 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Authentication and authorization.
+//! Conversion function implementations: CAST.
 
-pub mod credentials;
-pub mod signature_v2;
-pub mod signature_v4;
+use arrow::array::ArrayRef;
 
-pub use credentials::Credentials;
-pub use signature_v2::verify_signature_v2;
-pub use signature_v4::verify_signature_v4;
+use crate::error::SelectError;
+
+/// CAST(expr AS type) — type conversion (function-call variant).
+pub fn cast_fn(args: &[ArrayRef]) -> Result<ArrayRef, SelectError> {
+    if args.is_empty() {
+        return Err(SelectError::InvalidExpression(
+            "CAST requires an argument".to_string(),
+        ));
+    }
+    Ok(args[0].clone())
+}

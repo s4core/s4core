@@ -21,6 +21,9 @@ use axum::response::Response;
 use s4_features::iam::{Role, User};
 use tracing::{debug, warn};
 
+use crate::auth::signature_v2::{
+    detect_v2_auth, verify_signature_v2, verify_signature_v2_with_iam_data, SignatureV2RequestData,
+};
 use crate::auth::signature_v4::{
     verify_signature_v4, verify_signature_v4_with_iam_data, SignatureRequestData,
 };
@@ -55,6 +58,74 @@ pub async fn iam_auth_middleware(
         return next.run(request).await;
     }
 
+    // POST object uploads use multipart/form-data with policy-based auth
+    // inside the form body. They don't have Authorization header or presigned
+    // query params, so we must let them through here — auth is done in the handler.
+    let is_post_object_upload = request.method() == axum::http::Method::POST
+        && request
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.starts_with("multipart/form-data"))
+            .unwrap_or(false);
+
+    if is_post_object_upload {
+        return next.run(request).await;
+    }
+
+    // Get IAM storage (this is Arc, so cheap to clone)
+    let iam_storage = state.iam_storage.clone();
+
+    // Detect signature version: V2 first, then V4 (default).
+    if detect_v2_auth(&request) {
+        // ---- AWS Signature V2 path ----
+        let v2_data = match SignatureV2RequestData::from_request(&request) {
+            Ok(data) => data,
+            Err(e) => {
+                warn!("Failed to extract V2 request data: {:?}", e);
+                return error_response(&e);
+            }
+        };
+
+        // Try IAM first, then fallback to ENV credentials
+        match verify_signature_v2_with_iam_data(v2_data, &iam_storage).await {
+            Ok(user) => {
+                request.extensions_mut().insert::<User>(user);
+                return next.run(request).await;
+            }
+            Err(e) => {
+                if matches!(e, crate::s3::errors::S3Error::AccessDenied) {
+                    debug!("V2 IAM lookup failed, trying legacy ENV credentials");
+
+                    if !state.access_key_id.is_empty() && !state.secret_access_key.is_empty() {
+                        let credentials = Credentials::new(
+                            state.access_key_id.clone(),
+                            state.secret_access_key.clone(),
+                        );
+
+                        match verify_signature_v2(&request, &credentials) {
+                            Ok(()) => {
+                                debug!("V2 legacy ENV authentication successful");
+                                let legacy_user = create_legacy_user(&state);
+                                request.extensions_mut().insert::<User>(legacy_user);
+                                return next.run(request).await;
+                            }
+                            Err(legacy_err) => {
+                                warn!("V2 legacy ENV authentication also failed: {:?}", legacy_err);
+                                return error_response(&legacy_err);
+                            }
+                        }
+                    }
+                }
+
+                warn!("V2 IAM authentication failed: {:?}", e);
+                return error_response(&e);
+            }
+        }
+    }
+
+    // ---- AWS Signature V4 path (unchanged) ----
+
     // Extract all request data SYNCHRONOUSLY before any async operations.
     // This avoids holding borrows across await points, which would make
     // the future !Send and break axum middleware compatibility.
@@ -65,9 +136,6 @@ pub async fn iam_auth_middleware(
             return error_response(&e);
         }
     };
-
-    // Get IAM storage (this is Arc, so cheap to clone)
-    let iam_storage = state.iam_storage.clone();
 
     // Try IAM authentication first
     match verify_signature_v4_with_iam_data(req_data, &iam_storage).await {
@@ -92,20 +160,7 @@ pub async fn iam_auth_middleware(
                     match verify_signature_v4(&request, &credentials) {
                         Ok(()) => {
                             debug!("Legacy ENV authentication successful");
-                            // Create a synthetic SuperUser for legacy auth
-                            // This maintains backwards compatibility
-                            let legacy_user = User {
-                                id: "legacy-env-user".to_string(),
-                                username: "env-admin".to_string(),
-                                password_hash: String::new(),
-                                role: Role::SuperUser,
-                                access_key: Some(state.access_key_id.clone()),
-                                secret_key: None,
-                                secret_key_hash: None,
-                                created_at: chrono::Utc::now(),
-                                updated_at: chrono::Utc::now(),
-                                is_active: true,
-                            };
+                            let legacy_user = create_legacy_user(&state);
                             request.extensions_mut().insert::<User>(legacy_user);
                             return next.run(request).await;
                         }
@@ -120,6 +175,22 @@ pub async fn iam_auth_middleware(
             warn!("IAM authentication failed: {:?}", e);
             error_response(&e)
         }
+    }
+}
+
+/// Creates a synthetic SuperUser for legacy ENV-based authentication.
+fn create_legacy_user(state: &AppState) -> User {
+    User {
+        id: "legacy-env-user".to_string(),
+        username: "env-admin".to_string(),
+        password_hash: String::new(),
+        role: Role::SuperUser,
+        access_key: Some(state.access_key_id.clone()),
+        secret_key: None,
+        secret_key_hash: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        is_active: true,
     }
 }
 

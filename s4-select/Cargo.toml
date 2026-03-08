@@ -1,0 +1,37 @@
+[package]
+name = "s4-select"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "SQL query engine for S4 object storage (S3 Select compatible + multi-object queries)"
+
+[dependencies]
+# SQL parsing
+sqlparser = "0.55"
+
+# Arrow columnar format and compute kernels
+arrow = { version = "54", features = ["prettyprint"] }
+
+# Workspace dependencies
+quick-xml = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+
+# Additional
+bytes = "1"
+csv = "1"
+crc32fast = "1"
+glob-match = "0.2"
+regex = "1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"
+
+[lints]
+workspace = true

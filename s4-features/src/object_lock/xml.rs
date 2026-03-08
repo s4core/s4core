@@ -62,6 +62,7 @@ pub fn parse_object_lock_xml(xml: &str) -> Result<ObjectLockConfiguration, Strin
     let mut in_default_retention = false;
     let mut retention_mode: Option<RetentionMode> = None;
     let mut retention_days: Option<u32> = None;
+    let mut retention_years: Option<u32> = None;
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -91,15 +92,33 @@ pub fn parse_object_lock_xml(xml: &str) -> Result<ObjectLockConfiguration, Strin
                             return Err(format!("Invalid retention days: {}", text));
                         }
                     }
+                    "Years" if in_default_retention => {
+                        retention_years = text.parse().ok();
+                        if retention_years.is_none() {
+                            return Err(format!("Invalid retention years: {}", text));
+                        }
+                    }
                     _ => {}
                 }
             }
             Ok(Event::End(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
                 if name == "DefaultRetention" {
-                    // Build DefaultRetention if both mode and days were provided
-                    if let (Some(mode), Some(days)) = (retention_mode, retention_days) {
-                        config.default_retention = Some(DefaultRetention { mode, days });
+                    // Build DefaultRetention if mode and either days or years were provided
+                    if let Some(mode) = retention_mode {
+                        if let Some(years) = retention_years {
+                            config.default_retention = Some(DefaultRetention {
+                                mode,
+                                days: 0,
+                                years,
+                            });
+                        } else if let Some(days) = retention_days {
+                            config.default_retention = Some(DefaultRetention {
+                                mode,
+                                days,
+                                years: 0,
+                            });
+                        }
                     }
                     in_default_retention = false;
                 }
@@ -140,7 +159,11 @@ pub fn object_lock_to_xml(config: &ObjectLockConfiguration) -> String {
         xml.push_str("  <Rule>\n");
         xml.push_str("    <DefaultRetention>\n");
         xml.push_str(&format!("      <Mode>{}</Mode>\n", retention.mode.as_str()));
-        xml.push_str(&format!("      <Days>{}</Days>\n", retention.days));
+        if retention.years > 0 {
+            xml.push_str(&format!("      <Years>{}</Years>\n", retention.years));
+        } else {
+            xml.push_str(&format!("      <Days>{}</Days>\n", retention.days));
+        }
         xml.push_str("    </DefaultRetention>\n");
         xml.push_str("  </Rule>\n");
     }
@@ -389,6 +412,7 @@ mod tests {
             default_retention: Some(DefaultRetention {
                 mode: RetentionMode::COMPLIANCE,
                 days: 90,
+                years: 0,
             }),
         };
 
@@ -405,6 +429,7 @@ mod tests {
             default_retention: Some(DefaultRetention {
                 mode: RetentionMode::GOVERNANCE,
                 days: 30,
+                years: 0,
             }),
         };
 

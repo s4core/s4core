@@ -61,27 +61,22 @@ pub fn verify_signature_v4(
     request: &Request<axum::body::Body>,
     credentials: &Credentials,
 ) -> Result<(), S3Error> {
+    let req_data = SignatureRequestData::from_request(request)?;
+
     // Log all headers for debugging
-    tracing::debug!("Request method: {}", request.method());
-    tracing::debug!("Request URI: {}", request.uri());
+    tracing::debug!("Request method: {}", req_data.method);
+    tracing::debug!("Request URI: {}", req_data.uri);
     tracing::debug!("Request headers:");
-    for (name, value) in request.headers() {
+    for (name, value) in &req_data.headers {
         if let Ok(value_str) = value.to_str() {
             tracing::debug!("  {}: {}", name, value_str);
         }
     }
 
-    // Extract Authorization header
-    let auth_header = request
-        .headers()
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .ok_or(S3Error::AccessDenied)?;
-
-    tracing::debug!("Authorization header: {}", auth_header);
+    tracing::debug!("Authorization header: {}", req_data.auth_header);
 
     // Parse Authorization header
-    let auth = parse_authorization_header(auth_header)?;
+    let auth = parse_authorization_header(&req_data.auth_header)?;
 
     // Verify access key matches
     if auth.credential.access_key_id != credentials.access_key_id {
@@ -89,10 +84,10 @@ pub fn verify_signature_v4(
     }
 
     // Extract date and timestamp from headers (X-Amz-Date or Date)
-    let (date, timestamp) = extract_date_and_timestamp(request.headers())?;
+    let (date, timestamp) = extract_date_and_timestamp(&req_data.headers)?;
 
     // Create canonical request
-    let canonical_request = create_canonical_request(request, &auth.signed_headers)?;
+    let canonical_request = create_canonical_request_from_data(&req_data, &auth.signed_headers)?;
 
     // Create string to sign
     let string_to_sign = create_string_to_sign(
@@ -128,11 +123,13 @@ pub fn verify_signature_v4(
 
     // NormalizePath may have stripped a trailing slash. Retry with trailing slash if the
     // path doesn't already end with one — the client may have signed the original URI.
-    let path = request.uri().path();
-    if !path.ends_with('/') {
-        let alt_path = format!("{}/", path);
+    if !req_data.path.ends_with('/') {
+        let alt_data = SignatureRequestData {
+            path: format!("{}/", req_data.path),
+            ..req_data.clone()
+        };
         if let Ok(alt_canonical) =
-            create_canonical_request_with_path(request, &auth.signed_headers, &alt_path)
+            create_canonical_request_from_data(&alt_data, &auth.signed_headers)
         {
             let alt_sts = create_string_to_sign(
                 &auth.algorithm,
@@ -192,15 +189,72 @@ pub struct SignatureRequestData {
 impl SignatureRequestData {
     /// Extract data from request synchronously.
     pub fn from_request(request: &Request<axum::body::Body>) -> Result<Self, S3Error> {
-        let auth_header = request
-            .headers()
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .ok_or(S3Error::AccessDenied)?
-            .to_string();
+        let mut headers = request.headers().clone();
 
-        let payload_hash = request
-            .headers()
+        let auth_header = match headers.get("authorization") {
+            Some(v) => v.to_str().ok().ok_or(S3Error::AccessDenied)?.to_string(),
+            None => {
+                // Check if this is a presigned URL based on query string
+                let query = request.uri().query().unwrap_or("");
+                let mut params = std::collections::HashMap::new();
+                for pair in query.split('&') {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        params.insert(k.to_string(), v.to_string());
+                    }
+                }
+
+                let algorithm = params.get("X-Amz-Algorithm");
+                let credential = params.get("X-Amz-Credential");
+                let date = params.get("X-Amz-Date");
+                let signed_headers = params.get("X-Amz-SignedHeaders");
+                let signature = params.get("X-Amz-Signature");
+                let expires = params.get("X-Amz-Expires");
+
+                if let (Some(alg), Some(cred), Some(dh), Some(sh), Some(sig)) =
+                    (algorithm, credential, date, signed_headers, signature)
+                {
+                    let alg_dec = url_decode(alg);
+                    let cred_dec = url_decode(cred);
+                    let dh_dec = url_decode(dh);
+                    let sh_dec = url_decode(sh);
+                    let sig_dec = url_decode(sig);
+
+                    // Validate expiration if provided
+                    if let Some(exp_str) = expires {
+                        if let Ok(exp_secs) = url_decode(exp_str).parse::<i64>() {
+                            if dh_dec.len() == 16 && dh_dec.ends_with('Z') {
+                                // yyyymmddThhmmssZ
+                                if let Ok(dt) =
+                                    chrono::NaiveDateTime::parse_from_str(&dh_dec, "%Y%m%dT%H%M%SZ")
+                                {
+                                    #[allow(deprecated)]
+                                    let dt =
+                                        chrono::DateTime::<chrono::Utc>::from_utc(dt, chrono::Utc);
+                                    let now = chrono::Utc::now();
+                                    if now.signed_duration_since(dt).num_seconds() > exp_secs {
+                                        return Err(S3Error::AccessDenied);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Inject x-amz-date into headers for extract_date_and_timestamp
+                    if let Ok(hval) = axum::http::HeaderValue::from_str(&dh_dec) {
+                        headers.insert("x-amz-date", hval);
+                    }
+
+                    format!(
+                        "{} Credential={}, SignedHeaders={}, Signature={}",
+                        alg_dec, cred_dec, sh_dec, sig_dec
+                    )
+                } else {
+                    return Err(S3Error::AccessDenied);
+                }
+            }
+        };
+
+        let payload_hash = headers
             .get("x-amz-content-sha256")
             .and_then(|h| h.to_str().ok())
             .unwrap_or("UNSIGNED-PAYLOAD")
@@ -211,7 +265,7 @@ impl SignatureRequestData {
             uri: request.uri().to_string(),
             path: request.uri().path().to_string(),
             query: request.uri().query().map(|s| s.to_string()),
-            headers: request.headers().clone(),
+            headers,
             auth_header,
             payload_hash,
         })
@@ -495,86 +549,6 @@ fn extract_date_and_timestamp(headers: &HeaderMap) -> Result<(String, String), S
     Err(S3Error::SignatureDoesNotMatch)
 }
 
-/// Creates canonical request string.
-///
-/// Format:
-/// ```text
-/// METHOD
-/// CANONICAL_URI
-/// CANONICAL_QUERY_STRING
-/// CANONICAL_HEADERS
-///
-/// SIGNED_HEADERS
-/// PAYLOAD_HASH
-/// ```
-fn create_canonical_request(
-    request: &Request<axum::body::Body>,
-    signed_headers: &[String],
-) -> Result<String, S3Error> {
-    // Method
-    let method = request.method().as_str();
-
-    // Canonical URI (percent-encoded path)
-    let uri = request.uri();
-    let canonical_uri = canonicalize_uri(uri.path())?;
-
-    // Canonical query string (sorted, percent-encoded)
-    // Note: uri.query() returns the raw query string (may be URL-encoded)
-    let canonical_query = canonicalize_query_string(uri.query())?;
-    tracing::debug!("Original query string: {:?}", uri.query());
-    tracing::debug!("Canonical query string: {}", canonical_query);
-
-    // Canonical headers (sorted, lowercase keys, trimmed values)
-    let canonical_headers = create_canonical_headers(request.headers(), signed_headers)?;
-
-    // Signed headers (sorted, lowercase, semicolon-separated)
-    let signed_headers_str = signed_headers.join(";");
-
-    // Payload hash (SHA256 of body)
-    // Check for x-amz-content-sha256 header first (used by AWS CLI)
-    // This header can have several special values:
-    // - UNSIGNED-PAYLOAD: payload is not signed
-    // - STREAMING-UNSIGNED-PAYLOAD-TRAILER: chunked upload with trailing checksum
-    // - STREAMING-AWS4-HMAC-SHA256-PAYLOAD: signed streaming payload
-    // - STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER: signed streaming with trailer
-    // - 64-char hex string: SHA256 hash of the payload
-    // Accept all valid x-amz-content-sha256 values as-is
-    // They will be used verbatim in the canonical request
-    let payload_hash = request
-        .headers()
-        .get("x-amz-content-sha256")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("UNSIGNED-PAYLOAD");
-
-    Ok(format!(
-        "{}\n{}\n{}\n{}\n\n{}\n{}",
-        method, canonical_uri, canonical_query, canonical_headers, signed_headers_str, payload_hash
-    ))
-}
-
-/// Like `create_canonical_request` but uses a custom path (for trailing-slash retry).
-fn create_canonical_request_with_path(
-    request: &Request<axum::body::Body>,
-    signed_headers: &[String],
-    path: &str,
-) -> Result<String, S3Error> {
-    let method = request.method().as_str();
-    let canonical_uri = canonicalize_uri(path)?;
-    let canonical_query = canonicalize_query_string(request.uri().query())?;
-    let canonical_headers = create_canonical_headers(request.headers(), signed_headers)?;
-    let signed_headers_str = signed_headers.join(";");
-    let payload_hash = request
-        .headers()
-        .get("x-amz-content-sha256")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("UNSIGNED-PAYLOAD");
-
-    Ok(format!(
-        "{}\n{}\n{}\n{}\n\n{}\n{}",
-        method, canonical_uri, canonical_query, canonical_headers, signed_headers_str, payload_hash
-    ))
-}
-
 /// Canonicalizes URI path (percent-encoding).
 ///
 /// For S3, we need to:
@@ -648,6 +622,13 @@ fn canonicalize_query_string(query: Option<&str>) -> Result<String, S3Error> {
             let mut parts = pair.splitn(2, '=');
             let key_encoded = parts.next()?;
             let value_encoded = parts.next().unwrap_or("");
+
+            // X-Amz-Signature must NOT be included in canonical request
+            if key_encoded.eq_ignore_ascii_case("x-amz-signature")
+                || url_decode(key_encoded).eq_ignore_ascii_case("x-amz-signature")
+            {
+                return None;
+            }
 
             // URL-decode key and value
             let key = url_decode(key_encoded);
@@ -772,7 +753,7 @@ fn create_string_to_sign(
 /// kRegion = HMAC-SHA256(kDate, region)
 /// kService = HMAC-SHA256(kRegion, service)
 /// kSigning = HMAC-SHA256(kService, "aws4_request")
-fn calculate_signing_key(secret_key: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+pub fn calculate_signing_key(secret_key: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
     let k_secret = format!("AWS4{}", secret_key);
     let k_date = hmac_sha256(k_secret.as_bytes(), date.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
@@ -788,7 +769,7 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
 }
 
 /// Calculates signature.
-fn calculate_signature(signing_key: &[u8], string_to_sign: &str) -> String {
+pub fn calculate_signature(signing_key: &[u8], string_to_sign: &str) -> String {
     let signature = hmac_sha256(signing_key, string_to_sign.as_bytes());
     hex::encode(signature)
 }
@@ -838,7 +819,7 @@ fn percent_decode(s: &str) -> String {
 }
 
 /// Constant-time comparison of byte slices.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

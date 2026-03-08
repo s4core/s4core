@@ -26,14 +26,32 @@ pub struct DefaultRetention {
     /// Retention mode (GOVERNANCE or COMPLIANCE).
     pub mode: RetentionMode,
 
-    /// Number of days to retain objects from creation.
+    /// Number of days to retain objects from creation (mutually exclusive with years).
     pub days: u32,
+
+    /// Number of years to retain objects from creation (mutually exclusive with days).
+    /// When set (> 0), takes precedence over days for XML serialization.
+    #[serde(default)]
+    pub years: u32,
 }
 
 impl DefaultRetention {
-    /// Creates a new default retention configuration.
+    /// Creates a new default retention configuration with days.
     pub fn new(mode: RetentionMode, days: u32) -> Self {
-        Self { mode, days }
+        Self {
+            mode,
+            days,
+            years: 0,
+        }
+    }
+
+    /// Creates a new default retention configuration with years.
+    pub fn new_years(mode: RetentionMode, years: u32) -> Self {
+        Self {
+            mode,
+            days: 0,
+            years,
+        }
     }
 
     /// Calculates the retain-until timestamp from creation timestamp.
@@ -47,7 +65,11 @@ impl DefaultRetention {
     /// Retain-until timestamp in nanoseconds
     pub fn calculate_retain_until(&self, created_at: u64) -> u64 {
         const NANOS_PER_DAY: u64 = 86_400_000_000_000; // 24 * 60 * 60 * 1_000_000_000
-        created_at + (self.days as u64 * NANOS_PER_DAY)
+        if self.years > 0 {
+            created_at + (self.years as u64 * 365 * NANOS_PER_DAY)
+        } else {
+            created_at + (self.days as u64 * NANOS_PER_DAY)
+        }
     }
 }
 

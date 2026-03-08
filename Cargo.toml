@@ -5,6 +5,7 @@ members = [
     "s4-features",
     "s4-compactor",
     "s4-server",
+    "s4-select",
 ]
 resolver = "2"
 
@@ -40,10 +41,11 @@ metrics-exporter-prometheus = "0.13"
 
 # Hashing
 blake3 = "1.5"
+sha1 = "0.10"
 sha2 = "0.10"
 
 # HTTP/Web
-axum = "0.7"
+axum = { version = "0.7", features = ["multipart"] }
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 hyper = "1.0"
 rustls = "0.23"

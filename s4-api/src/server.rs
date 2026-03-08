@@ -20,7 +20,7 @@
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Extension, Path, Query, State},
-    http::{header::HeaderName, HeaderMap, Method},
+    http::{header, header::HeaderName, HeaderMap, HeaderValue, Method, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::{delete, get, head, post, put},
@@ -359,11 +359,35 @@ struct ObjectQueryParams {
     legal_hold: Option<String>,
     /// Tagging configuration marker for Object tagging.
     tagging: Option<String>,
+    /// Maximum number of parts to return in ListParts.
+    #[serde(rename = "max-parts")]
+    max_parts: Option<i64>,
+    /// Part number marker for ListParts pagination.
+    #[serde(rename = "part-number-marker")]
+    part_number_marker: Option<i64>,
     /// S3 Select marker (SelectObjectContent).
     select: Option<String>,
     /// S3 Select type parameter.
     #[serde(rename = "select-type")]
     select_type: Option<String>,
+    /// Response override: Content-Disposition
+    #[serde(rename = "response-content-disposition")]
+    response_content_disposition: Option<String>,
+    /// Response override: Content-Type
+    #[serde(rename = "response-content-type")]
+    response_content_type: Option<String>,
+    /// Response override: Cache-Control
+    #[serde(rename = "response-cache-control")]
+    response_cache_control: Option<String>,
+    /// Response override: Content-Encoding
+    #[serde(rename = "response-content-encoding")]
+    response_content_encoding: Option<String>,
+    /// Response override: Content-Language
+    #[serde(rename = "response-content-language")]
+    response_content_language: Option<String>,
+    /// Response override: Expires
+    #[serde(rename = "response-expires")]
+    response_expires: Option<String>,
 }
 
 /// Query parameters for bucket configuration operations.
@@ -384,6 +408,15 @@ struct BucketConfigQueryParams {
     delete: Option<String>,
     /// Location marker (GET /{bucket}?location).
     location: Option<String>,
+    /// Bucket policy marker (GET/PUT/DELETE /{bucket}?policy).
+    policy: Option<String>,
+    /// Bucket policy status marker (GET /{bucket}?policyStatus).
+    #[serde(rename = "policyStatus")]
+    policy_status: Option<String>,
+    /// S4 SQL query marker (POST /{bucket}?sql).
+    sql: Option<String>,
+    /// Bucket encryption marker (GET/PUT/DELETE /{bucket}?encryption).
+    encryption: Option<String>,
 }
 
 /// Routes GET requests for bucket - either ListObjects, ListObjectVersions, or bucket configuration.
@@ -413,6 +446,12 @@ async fn get_bucket_router(
         handlers::get_bucket_object_lock_configuration(state, path)
             .await
             .into_response()
+    } else if config_params.policy.is_some() {
+        handlers::get_bucket_policy(state, path).await.into_response()
+    } else if config_params.policy_status.is_some() {
+        handlers::get_bucket_policy_status(state, path).await.into_response()
+    } else if config_params.encryption.is_some() {
+        handlers::get_bucket_encryption(state, path).await.into_response()
     } else if config_params.versions.is_some() {
         // ListObjectVersions
         handlers::list_object_versions(state, path, Query(versions_params))
@@ -448,6 +487,10 @@ async fn put_bucket_router(
         handlers::put_bucket_object_lock_configuration(state, path, body)
             .await
             .into_response()
+    } else if params.policy.is_some() {
+        handlers::put_bucket_policy(state, path, body).await.into_response()
+    } else if params.encryption.is_some() {
+        handlers::put_bucket_encryption(state, path, body).await.into_response()
     } else {
         // Default: CreateBucket (pass headers for x-amz-bucket-object-lock-enabled)
         handlers::create_bucket(state, path, headers).await.into_response()
@@ -470,31 +513,70 @@ async fn delete_bucket_router(
         handlers::delete_bucket_cors(state, path).await.into_response()
     } else if params.lifecycle.is_some() {
         handlers::delete_bucket_lifecycle(state, path).await.into_response()
+    } else if params.policy.is_some() {
+        handlers::delete_bucket_policy(state, path).await.into_response()
+    } else if params.encryption.is_some() {
+        handlers::delete_bucket_encryption(state, path).await.into_response()
     } else {
         // Default: DeleteBucket
         handlers::delete_bucket(state, path).await.into_response()
     }
 }
 
-/// Routes POST requests for bucket operations.
+/// Routes POST requests for bucket operations (including POST object upload).
 async fn post_bucket_router(
     state: State<AppState>,
     path: Path<String>,
     user: Option<Extension<User>>,
     Query(params): Query<BucketConfigQueryParams>,
     headers: HeaderMap,
-    body: Bytes,
+    request: axum::extract::Request,
 ) -> axum::response::Response {
-    // Check write permission (DeleteObjects requires write)
-    if let Err(response) = check_write_permission(user.as_ref().map(|e| &e.0)) {
-        return response;
-    }
+    let is_multipart = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.starts_with("multipart/form-data"))
+        .unwrap_or(false);
 
-    if params.delete.is_some() {
+    if params.sql.is_some() {
+        // S4 SQL query — requires read permission (read-only query)
+        if let Err(response) = check_read_permission(user.as_ref().map(|e| &e.0)) {
+            return response;
+        }
+
+        use axum::extract::FromRequest;
+        let body = match Bytes::from_request(request, &state.0).await {
+            Ok(b) => b,
+            Err(_) => {
+                return S3Error::InternalError("Failed to read body".to_string()).into_response()
+            }
+        };
+        handlers::bucket_sql_query(state, path, headers, body).await
+    } else if params.delete.is_some() {
+        // Check write permission (DeleteObjects requires write)
+        if let Err(response) = check_write_permission(user.as_ref().map(|e| &e.0)) {
+            return response;
+        }
+
+        use axum::extract::FromRequest;
+        let body = match Bytes::from_request(request, &state.0).await {
+            Ok(b) => b,
+            Err(_) => {
+                return S3Error::InternalError("Failed to read body".to_string()).into_response()
+            }
+        };
         handlers::delete_objects(state, path, headers, body).await.into_response()
+    } else if is_multipart {
+        use axum::extract::FromRequest;
+        let multipart = match axum::extract::Multipart::from_request(request, &state.0).await {
+            Ok(m) => m,
+            Err(_) => {
+                return S3Error::InvalidRequest("Invalid multipart body".into()).into_response()
+            }
+        };
+        handlers::post_object(state, path, headers, multipart).await.into_response()
     } else {
-        S3Error::NotImplemented("The requested operation is not implemented".to_string())
-            .into_response()
+        S3Error::MethodNotAllowed.into_response()
     }
 }
 
@@ -527,12 +609,22 @@ async fn put_object_router(
         handlers::put_object_legal_hold(state, path, Query(version_query), body)
             .await
             .into_response()
+    } else if params.tagging.is_some() {
+        // PutObjectTagging: PUT /{bucket}/{key}?tagging
+        let version_query = handlers::ObjectVersionQuery {
+            version_id: params.version_id,
+        };
+        handlers::put_object_tagging(state, path, Query(version_query), body)
+            .await
+            .into_response()
     } else if params.part_number.is_some() && params.upload_id.is_some() {
         // UploadPart
         let query = handlers::multipart::MultipartQuery {
             upload_id: params.upload_id,
             part_number: params.part_number,
             uploads: None,
+            max_parts: None,
+            part_number_marker: None,
         };
         handlers::upload_part(state, path, Query(query), headers, body)
             .await
@@ -559,12 +651,24 @@ async fn delete_object_router(
         return response;
     }
 
+    // DeleteObjectTagging: DELETE /{bucket}/{key}?tagging
+    if params.tagging.is_some() {
+        let version_query = handlers::ObjectVersionQuery {
+            version_id: params.version_id,
+        };
+        return handlers::delete_object_tagging(state, path, Query(version_query))
+            .await
+            .into_response();
+    }
+
     // If uploadId is present, this is AbortMultipartUpload
     if params.upload_id.is_some() {
         let query = handlers::multipart::MultipartQuery {
             upload_id: params.upload_id,
             part_number: None,
             uploads: None,
+            max_parts: None,
+            part_number_marker: None,
         };
         handlers::abort_multipart_upload(state, path, Query(query))
             .await
@@ -581,7 +685,7 @@ async fn delete_object_router(
     }
 }
 
-/// Routes POST requests - either CreateMultipartUpload or CompleteMultipartUpload.
+/// Routes POST requests - CreateMultipartUpload, CompleteMultipartUpload, or SelectObjectContent.
 async fn post_object_router(
     state: State<AppState>,
     path: Path<(String, String)>,
@@ -590,34 +694,36 @@ async fn post_object_router(
     headers: HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
-    // Check write permission (all POST object operations require write)
-    if let Err(response) = check_write_permission(user.as_ref().map(|e| &e.0)) {
-        return response;
-    }
-
     // If "uploads" query param is present, this is CreateMultipartUpload
     if params.uploads.is_some() {
+        if let Err(response) = check_write_permission(user.as_ref().map(|e| &e.0)) {
+            return response;
+        }
         handlers::create_multipart_upload(state, path, headers).await.into_response()
     } else if params.upload_id.is_some() {
         // If uploadId is present, this is CompleteMultipartUpload
+        if let Err(response) = check_write_permission(user.as_ref().map(|e| &e.0)) {
+            return response;
+        }
         let query = handlers::multipart::MultipartQuery {
             upload_id: params.upload_id,
             part_number: None,
             uploads: None,
+            max_parts: None,
+            part_number_marker: None,
         };
         handlers::complete_multipart_upload(state, path, Query(query), headers, body)
             .await
             .into_response()
     } else if params.select.is_some() || params.select_type.is_some() {
-        // S3 Select (SelectObjectContent) is not implemented
-        S3Error::NotImplemented(
-            "S3 Select (SelectObjectContent) is not supported by this server".to_string(),
-        )
-        .into_response()
+        // S3 SelectObjectContent — requires read permission (read-only query)
+        if let Err(response) = check_read_permission(user.as_ref().map(|e| &e.0)) {
+            return response;
+        }
+        handlers::select_object_content(state, path, headers, body).await
     } else {
-        // Unknown POST operation
-        S3Error::NotImplemented("The requested operation is not implemented".to_string())
-            .into_response()
+        // Unknown POST operation on object path
+        S3Error::MethodNotAllowed.into_response()
     }
 }
 
@@ -656,14 +762,64 @@ async fn get_object_router(
         handlers::get_object_tagging(state, path, Query(version_query))
             .await
             .into_response()
+    } else if params.upload_id.is_some() {
+        // ListParts: GET /{bucket}/{key}?uploadId=X
+        let query = handlers::multipart::MultipartQuery {
+            upload_id: params.upload_id,
+            part_number: None,
+            uploads: None,
+            max_parts: params.max_parts,
+            part_number_marker: params.part_number_marker,
+        };
+        handlers::list_parts(state, path, Query(query)).await.into_response()
     } else {
         // Default: GetObject
         let version_query = handlers::ObjectVersionQuery {
             version_id: params.version_id,
         };
-        handlers::get_object(state, path, Query(version_query), headers)
+        let mut response = handlers::get_object(state, path, Query(version_query), headers)
             .await
-            .into_response()
+            .into_response();
+
+        // Apply response override query parameters (for presigned URLs)
+        if let Some(ref v) = params.response_content_disposition {
+            response.headers_mut().insert(
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_str(v).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+        }
+        if let Some(ref v) = params.response_content_type {
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_str(v).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+        }
+        if let Some(ref v) = params.response_cache_control {
+            response.headers_mut().insert(
+                header::CACHE_CONTROL,
+                HeaderValue::from_str(v).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+        }
+        if let Some(ref v) = params.response_content_encoding {
+            response.headers_mut().insert(
+                header::CONTENT_ENCODING,
+                HeaderValue::from_str(v).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+        }
+        if let Some(ref v) = params.response_content_language {
+            response.headers_mut().insert(
+                header::CONTENT_LANGUAGE,
+                HeaderValue::from_str(v).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+        }
+        if let Some(ref v) = params.response_expires {
+            response.headers_mut().insert(
+                header::EXPIRES,
+                HeaderValue::from_str(v).unwrap_or_else(|_| HeaderValue::from_static("")),
+            );
+        }
+
+        response
     }
 }
 
@@ -845,6 +1001,26 @@ pub fn create_router(state: AppState) -> Router {
         // Observability endpoints (no auth required)
         .route("/metrics", get(handlers::stats::prometheus_metrics))
         .route("/api/stats", get(handlers::stats::api_stats))
+        // MinIO-compatible health check endpoints (no auth required)
+        .route("/minio/health/live", get(|| async { StatusCode::OK }))
+        .route("/minio/health/ready", get(|| async { StatusCode::OK }))
+        // MinIO-compatible Prometheus metrics endpoints (no auth required)
+        .route(
+            "/minio/v2/metrics/cluster",
+            get(handlers::stats::prometheus_metrics),
+        )
+        .route(
+            "/minio/v2/metrics/node",
+            get(handlers::stats::prometheus_metrics),
+        )
+        .route(
+            "/minio/v2/metrics/bucket",
+            get(handlers::stats::prometheus_metrics),
+        )
+        .route(
+            "/minio/v2/metrics/resource",
+            get(handlers::stats::prometheus_metrics),
+        )
         .merge(s3_router)
         // Add tracing layer for request logging
         .layer(TraceLayer::new_for_http())

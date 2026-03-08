@@ -5,7 +5,7 @@
   Per S3 spec, a bucket must have no entries at all — including old
   versions and delete markers — before it can be deleted. The previous
   implementation filtered these out via strip_version_ids_from_keys,
-  which could allow deletion of non-empty versioned buckets.
+  which could allow deletion of non-empty versioned buckets.  
 
 # v0.0.1-alpha-21
 

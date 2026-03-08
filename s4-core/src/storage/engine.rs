@@ -68,6 +68,8 @@ pub struct ListVersionsResult {
     pub versions: Vec<ObjectVersion>,
     /// Delete markers.
     pub delete_markers: Vec<DeleteMarkerEntry>,
+    /// Common prefixes (when delimiter is used).
+    pub common_prefixes: Vec<String>,
     /// True if there are more results.
     pub is_truncated: bool,
     /// Next key marker for pagination.

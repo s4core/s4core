@@ -31,80 +31,116 @@ use super::xml;
 #[derive(Error, Debug, Clone)]
 pub enum S3Error {
     /// The specified bucket does not exist.
-    #[error("NoSuchBucket: The specified bucket does not exist")]
+    #[error("The specified bucket does not exist")]
     NoSuchBucket,
 
     /// The specified key does not exist.
-    #[error("NoSuchKey: The specified key does not exist")]
+    #[error("The specified key does not exist")]
     NoSuchKey,
 
     /// The requested bucket name is not available.
-    #[error("BucketAlreadyExists: The requested bucket name is not available")]
+    #[error("The requested bucket name is not available")]
     BucketAlreadyExists,
 
     /// The request is invalid.
-    #[error("InvalidRequest: {0}")]
+    #[error("{0}")]
     InvalidRequest(String),
 
+    /// Missing argument.
+    #[error("{0}")]
+    InvalidArgument(String),
+
     /// Access denied.
-    #[error("AccessDenied: Access Denied")]
+    #[error("Access Denied")]
     AccessDenied,
 
     /// The bucket is not empty.
-    #[error("BucketNotEmpty: The bucket you tried to delete is not empty")]
+    #[error("The bucket you tried to delete is not empty")]
     BucketNotEmpty,
 
     /// Invalid bucket name.
-    #[error("InvalidBucketName: The specified bucket is not valid")]
+    #[error("The specified bucket is not valid")]
     InvalidBucketName(String),
 
     /// Signature does not match.
-    #[error("SignatureDoesNotMatch: The request signature we calculated does not match")]
+    #[error("The request signature we calculated does not match")]
     SignatureDoesNotMatch,
 
     /// The specified multipart upload does not exist.
-    #[error("NoSuchUpload: The specified multipart upload does not exist")]
+    #[error("The specified multipart upload does not exist")]
     NoSuchUpload,
 
     /// The CORS configuration does not exist.
-    #[error("NoSuchCORSConfiguration: The CORS configuration does not exist")]
+    #[error("The CORS configuration does not exist")]
     NoSuchCORSConfiguration,
 
     /// The lifecycle configuration does not exist.
-    #[error("NoSuchLifecycleConfiguration: The lifecycle configuration does not exist")]
+    #[error("The lifecycle configuration does not exist")]
     NoSuchLifecycleConfiguration,
 
     /// The specified version does not exist.
-    #[error("NoSuchVersion: The specified version does not exist")]
+    #[error("The specified version does not exist")]
     NoSuchVersion,
 
     /// Malformed XML in request body.
-    #[error("MalformedXML: The XML you provided was not well-formed")]
+    #[error("The XML you provided was not well-formed")]
     MalformedXML,
 
     /// The Object Lock configuration does not exist.
-    #[error("ObjectLockConfigurationNotFoundError: The Object Lock configuration does not exist")]
+    #[error("The Object Lock configuration does not exist")]
     ObjectLockConfigurationNotFound,
 
     /// Invalid bucket state for the operation.
-    #[error("InvalidBucketState: {0}")]
+    #[error("{0}")]
     InvalidBucketState(String),
 
     /// The object lock configuration does not exist for this object.
-    #[error("NoSuchObjectLockConfiguration: The specified object does not have an Object Lock configuration")]
+    #[error("The specified object does not have an Object Lock configuration")]
     NoSuchObjectLockConfiguration,
 
     /// Invalid retention configuration.
-    #[error("InvalidRetention: {0}")]
+    #[error("{0}")]
     InvalidRetention(String),
 
     /// Internal error.
-    #[error("InternalError: {0}")]
+    #[error("{0}")]
     InternalError(String),
 
     /// The requested functionality is not implemented.
-    #[error("NotImplemented: {0}")]
+    #[error("{0}")]
     NotImplemented(String),
+
+    /// The specified method is not allowed against this resource.
+    #[error("The specified method is not allowed against this resource.")]
+    MethodNotAllowed,
+
+    /// The provided 'x-amz-content-sha256' header does not match what was computed.
+    #[error("The provided 'x-amz-content-sha256' header does not match what was computed.")]
+    XAmzContentSHA256Mismatch,
+
+    /// One or more of the specified parts could not be found (part too small).
+    #[error("Your proposed upload is smaller than the minimum allowed object size.")]
+    EntityTooSmall,
+
+    /// Bad request (generic 400).
+    #[error("{0}")]
+    BadRequest(String),
+
+    /// Invalid tag key or value.
+    #[error("{0}")]
+    InvalidTag(String),
+
+    /// The Content-MD5 you specified did not match what we received.
+    #[error("The Content-MD5 you specified did not match what we received.")]
+    BadDigest,
+
+    /// The storage class you specified is not valid.
+    #[error("The storage class you specified is not valid")]
+    InvalidStorageClass,
+
+    /// The server side encryption configuration was not found.
+    #[error("The server side encryption configuration was not found")]
+    ServerSideEncryptionConfigurationNotFound,
 }
 
 impl S3Error {
@@ -115,6 +151,7 @@ impl S3Error {
             S3Error::NoSuchKey => "NoSuchKey",
             S3Error::BucketAlreadyExists => "BucketAlreadyExists",
             S3Error::InvalidRequest(_) => "InvalidRequest",
+            S3Error::InvalidArgument(_) => "InvalidArgument",
             S3Error::AccessDenied => "AccessDenied",
             S3Error::BucketNotEmpty => "BucketNotEmpty",
             S3Error::InvalidBucketName(_) => "InvalidBucketName",
@@ -130,6 +167,16 @@ impl S3Error {
             S3Error::InvalidRetention(_) => "InvalidRetention",
             S3Error::InternalError(_) => "InternalError",
             S3Error::NotImplemented(_) => "NotImplemented",
+            S3Error::MethodNotAllowed => "MethodNotAllowed",
+            S3Error::XAmzContentSHA256Mismatch => "XAmzContentSHA256Mismatch",
+            S3Error::EntityTooSmall => "EntityTooSmall",
+            S3Error::BadRequest(_) => "BadRequest",
+            S3Error::InvalidTag(_) => "InvalidTag",
+            S3Error::BadDigest => "BadDigest",
+            S3Error::InvalidStorageClass => "InvalidStorageClass",
+            S3Error::ServerSideEncryptionConfigurationNotFound => {
+                "ServerSideEncryptionConfigurationNotFoundError"
+            }
         }
     }
 
@@ -140,6 +187,7 @@ impl S3Error {
             S3Error::NoSuchKey => StatusCode::NOT_FOUND,
             S3Error::BucketAlreadyExists => StatusCode::CONFLICT,
             S3Error::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+            S3Error::InvalidArgument(_) => StatusCode::BAD_REQUEST,
             S3Error::AccessDenied => StatusCode::FORBIDDEN,
             S3Error::BucketNotEmpty => StatusCode::CONFLICT,
             S3Error::InvalidBucketName(_) => StatusCode::BAD_REQUEST,
@@ -155,6 +203,14 @@ impl S3Error {
             S3Error::InvalidRetention(_) => StatusCode::BAD_REQUEST,
             S3Error::InternalError(_) => StatusCode::INTERNAL_SERVER_ERROR,
             S3Error::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
+            S3Error::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
+            S3Error::XAmzContentSHA256Mismatch => StatusCode::BAD_REQUEST,
+            S3Error::EntityTooSmall => StatusCode::BAD_REQUEST,
+            S3Error::BadRequest(_) => StatusCode::BAD_REQUEST,
+            S3Error::InvalidTag(_) => StatusCode::BAD_REQUEST,
+            S3Error::BadDigest => StatusCode::BAD_REQUEST,
+            S3Error::InvalidStorageClass => StatusCode::BAD_REQUEST,
+            S3Error::ServerSideEncryptionConfigurationNotFound => StatusCode::NOT_FOUND,
         }
     }
 }

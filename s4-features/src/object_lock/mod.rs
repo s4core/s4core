@@ -127,8 +127,8 @@ impl ObjectLockConfiguration {
                 return Err(ObjectLockError::RetentionWithoutLockEnabled);
             }
 
-            // Validate retention days > 0
-            if retention.days == 0 {
+            // Validate retention days > 0 or years > 0
+            if retention.days == 0 && retention.years == 0 {
                 return Err(ObjectLockError::InvalidRetentionDays { days: 0 });
             }
         }
@@ -248,6 +248,7 @@ mod tests {
             default_retention: Some(DefaultRetention {
                 mode: RetentionMode::GOVERNANCE,
                 days: 30,
+                years: 0,
             }),
         };
         assert!(config.validate().is_ok());
@@ -265,6 +266,7 @@ mod tests {
             default_retention: Some(DefaultRetention {
                 mode: RetentionMode::COMPLIANCE,
                 days: 90,
+                years: 0,
             }),
         };
         assert!(matches!(
@@ -278,6 +280,7 @@ mod tests {
             default_retention: Some(DefaultRetention {
                 mode: RetentionMode::GOVERNANCE,
                 days: 0,
+                years: 0,
             }),
         };
         assert!(matches!(
@@ -291,6 +294,7 @@ mod tests {
         let retention = DefaultRetention {
             mode: RetentionMode::GOVERNANCE,
             days: 30,
+            years: 0,
         };
 
         // Created at Unix epoch (0 nanoseconds)

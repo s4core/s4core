@@ -558,6 +558,283 @@ pub async fn get_bucket_location(
         .into_response()
 }
 
+// ============================================================================
+// Bucket Policy Handlers
+// ============================================================================
+
+const POLICY_CONFIG_PREFIX: &str = "__s4_bucket_policy_";
+
+/// Gets the bucket policy.
+///
+/// S3 API: GET /{bucket}?policy
+pub async fn get_bucket_policy(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+) -> impl IntoResponse {
+    debug!("GetBucketPolicy: {}", bucket);
+
+    let storage = state.storage.read().await;
+
+    // Check if bucket exists
+    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
+    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
+        return S3Error::NoSuchBucket.into_response();
+    }
+
+    let policy_key = format!("{}{}", POLICY_CONFIG_PREFIX, bucket);
+    match storage.get_object("__system__", &policy_key).await {
+        Ok((data, _)) => {
+            let json = String::from_utf8_lossy(&data).to_string();
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json))
+                .unwrap()
+        }
+        Err(_) => {
+            // No policy configured — return NoSuchBucketPolicy
+            // S3 returns this as a generic error with code "NoSuchBucketPolicy"
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>NoSuchBucketPolicy</Code>
+  <Message>The bucket policy does not exist</Message>
+  <BucketName>{}</BucketName>
+  <RequestId>{}</RequestId>
+</Error>"#,
+                bucket, request_id
+            );
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .header(header::CONTENT_TYPE, "application/xml")
+                .header("x-amz-request-id", request_id)
+                .body(Body::from(xml))
+                .unwrap()
+        }
+    }
+}
+
+/// Sets the bucket policy.
+///
+/// S3 API: PUT /{bucket}?policy
+pub async fn put_bucket_policy(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    body: Bytes,
+) -> impl IntoResponse {
+    info!("PutBucketPolicy: {}", bucket);
+
+    let storage = state.storage.read().await;
+
+    // Check if bucket exists
+    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
+    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
+        return S3Error::NoSuchBucket.into_response();
+    }
+
+    // Validate JSON
+    let policy_str = String::from_utf8_lossy(&body);
+    if serde_json::from_str::<serde_json::Value>(&policy_str).is_err() {
+        return S3Error::MalformedXML.into_response();
+    }
+
+    // Store policy
+    let policy_key = format!("{}{}", POLICY_CONFIG_PREFIX, bucket);
+    if let Err(e) = storage
+        .put_object(
+            "__system__",
+            &policy_key,
+            &body,
+            "application/json",
+            &HashMap::new(),
+        )
+        .await
+    {
+        error!("Failed to store bucket policy: {:?}", e);
+        return S3Error::InternalError("Failed to store bucket policy".to_string()).into_response();
+    }
+
+    info!("Bucket policy saved for bucket: {}", bucket);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Deletes the bucket policy.
+///
+/// S3 API: DELETE /{bucket}?policy
+pub async fn delete_bucket_policy(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+) -> impl IntoResponse {
+    info!("DeleteBucketPolicy: {}", bucket);
+
+    let storage = state.storage.read().await;
+
+    // Check if bucket exists
+    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
+    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
+        return S3Error::NoSuchBucket.into_response();
+    }
+
+    let policy_key = format!("{}{}", POLICY_CONFIG_PREFIX, bucket);
+    let _ = storage.delete_object("__system__", &policy_key).await;
+
+    info!("Bucket policy deleted for bucket: {}", bucket);
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Gets the bucket policy status (whether the policy is public).
+///
+/// S3 API: GET /{bucket}?policyStatus
+pub async fn get_bucket_policy_status(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+) -> impl IntoResponse {
+    debug!("GetBucketPolicyStatus: {}", bucket);
+
+    let storage = state.storage.read().await;
+
+    // Check if bucket exists
+    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
+    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
+        return S3Error::NoSuchBucket.into_response();
+    }
+
+    // Without Block Public Access settings, IsPublic is always false
+    let is_public = false;
+
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<PolicyStatus xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <IsPublic>{}</IsPublic>
+</PolicyStatus>"#,
+        if is_public { "true" } else { "false" }
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml")
+        .body(Body::from(xml))
+        .unwrap()
+}
+
+// ============================================================================
+// Bucket Encryption Configuration (stub — S4 uses AES-256 for all objects)
+// ============================================================================
+
+/// Default SSE-S3 encryption configuration XML (AES256).
+const DEFAULT_ENCRYPTION_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Rule>
+    <ApplyServerSideEncryptionByDefault>
+      <SSEAlgorithm>AES256</SSEAlgorithm>
+    </ApplyServerSideEncryptionByDefault>
+  </Rule>
+</ServerSideEncryptionConfiguration>"#;
+
+/// Sets bucket encryption configuration (stub — accepts and stores config).
+///
+/// S3 API: PUT /{bucket}?encryption
+pub async fn put_bucket_encryption(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+    body: Bytes,
+) -> impl IntoResponse {
+    debug!("PutBucketEncryption: {}", bucket);
+
+    let storage = state.storage.read().await;
+
+    // Check if bucket exists
+    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
+    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
+        return crate::s3::errors::S3Error::NoSuchBucket.into_response();
+    }
+
+    // Store encryption config
+    let config_key = format!("__s4_bucket_encryption_{}", bucket);
+    let data = if body.is_empty() {
+        DEFAULT_ENCRYPTION_XML.as_bytes()
+    } else {
+        &body
+    };
+
+    match storage
+        .put_object(
+            "__system__",
+            &config_key,
+            data,
+            "application/xml",
+            &std::collections::HashMap::new(),
+        )
+        .await
+    {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(e) => {
+            error!("Failed to save encryption config: {:?}", e);
+            crate::s3::errors::S3Error::InternalError("Failed to save encryption config".into())
+                .into_response()
+        }
+    }
+}
+
+/// Gets bucket encryption configuration.
+///
+/// S3 API: GET /{bucket}?encryption
+pub async fn get_bucket_encryption(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+) -> impl IntoResponse {
+    debug!("GetBucketEncryption: {}", bucket);
+
+    let storage = state.storage.read().await;
+
+    // Check if bucket exists
+    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
+    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
+        return crate::s3::errors::S3Error::NoSuchBucket.into_response();
+    }
+
+    // Get stored encryption config, or return error if not set
+    let config_key = format!("__s4_bucket_encryption_{}", bucket);
+    match storage.get_object("__system__", &config_key).await {
+        Ok((data, _)) => {
+            let xml = String::from_utf8_lossy(&data).to_string();
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/xml")
+                .body(Body::from(xml))
+                .unwrap()
+        }
+        Err(_) => {
+            crate::s3::errors::S3Error::ServerSideEncryptionConfigurationNotFound.into_response()
+        }
+    }
+}
+
+/// Deletes bucket encryption configuration (resets to default AES256).
+///
+/// S3 API: DELETE /{bucket}?encryption
+pub async fn delete_bucket_encryption(
+    State(state): State<AppState>,
+    Path(bucket): Path<String>,
+) -> impl IntoResponse {
+    debug!("DeleteBucketEncryption: {}", bucket);
+
+    let storage = state.storage.read().await;
+
+    // Check if bucket exists
+    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
+    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
+        return crate::s3::errors::S3Error::NoSuchBucket.into_response();
+    }
+
+    // Delete stored config (will return default on next GET)
+    let config_key = format!("__s4_bucket_encryption_{}", bucket);
+    let _ = storage.delete_object("__system__", &config_key).await;
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

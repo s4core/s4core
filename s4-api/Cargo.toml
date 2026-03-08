@@ -10,6 +10,7 @@ repository.workspace = true
 # Workspace dependencies
 s4-core = { path = "../s4-core" }
 s4-features = { path = "../s4-features" }
+s4-select = { path = "../s4-select" }
 tokio = { workspace = true }
 axum = { workspace = true }
 hyper = { workspace = true }
@@ -25,6 +26,7 @@ tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+sha1 = { workspace = true }
 sha2 = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }

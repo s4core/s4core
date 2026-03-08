@@ -253,6 +253,11 @@ pub async fn get_object_retention(
         Err(_) => return S3Error::NoSuchKey.into_response(),
     };
 
+    // Delete markers don't have retention
+    if record.is_delete_marker {
+        return S3Error::MethodNotAllowed.into_response();
+    }
+
     // Check if retention is set
     match (record.retention_mode, record.retain_until_timestamp) {
         (Some(mode), Some(retain_until)) => {
@@ -337,22 +342,60 @@ pub async fn put_object_retention(
         Err(_) => return S3Error::NoSuchKey.into_response(),
     };
 
+    // Delete markers don't have retention
+    if record.is_delete_marker {
+        return S3Error::MethodNotAllowed.into_response();
+    }
+
+    // Parse the new retention first so we can validate COMPLIANCE extensions
+    let new_retain_until = match &retention {
+        Some(ret) => match iso8601_to_timestamp(&ret.retain_until_date) {
+            Ok(ts) => Some(ts),
+            Err(e) => {
+                error!("Invalid retain-until-date: {:?}", e);
+                return S3Error::InvalidRequest(format!("Invalid date format: {}", e))
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
     // Check existing retention mode for permission
     if let Some(existing_mode) = record.retention_mode {
         if existing_mode == RetentionMode::COMPLIANCE {
-            warn!(
-                "Attempt to modify COMPLIANCE retention on {}/{} version {}",
-                bucket, key, version_id
-            );
-            return S3Error::AccessDenied.into_response();
+            // COMPLIANCE mode only allows extending the retention period
+            // (same mode, later date). Clearing or shortening is denied.
+            let allowed = match (&retention, record.retain_until_timestamp) {
+                (Some(ret), Some(current_until)) if ret.mode == RetentionMode::COMPLIANCE => {
+                    // Allow only if new date is strictly later
+                    new_retain_until.is_some_and(|new_ts| new_ts > current_until)
+                }
+                _ => false,
+            };
+            if !allowed {
+                warn!(
+                    "Attempt to modify COMPLIANCE retention on {}/{} version {}",
+                    bucket, key, version_id
+                );
+                return S3Error::AccessDenied.into_response();
+            }
         }
-        // GOVERNANCE mode requires bypass header to modify/clear
+        // GOVERNANCE mode: bypass header allows any modification.
+        // Without bypass, only extending the retention period (same mode, later date) is allowed.
         if existing_mode == RetentionMode::GOVERNANCE && !bypass_governance {
-            warn!(
-                "Attempt to modify GOVERNANCE retention without bypass on {}/{} version {}",
-                bucket, key, version_id
-            );
-            return S3Error::AccessDenied.into_response();
+            let can_extend = match (&retention, record.retain_until_timestamp) {
+                (Some(ret), Some(current_until)) if ret.mode == RetentionMode::GOVERNANCE => {
+                    new_retain_until.is_some_and(|new_ts| new_ts > current_until)
+                }
+                _ => false,
+            };
+            if !can_extend {
+                warn!(
+                    "Attempt to modify GOVERNANCE retention without bypass on {}/{} version {}",
+                    bucket, key, version_id
+                );
+                return S3Error::AccessDenied.into_response();
+            }
         }
     }
 
@@ -367,15 +410,7 @@ pub async fn put_object_retention(
             );
         }
         Some(ret) => {
-            // Validate retain-until-date is in future
-            let retain_until = match iso8601_to_timestamp(&ret.retain_until_date) {
-                Ok(ts) => ts,
-                Err(e) => {
-                    error!("Invalid retain-until-date: {:?}", e);
-                    return S3Error::InvalidRequest(format!("Invalid date format: {}", e))
-                        .into_response();
-                }
-            };
+            let retain_until = new_retain_until.unwrap();
 
             let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
             if retain_until <= now {
@@ -437,6 +472,11 @@ pub async fn get_object_legal_hold(
         Ok(r) => r,
         Err(_) => return S3Error::NoSuchKey.into_response(),
     };
+
+    // Delete markers don't have legal hold
+    if record.is_delete_marker {
+        return S3Error::MethodNotAllowed.into_response();
+    }
 
     // Return legal hold status
     let status = LegalHoldStatus::from_bool(record.legal_hold);
@@ -500,6 +540,11 @@ pub async fn put_object_legal_hold(
         Ok(r) => r,
         Err(_) => return S3Error::NoSuchKey.into_response(),
     };
+
+    // Delete markers don't have legal hold
+    if record.is_delete_marker {
+        return S3Error::MethodNotAllowed.into_response();
+    }
 
     // Update legal hold
     record.legal_hold = hold.status.to_bool();

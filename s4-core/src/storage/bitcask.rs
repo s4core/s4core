@@ -894,23 +894,66 @@ impl StorageEngine for BitcaskStorageEngine {
         version_id_marker: Option<&str>,
         max_keys: usize,
     ) -> Result<ListVersionsResult, StorageError> {
-        // List all version list keys for this bucket/prefix
+        // Collect all object keys in the bucket (both versioned and unversioned).
+        // We need to merge two sources:
+        // 1. Version list entries (__s4_versions_{bucket}/{key}) → versioned objects
+        // 2. Regular object entries ({bucket}/{key}) → may include unversioned objects
+
+        // Build a set of keys that have version lists
         let version_list_prefix = format!("__s4_versions_{}/{}", bucket, prefix);
         let version_list_entries = self.index_db.list(&version_list_prefix, usize::MAX).await?;
+
+        let mut versioned_keys: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for (list_key, _) in &version_list_entries {
+            let key_part =
+                list_key.strip_prefix(&format!("__s4_versions_{}/", bucket)).unwrap_or(list_key);
+            versioned_keys.insert(key_part.to_string());
+        }
+
+        // List regular objects to find unversioned ones
+        let bucket_prefix = format!("{}/{}", bucket, prefix);
+        let all_entries = self.index_db.list(&bucket_prefix, usize::MAX).await?;
+
+        let mut unversioned_keys: Vec<String> = Vec::new();
+        for (full_key, _) in &all_entries {
+            let key_part = full_key.strip_prefix(&format!("{}/", bucket)).unwrap_or(full_key);
+
+            // Skip version record keys (contain #)
+            if key_part.contains('#') {
+                continue;
+            }
+
+            // Skip keys that have version lists (they're versioned)
+            if versioned_keys.contains(key_part) {
+                continue;
+            }
+
+            unversioned_keys.push(key_part.to_string());
+        }
+
+        // Merge versioned and unversioned keys in sorted order
+        // Build a unified sorted list of (key, is_versioned)
+        let mut all_keys: Vec<(String, bool)> = Vec::new();
+        for k in &versioned_keys {
+            all_keys.push((k.clone(), true));
+        }
+        for k in &unversioned_keys {
+            all_keys.push((k.clone(), false));
+        }
+        all_keys.sort_by(|a, b| a.0.cmp(&b.0));
 
         let mut result = ListVersionsResult::default();
         let mut count = 0;
         let mut past_marker = key_marker.is_none();
+        // Track the last added key/version for correct pagination markers
+        let mut last_key: Option<String> = None;
+        let mut last_version_id: Option<String> = None;
 
-        for (list_key, _) in version_list_entries {
-            // Extract object key from version list key
-            let key_part = list_key
-                .strip_prefix(&format!("__s4_versions_{}/", bucket))
-                .unwrap_or(&list_key);
-
+        for (key_part, is_versioned) in &all_keys {
             // Handle key marker pagination
             if !past_marker {
-                if Some(key_part) == key_marker {
+                if Some(key_part.as_str()) == key_marker {
                     past_marker = true;
                 }
                 if !past_marker {
@@ -918,51 +961,76 @@ impl StorageEngine for BitcaskStorageEngine {
                 }
             }
 
-            // Get the version list for this key
-            let version_list = self.get_version_list(bucket, key_part).await?;
+            if *is_versioned {
+                // Versioned object: enumerate all versions from version list
+                let version_list = self.get_version_list(bucket, key_part).await?;
 
-            let mut past_version_marker =
-                version_id_marker.is_none() || key_marker != Some(key_part);
+                let mut past_version_marker =
+                    version_id_marker.is_none() || key_marker != Some(key_part.as_str());
 
-            for (i, vid) in version_list.versions.iter().enumerate() {
-                // Handle version ID marker pagination
-                if !past_version_marker {
-                    if Some(vid.as_str()) == version_id_marker {
-                        past_version_marker = true;
+                for (i, vid) in version_list.versions.iter().enumerate() {
+                    if !past_version_marker {
+                        if Some(vid.as_str()) == version_id_marker {
+                            past_version_marker = true;
+                        }
+                        continue;
                     }
-                    continue;
-                }
 
+                    if count >= max_keys {
+                        result.is_truncated = true;
+                        result.next_key_marker = last_key;
+                        result.next_version_id_marker = last_version_id;
+                        return Ok(result);
+                    }
+
+                    let version_key = self.make_version_key(bucket, key_part, vid);
+                    if let Some(record) = self.index_db.get(&version_key).await? {
+                        let is_latest = i == 0;
+
+                        if record.is_delete_marker {
+                            result.delete_markers.push(DeleteMarkerEntry {
+                                key: key_part.to_string(),
+                                version_id: vid.clone(),
+                                is_latest,
+                                last_modified: record.modified_at,
+                            });
+                        } else {
+                            result.versions.push(ObjectVersion {
+                                key: key_part.to_string(),
+                                version_id: vid.clone(),
+                                is_latest,
+                                last_modified: record.modified_at,
+                                etag: record.etag.clone(),
+                                size: record.size,
+                            });
+                        }
+
+                        last_key = Some(key_part.to_string());
+                        last_version_id = Some(vid.clone());
+                        count += 1;
+                    }
+                }
+            } else {
+                // Unversioned object: include with "null" version ID
                 if count >= max_keys {
                     result.is_truncated = true;
-                    result.next_key_marker = Some(key_part.to_string());
-                    result.next_version_id_marker = Some(vid.clone());
+                    result.next_key_marker = last_key;
+                    result.next_version_id_marker = last_version_id;
                     return Ok(result);
                 }
 
-                // Get version record
-                let version_key = self.make_version_key(bucket, key_part, vid);
-                if let Some(record) = self.index_db.get(&version_key).await? {
-                    let is_latest = i == 0;
-
-                    if record.is_delete_marker {
-                        result.delete_markers.push(DeleteMarkerEntry {
-                            key: key_part.to_string(),
-                            version_id: vid.clone(),
-                            is_latest,
-                            last_modified: record.modified_at,
-                        });
-                    } else {
-                        result.versions.push(ObjectVersion {
-                            key: key_part.to_string(),
-                            version_id: vid.clone(),
-                            is_latest,
-                            last_modified: record.modified_at,
-                            etag: record.etag.clone(),
-                            size: record.size,
-                        });
-                    }
-
+                let full_key = self.make_key(bucket, key_part);
+                if let Some(record) = self.index_db.get(&full_key).await? {
+                    result.versions.push(ObjectVersion {
+                        key: key_part.to_string(),
+                        version_id: NULL_VERSION_ID.to_string(),
+                        is_latest: true,
+                        last_modified: record.modified_at,
+                        etag: record.etag.clone(),
+                        size: record.size,
+                    });
+                    last_key = Some(key_part.to_string());
+                    last_version_id = Some(NULL_VERSION_ID.to_string());
                     count += 1;
                 }
             }
@@ -1085,6 +1153,25 @@ impl StorageEngine for BitcaskStorageEngine {
         version_id: &str,
         updated_record: IndexRecord,
     ) -> Result<(), StorageError> {
+        // For non-versioned objects (empty version_id), update the primary key directly
+        if version_id.is_empty() {
+            let full_key = self.make_key(bucket, key);
+            let existing = self.index_db.get(&full_key).await?.ok_or_else(|| {
+                StorageError::VersionNotFound {
+                    key: key.to_string(),
+                    version_id: String::new(),
+                }
+            })?;
+            if existing.is_delete_marker {
+                return Err(StorageError::InvalidOperation {
+                    operation: "update_object_metadata".to_string(),
+                    reason: "Cannot update metadata of delete marker".to_string(),
+                });
+            }
+            self.index_db.put(&full_key, &updated_record).await?;
+            return Ok(());
+        }
+
         let version_key = self.make_version_key(bucket, key, version_id);
 
         // Verify version exists

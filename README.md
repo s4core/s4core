@@ -19,6 +19,8 @@ S4 is a high-performance, S3-compatible object storage server written in Rust. I
 - **Atomic Operations**: Rename directories with millions of files in milliseconds
 - **Strict Consistency**: Data is guaranteed to be written before returning success
 - **IAM & Admin API**: Role-based access control (Reader, Writer, SuperUser) with JWT authentication
+- **S3 Select SQL**: Query CSV/JSON/Parquet objects with full SQL (powered by Apache DataFusion)
+- **Multi-Object SQL**: Extended S3 Select with glob patterns for querying across multiple objects
 - **High Performance**: Optimized for single-node performance
 
 ## Architecture
@@ -162,6 +164,9 @@ S4 is configured through environment variables:
 | `S4_LIFECYCLE_INTERVAL_HOURS` | Lifecycle evaluation interval (hours) | `24` | `1`, `6`, `24`, `168` |
 | `S4_LIFECYCLE_DRY_RUN` | Dry-run mode (log without deleting) | `false` | `true`, `false`, `1`, `0` |
 | `S4_METRICS_ENABLED` | Prometheus metrics | true) | false |
+| `S4_SELECT_ENABLED` | Enable/disable S3 Select SQL engine | `true` | `false` |
+| `S4_SELECT_MAX_MEMORY` | Per-query memory limit for SQL engine | `256MB` | `512MB`, `1GB` |
+| `S4_SELECT_TIMEOUT` | SQL query timeout (seconds) | `60` | `120` |
 
 **Size format**: Supports `GB`/`G`, `MB`/`M`, `KB`/`K`, or bytes (no suffix).
 
@@ -388,6 +393,56 @@ aws --endpoint-url https://localhost:9000 --no-verify-ssl s3 ls
 ```
 
 Legacy `S4_ACCESS_KEY_ID` / `S4_SECRET_ACCESS_KEY` environment credentials continue to work as a fallback with full (SuperUser) access.
+
+### S3 Select SQL
+
+S4 includes a built-in SQL query engine powered by Apache DataFusion. Query your stored objects directly — no need to download them first.
+
+**Single-Object Query (S3 Select API):**
+
+```bash
+# Upload a CSV file
+aws --endpoint-url http://localhost:9000 s3 cp employees.csv s3://mybucket/employees.csv
+
+# Query it with SQL (via curl — returns binary event stream)
+curl -X POST "http://localhost:9000/mybucket/employees.csv?select&select-type=2" \
+  -H "Content-Type: application/xml" \
+  -d '<?xml version="1.0" encoding="UTF-8"?>
+<SelectObjectContentRequest>
+    <Expression>SELECT name, salary FROM s3object WHERE CAST(salary AS INT) > 100000</Expression>
+    <ExpressionType>SQL</ExpressionType>
+    <InputSerialization>
+        <CSV><FileHeaderInfo>USE</FileHeaderInfo></CSV>
+    </InputSerialization>
+    <OutputSerialization>
+        <CSV/>
+    </OutputSerialization>
+</SelectObjectContentRequest>'
+```
+
+Supported input formats: CSV, JSON (Lines/Document), Parquet. Output formats: CSV, JSON.
+
+**Multi-Object SQL Query (S4 Extended):**
+
+S4 extends S3 Select with multi-object queries using glob patterns:
+
+```bash
+# Upload multiple CSV files
+aws --endpoint-url http://localhost:9000 s3 cp data1.csv s3://mybucket/logs/data1.csv
+aws --endpoint-url http://localhost:9000 s3 cp data2.csv s3://mybucket/logs/data2.csv
+
+# Query across all matching objects (JSON output)
+curl -X POST "http://localhost:9000/mybucket?sql" \
+  -H "Content-Type: application/json" \
+  -d '{"sql": "SELECT * FROM '\''logs/*.csv'\'' WHERE status = '\''ERROR'\''", "format": "csv", "output": "json"}'
+
+# Aggregation across files (CSV output)
+curl -X POST "http://localhost:9000/mybucket?sql" \
+  -H "Content-Type: application/json" \
+  -d '{"sql": "SELECT COUNT(*) as total, AVG(CAST(value AS DOUBLE)) as avg_val FROM '\''logs/*.csv'\''", "format": "csv", "output": "csv"}'
+```
+
+Full SQL support includes `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`, `JOIN`, window functions, CTEs, and aggregate functions.
 
 ### CORS Configuration
 

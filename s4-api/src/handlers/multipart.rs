@@ -32,8 +32,6 @@ use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use sha2::{Digest, Sha256};
-
 use crate::middleware::{decode_aws_chunked, is_aws_chunked, validate_decoded_content_length};
 use crate::s3::errors::S3Error;
 use crate::server::AppState;
@@ -49,6 +47,12 @@ pub struct MultipartQuery {
     pub part_number: Option<u32>,
     /// Marker for uploads initiation (presence indicates CreateMultipartUpload).
     pub uploads: Option<String>,
+    /// Maximum number of parts to return in ListParts (0-1000).
+    #[serde(rename = "max-parts")]
+    pub max_parts: Option<i64>,
+    /// Part number marker for ListParts pagination.
+    #[serde(rename = "part-number-marker")]
+    pub part_number_marker: Option<i64>,
 }
 
 /// Initiates a multipart upload.
@@ -80,13 +84,26 @@ pub async fn create_multipart_upload(
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream");
+        .unwrap_or("binary/octet-stream");
 
-    // Store upload metadata
+    // Extract custom metadata (x-amz-meta-* headers)
+    let mut custom_metadata = HashMap::new();
+    for (name, value) in headers.iter() {
+        let name_str = name.as_str().to_lowercase();
+        if name_str.starts_with("x-amz-meta-") {
+            if let Ok(v) = value.to_str() {
+                let meta_key = name_str.strip_prefix("x-amz-meta-").unwrap().to_string();
+                custom_metadata.insert(meta_key, v.to_string());
+            }
+        }
+    }
+
+    // Store upload metadata (including custom metadata)
     let upload_marker_key = format!("__s4_multipart_{}_{}", upload_id, key);
+    let meta_json = serde_json::to_string(&custom_metadata).unwrap_or_default();
     let metadata = format!(
-        "{{\"bucket\":\"{}\",\"key\":\"{}\",\"content_type\":\"{}\"}}",
-        bucket, key, content_type
+        "{{\"bucket\":\"{}\",\"key\":\"{}\",\"content_type\":\"{}\",\"custom_metadata\":{}}}",
+        bucket, key, content_type, meta_json
     );
 
     if let Err(e) = storage
@@ -285,7 +302,7 @@ pub async fn upload_part(
 
     // Store the part in memory (avoids polluting append-only volumes with temp data)
     let part_key = format!("__s4_part_{}_{}_{:05}", upload_id, key, part_number);
-    let etag = format!("{:x}", Sha256::digest(&body));
+    let etag = format!("{:x}", md5::compute(&body));
 
     {
         let mut parts = state.part_store.write().await;
@@ -342,7 +359,7 @@ pub async fn complete_multipart_upload(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<MultipartQuery>,
-    headers: HeaderMap,
+    _headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
     let upload_id = match params.upload_id {
@@ -380,10 +397,10 @@ pub async fn complete_multipart_upload(
         if let Some(end) = upload_metadata[start..].find('"') {
             &upload_metadata[start..start + end]
         } else {
-            "application/octet-stream"
+            "binary/octet-stream"
         }
     } else {
-        "application/octet-stream"
+        "binary/octet-stream"
     };
 
     // Collect parts from in-memory store
@@ -403,22 +420,30 @@ pub async fn complete_multipart_upload(
         return S3Error::InvalidRequest("No parts uploaded".to_string()).into_response();
     }
 
+    // S3 spec: all parts except the last must be at least 5MB
+    const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB
+    if sorted_parts.len() > 1 {
+        for (_, data) in &sorted_parts[..sorted_parts.len() - 1] {
+            if data.len() < MIN_PART_SIZE {
+                return S3Error::EntityTooSmall.into_response();
+            }
+        }
+    }
+
     let mut combined_data = Vec::new();
     for (_, data) in &sorted_parts {
         combined_data.extend_from_slice(data);
     }
 
-    // Extract custom metadata from headers
-    let mut metadata = HashMap::new();
-    for (name, value) in headers.iter() {
-        let name_str = name.as_str().to_lowercase();
-        if name_str.starts_with("x-amz-meta-") {
-            if let Ok(v) = value.to_str() {
-                let meta_key = name_str.strip_prefix("x-amz-meta-").unwrap().to_string();
-                metadata.insert(meta_key, v.to_string());
-            }
-        }
-    }
+    // Extract custom metadata from upload initiation metadata (not from complete request headers)
+    let metadata: HashMap<String, String> =
+        if let Some(start) = upload_metadata.find("\"custom_metadata\":") {
+            let json_start = start + "\"custom_metadata\":".len();
+            serde_json::from_str(&upload_metadata[json_start..upload_metadata.len() - 1])
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
 
     // Store the combined object
     let etag =
@@ -510,6 +535,150 @@ pub async fn abort_multipart_upload(
 
     info!("Multipart upload aborted: uploadId={}", upload_id);
     StatusCode::NO_CONTENT.into_response()
+}
+
+/// Lists parts uploaded for a multipart upload.
+///
+/// S3 API: GET /{bucket}/{key}?uploadId=X
+///
+/// # Returns
+///
+/// XML response listing parts with ETags and sizes.
+pub async fn list_parts(
+    State(state): State<AppState>,
+    Path((bucket, key)): Path<(String, String)>,
+    Query(params): Query<MultipartQuery>,
+) -> impl IntoResponse {
+    let upload_id = match params.upload_id {
+        Some(id) => id,
+        None => return S3Error::InvalidRequest("Missing uploadId".to_string()).into_response(),
+    };
+
+    // Validate max-parts (must be non-negative, max 1000)
+    let max_parts = match params.max_parts {
+        Some(v) if v < 0 => {
+            return S3Error::InvalidArgument(
+                "Argument max-parts must be a non-negative integer".to_string(),
+            )
+            .into_response();
+        }
+        Some(v) => std::cmp::min(v as usize, 1000),
+        None => 1000,
+    };
+
+    // Validate part-number-marker (must be non-negative)
+    let part_number_marker = match params.part_number_marker {
+        Some(v) if v < 0 => {
+            return S3Error::InvalidArgument(
+                "Argument part-number-marker must be a non-negative integer".to_string(),
+            )
+            .into_response();
+        }
+        Some(v) => Some(v as u32),
+        None => None,
+    };
+
+    debug!(
+        "ListParts: bucket={}, key={}, uploadId={}, maxParts={}, partNumberMarker={:?}",
+        bucket, key, upload_id, max_parts, part_number_marker
+    );
+
+    let storage = state.storage.read().await;
+
+    // Check if bucket exists
+    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
+    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
+        return S3Error::NoSuchBucket.into_response();
+    }
+
+    // Verify multipart upload exists
+    let upload_marker_key = format!("__s4_multipart_{}_{}", upload_id, key);
+    if storage.head_object("__system__", &upload_marker_key).await.is_err() {
+        return S3Error::NoSuchUpload.into_response();
+    }
+
+    // List parts from in-memory store
+    let part_prefix = format!("__s4_part_{}_{}_", upload_id, key);
+    let parts_list: Vec<(u32, String, usize)> = {
+        let parts = state.part_store.read().await;
+        let mut matching: Vec<(u32, String, usize)> = parts
+            .iter()
+            .filter(|(k, _)| k.starts_with(&part_prefix))
+            .filter_map(|(k, v)| {
+                // Extract part number from key: __s4_part_{upload_id}_{key}_{part_number:05}
+                let suffix = k.strip_prefix(&part_prefix)?;
+                let part_num: u32 = suffix.parse().ok()?;
+                let etag = format!("{:x}", md5::compute(v));
+                Some((part_num, etag, v.len()))
+            })
+            .collect();
+        matching.sort_by_key(|(num, _, _)| *num);
+        matching
+    };
+
+    // Apply part-number-marker filter (return parts AFTER the marker)
+    let filtered_parts: Vec<_> = if let Some(marker) = part_number_marker {
+        parts_list.into_iter().filter(|(num, _, _)| *num > marker).collect()
+    } else {
+        parts_list
+    };
+
+    // Apply max-parts pagination
+    let is_truncated = filtered_parts.len() > max_parts;
+    let page_parts: Vec<_> = filtered_parts.into_iter().take(max_parts).collect();
+    let next_marker = if is_truncated {
+        page_parts.last().map(|(num, _, _)| *num)
+    } else {
+        None
+    };
+
+    // Build XML response
+    let mut parts_xml = String::new();
+    for (part_num, etag, size) in &page_parts {
+        parts_xml.push_str(&format!(
+            "  <Part>\n    <PartNumber>{}</PartNumber>\n    <ETag>\"{}\"</ETag>\n    <Size>{}</Size>\n    <LastModified>{}</LastModified>\n  </Part>\n",
+            part_num, etag, size, chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        ));
+    }
+
+    let mut extra_xml = String::new();
+    if let Some(marker) = part_number_marker {
+        extra_xml.push_str(&format!(
+            "  <PartNumberMarker>{}</PartNumberMarker>\n",
+            marker
+        ));
+    }
+    if let Some(next) = next_marker {
+        extra_xml.push_str(&format!(
+            "  <NextPartNumberMarker>{}</NextPartNumberMarker>\n",
+            next
+        ));
+    }
+
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListPartsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Bucket>{}</Bucket>
+  <Key>{}</Key>
+  <UploadId>{}</UploadId>
+  <IsTruncated>{}</IsTruncated>
+  <MaxParts>{}</MaxParts>
+{}{}
+</ListPartsResult>"#,
+        escape_xml(&bucket),
+        escape_xml(&key),
+        upload_id,
+        is_truncated,
+        max_parts,
+        extra_xml,
+        parts_xml
+    );
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml")
+        .body(Body::from(xml))
+        .unwrap()
 }
 
 /// Escapes special XML characters.

@@ -290,6 +290,7 @@ fn format_timestamp(timestamp_nanos: u64) -> String {
 pub fn list_object_versions_response(
     bucket: &str,
     prefix: &str,
+    delimiter: Option<&str>,
     max_keys: usize,
     result: &s4_core::ListVersionsResult,
 ) -> String {
@@ -306,6 +307,10 @@ pub fn list_object_versions_response(
         max_keys,
         result.is_truncated
     );
+
+    if let Some(delim) = delimiter {
+        xml.push_str(&format!("  <Delimiter>{}</Delimiter>\n", escape_xml(delim)));
+    }
 
     // Add pagination markers if truncated
     if let Some(ref marker) = result.next_key_marker {
@@ -367,6 +372,17 @@ pub fn list_object_versions_response(
             escape_xml(&marker.version_id),
             marker.is_latest,
             last_modified
+        ));
+    }
+
+    // Add common prefixes (when delimiter is used)
+    for cp in &result.common_prefixes {
+        xml.push_str(&format!(
+            r#"  <CommonPrefixes>
+    <Prefix>{}</Prefix>
+  </CommonPrefixes>
+"#,
+            escape_xml(cp)
         ));
     }
 

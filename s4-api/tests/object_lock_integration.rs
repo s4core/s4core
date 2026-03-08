@@ -419,11 +419,11 @@ async fn test_cannot_modify_compliance_retention() {
     .await;
     assert_eq!(status, StatusCode::OK, "Should set COMPLIANCE retention");
 
-    // Try to modify retention - should fail in Phase 3
+    // Extending COMPLIANCE retention (later date, same mode) should succeed per S3 spec
     let new_date = chrono::Utc::now() + chrono::Duration::days(14);
     let new_retain_until = new_date.format("%Y-%m-%dT%H:%M:%SZ").to_string();
 
-    let modify_status = set_retention(
+    let extend_status = set_retention(
         &app,
         bucket,
         "compliance.txt",
@@ -433,9 +433,47 @@ async fn test_cannot_modify_compliance_retention() {
     )
     .await;
     assert_eq!(
-        modify_status,
+        extend_status,
+        StatusCode::OK,
+        "Should allow extending COMPLIANCE retention period"
+    );
+
+    // Shortening COMPLIANCE retention (earlier date) should be denied
+    let shorter_date = chrono::Utc::now() + chrono::Duration::days(1);
+    let shorter_retain_until = shorter_date.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    let shorten_status = set_retention(
+        &app,
+        bucket,
+        "compliance.txt",
+        &version_id,
+        "COMPLIANCE",
+        &shorter_retain_until,
+    )
+    .await;
+    assert_eq!(
+        shorten_status,
         StatusCode::FORBIDDEN,
-        "Should deny modification of COMPLIANCE retention (AccessDenied)"
+        "Should deny shortening COMPLIANCE retention (AccessDenied)"
+    );
+
+    // Changing COMPLIANCE to GOVERNANCE should be denied
+    let gov_date = chrono::Utc::now() + chrono::Duration::days(30);
+    let gov_retain_until = gov_date.format("%Y-%m-%dT%H:%M:%SZ").to_string();
+
+    let change_mode_status = set_retention(
+        &app,
+        bucket,
+        "compliance.txt",
+        &version_id,
+        "GOVERNANCE",
+        &gov_retain_until,
+    )
+    .await;
+    assert_eq!(
+        change_mode_status,
+        StatusCode::FORBIDDEN,
+        "Should deny changing COMPLIANCE to GOVERNANCE (AccessDenied)"
     );
 }
 

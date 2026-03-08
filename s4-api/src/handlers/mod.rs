@@ -28,6 +28,7 @@ pub mod bucket_config;
 pub mod multipart;
 pub mod object;
 pub mod object_lock;
+pub mod select;
 pub mod stats;
 
 pub use bucket::{
@@ -36,18 +37,22 @@ pub use bucket::{
     ListObjectsQuery,
 };
 pub use bucket_config::{
-    delete_bucket_cors, delete_bucket_lifecycle, get_bucket_cors, get_bucket_lifecycle,
-    get_bucket_location, get_bucket_versioning, get_bucket_versioning_status, get_cors_config,
-    is_versioning_enabled, put_bucket_cors, put_bucket_lifecycle, put_bucket_versioning,
+    delete_bucket_cors, delete_bucket_encryption, delete_bucket_lifecycle, delete_bucket_policy,
+    get_bucket_cors, get_bucket_encryption, get_bucket_lifecycle, get_bucket_location,
+    get_bucket_policy, get_bucket_policy_status, get_bucket_versioning,
+    get_bucket_versioning_status, get_cors_config, is_versioning_enabled, put_bucket_cors,
+    put_bucket_encryption, put_bucket_lifecycle, put_bucket_policy, put_bucket_versioning,
 };
 pub use multipart::{
-    abort_multipart_upload, complete_multipart_upload, create_multipart_upload, upload_part,
+    abort_multipart_upload, complete_multipart_upload, create_multipart_upload, list_parts,
+    upload_part,
 };
 pub use object::{
-    copy_object, delete_object, get_object, get_object_tagging, head_object, put_object,
-    ObjectVersionQuery,
+    copy_object, delete_object, delete_object_tagging, get_object, get_object_tagging, head_object,
+    post_object, put_object, put_object_tagging, ObjectVersionQuery,
 };
 pub use object_lock::{
     get_bucket_object_lock_configuration, get_object_legal_hold, get_object_retention,
     put_bucket_object_lock_configuration, put_object_legal_hold, put_object_retention,
 };
+pub use select::{bucket_sql_query, select_object_content};

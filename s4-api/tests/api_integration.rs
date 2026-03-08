@@ -1088,8 +1088,11 @@ async fn test_multipart_upload_large_file() {
     .await
     .unwrap();
 
-    // Create data larger than 4KB (10KB total, split into parts)
-    let original_data: Vec<u8> = (0..10240).map(|i| (i % 256) as u8).collect();
+    // Create data larger than 5MB (12MB total, split into 2 parts: 6MB + 6MB)
+    // S3 spec requires all non-last parts to be at least 5MB
+    let part_size = 6 * 1024 * 1024; // 6MB
+    let total_size = part_size * 2;
+    let original_data: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
 
     // Initiate multipart upload
     let app = create_router(state.clone());
@@ -1111,11 +1114,11 @@ async fn test_multipart_upload_large_file() {
     let upload_id_end = body.find("</UploadId>").unwrap();
     let upload_id = &body[upload_id_start..upload_id_end];
 
-    // Upload parts (2 parts of 5KB each)
+    // Upload parts (2 parts of 6MB each)
     let mut etags = Vec::new();
     for part_num in 1..=2 {
-        let start = (part_num - 1) * 5120;
-        let end = part_num * 5120;
+        let start = (part_num - 1) * part_size;
+        let end = part_num * part_size;
         let part_data = &original_data[start..end];
 
         let app = create_router(state.clone());
