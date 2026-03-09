@@ -17,6 +17,7 @@ COPY s4-core ./s4-core
 COPY s4-api ./s4-api
 COPY s4-features ./s4-features
 COPY s4-compactor ./s4-compactor
+COPY s4-select ./s4-select
 COPY s4-server ./s4-server
 
 # Build release binary with static linking

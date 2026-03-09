@@ -36,6 +36,9 @@ add_license.sh
 *.log
 tmp/
 
+
+.agents
+.codex
 # Test data
 test-data/
 *.redb
