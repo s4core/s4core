@@ -109,7 +109,7 @@ pub async fn get_user(
 
     // Get user by ID using direct storage access
     let user_key = format!("__s4_iam_user_{}", user_id);
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
     let (user_bytes, _) = storage
         .get_object("__system__", &user_key)
         .await
@@ -220,7 +220,7 @@ pub async fn bucket_stats(
         return Err(AdminError::Forbidden);
     }
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // List all bucket markers to get bucket names
     let markers = storage
@@ -283,7 +283,7 @@ pub async fn create_bucket(
         return Err(AdminError::Forbidden);
     }
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
     let marker_key = format!("__s4_bucket_marker_{}", bucket_name);
 
     // Check if already exists
@@ -319,7 +319,7 @@ pub async fn delete_bucket(
         return Err(AdminError::Forbidden);
     }
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
     let marker_key = format!("__s4_bucket_marker_{}", bucket_name);
 
     // Check exists
@@ -369,7 +369,7 @@ pub async fn list_bucket_objects(
         return Err(AdminError::Forbidden);
     }
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
     let prefix = params.prefix.unwrap_or_default();
     let max_keys = params.max_keys.unwrap_or(50);
 

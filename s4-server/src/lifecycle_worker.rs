@@ -25,7 +25,6 @@ use s4_features::lifecycle::{
     EvaluationResult, LifecycleConfiguration, LifecycleRule, RuleStatus,
 };
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio::time::{interval, Duration as TokioDuration};
 use tracing::{debug, error, info, warn};
 
@@ -41,14 +40,14 @@ const LIFECYCLE_CONFIG_PREFIX: &str = "__s4_bucket_lifecycle_";
 /// to delete expired objects and versions.
 pub struct LifecycleWorker {
     /// Storage engine.
-    storage: Arc<RwLock<BitcaskStorageEngine>>,
+    storage: Arc<BitcaskStorageEngine>,
     /// Worker configuration.
     config: LifecycleConfig,
 }
 
 impl LifecycleWorker {
     /// Creates a new lifecycle worker.
-    pub fn new(storage: Arc<RwLock<BitcaskStorageEngine>>, config: LifecycleConfig) -> Self {
+    pub fn new(storage: Arc<BitcaskStorageEngine>, config: LifecycleConfig) -> Self {
         Self { storage, config }
     }
 
@@ -133,7 +132,7 @@ impl LifecycleWorker {
 
     /// Lists all buckets in the system.
     async fn list_buckets(&self) -> Result<Vec<String>, anyhow::Error> {
-        let storage = self.storage.read().await;
+        let storage = &*self.storage;
 
         let markers = storage.list_objects("__system__", BUCKET_MARKER_PREFIX, 10000).await?;
 
@@ -150,7 +149,7 @@ impl LifecycleWorker {
         &self,
         bucket: &str,
     ) -> Result<Option<LifecycleConfiguration>, anyhow::Error> {
-        let storage = self.storage.read().await;
+        let storage = &*self.storage;
         let lifecycle_key = format!("{}{}", LIFECYCLE_CONFIG_PREFIX, bucket);
 
         match storage.get_object("__system__", &lifecycle_key).await {
@@ -173,7 +172,7 @@ impl LifecycleWorker {
 
     /// Gets the versioning status for a bucket.
     async fn get_versioning_status(&self, bucket: &str) -> Result<VersioningStatus, anyhow::Error> {
-        let storage = self.storage.read().await;
+        let storage = &*self.storage;
         let versioning_key = format!("{}{}", VERSIONING_CONFIG_PREFIX, bucket);
 
         match storage.get_object("__system__", &versioning_key).await {
@@ -196,7 +195,7 @@ impl LifecycleWorker {
         rules: &[&LifecycleRule],
     ) -> Result<LifecycleStats, anyhow::Error> {
         let mut stats = LifecycleStats::default();
-        let storage = self.storage.read().await;
+        let storage = &*self.storage;
 
         // Get versioning status
         let versioning_status = self.get_versioning_status(bucket).await?;
@@ -208,9 +207,6 @@ impl LifecycleWorker {
         // List all objects in bucket (limit to reasonable number)
         let objects = storage.list_objects(bucket, "", 100_000).await?;
         debug!("Found {} objects in bucket '{}'", objects.len(), bucket);
-
-        // Release storage lock before processing
-        drop(storage);
 
         let now = Utc::now();
 
@@ -259,7 +255,7 @@ impl LifecycleWorker {
                     "Expiring current version: {}/{} (rule: {})",
                     bucket, key, rule.id
                 );
-                let storage = self.storage.write().await;
+                let storage = &*self.storage;
                 storage.delete_object_versioned(bucket, key, None, versioning_status).await?;
                 stats.objects_deleted += 1;
             }
@@ -272,7 +268,7 @@ impl LifecycleWorker {
                 let mut versions_to_delete = Vec::new();
 
                 {
-                    let storage = self.storage.read().await;
+                    let storage = &*self.storage;
                     // Get version list
                     let version_list_key = format!("__s4_versions_{}/{}", bucket, key);
                     if let Ok((data, _)) = storage.get_object("__system__", &version_list_key).await
@@ -339,7 +335,7 @@ impl LifecycleWorker {
                             "Expiring noncurrent version: {}/{} ({})",
                             bucket, key, version_id
                         );
-                        let storage = self.storage.write().await;
+                        let storage = &*self.storage;
                         storage
                             .delete_object_versioned(
                                 bucket,
@@ -356,7 +352,7 @@ impl LifecycleWorker {
 
         // Action 3: Cleanup expired delete markers
         if result.cleanup_delete_markers && versioning_status != VersioningStatus::Unversioned {
-            let storage = self.storage.read().await;
+            let storage = &*self.storage;
             let version_list_key = format!("__s4_versions_{}/{}", bucket, key);
             if let Ok((data, _)) = storage.get_object("__system__", &version_list_key).await {
                 if let Ok(version_list_json) = String::from_utf8(data) {
@@ -385,21 +381,15 @@ impl LifecycleWorker {
                                             "Removing expired delete marker: {}/{} ({})",
                                             bucket, key, latest_vid
                                         );
-                                        // Drop read lock, acquire write lock
-                                        drop(storage);
-                                        {
-                                            let storage = self.storage.write().await;
-                                            storage
-                                                .delete_object_versioned(
-                                                    bucket,
-                                                    key,
-                                                    Some(latest_vid),
-                                                    versioning_status,
-                                                )
-                                                .await?;
-                                            stats.delete_markers_removed += 1;
-                                        }
-                                        let _storage = self.storage.read().await;
+                                        storage
+                                            .delete_object_versioned(
+                                                bucket,
+                                                key,
+                                                Some(latest_vid),
+                                                versioning_status,
+                                            )
+                                            .await?;
+                                        stats.delete_markers_removed += 1;
                                     }
                                 }
                             }

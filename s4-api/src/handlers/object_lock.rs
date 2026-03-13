@@ -58,7 +58,7 @@ pub async fn get_bucket_object_lock_configuration(
 ) -> impl IntoResponse {
     debug!("GetBucketObjectLockConfiguration: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -105,7 +105,7 @@ pub async fn put_bucket_object_lock_configuration(
 ) -> impl IntoResponse {
     info!("PutBucketObjectLockConfiguration: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -239,7 +239,7 @@ pub async fn get_object_retention(
         bucket, key, query.version_id
     );
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Resolve version ID: use provided or fall back to latest version
     let version_id = match resolve_version_id(&*storage, &bucket, &key, query.version_id).await {
@@ -309,7 +309,7 @@ pub async fn put_object_retention(
     );
 
     let bypass_governance = is_bypass_governance(&headers);
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Validate Object Lock is enabled on bucket
     let _lock_config = match get_object_lock_config_internal(&*storage, &bucket).await {
@@ -459,7 +459,7 @@ pub async fn get_object_legal_hold(
         bucket, key, query.version_id
     );
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Resolve version ID: use provided or fall back to latest version
     let version_id = match resolve_version_id(&*storage, &bucket, &key, query.version_id).await {
@@ -508,7 +508,7 @@ pub async fn put_object_legal_hold(
         bucket, key, query.version_id
     );
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Validate Object Lock is enabled on bucket
     match get_object_lock_config_internal(&*storage, &bucket).await {

@@ -123,7 +123,7 @@ pub async fn put_object(
     // Get versioning status before acquiring storage lock
     let versioning_status = get_bucket_versioning_status(&state, &bucket).await;
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -368,7 +368,7 @@ pub async fn copy_object(
         &src_bucket, &src_key, &bucket, &key
     );
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check destination bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -518,7 +518,7 @@ pub async fn get_object(
         bucket, key, query.version_id
     );
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -665,7 +665,7 @@ pub async fn delete_object(
     // Get versioning status before acquiring storage lock
     let versioning_status = get_bucket_versioning_status(&state, &bucket).await;
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -855,7 +855,7 @@ pub async fn head_object(
         bucket, key, query.version_id
     );
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -1052,7 +1052,7 @@ pub async fn get_object_tagging(
         bucket, key, version_query.version_id
     );
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -1107,7 +1107,7 @@ pub async fn put_object_tagging(
         bucket, key, version_query.version_id
     );
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -1208,7 +1208,7 @@ pub async fn delete_object_tagging(
         bucket, key, version_query.version_id
     );
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -1435,7 +1435,7 @@ pub async fn post_object(
 
     // Write object
     let versioning_status = get_bucket_versioning_status(&state, &bucket).await;
-    let storage = state.storage.write().await;
+    let storage = &*state.storage;
 
     // Check bucket existence
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);

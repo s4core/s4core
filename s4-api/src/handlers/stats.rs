@@ -69,7 +69,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
 /// Queries the storage engine for current bucket/object counts, storage usage,
 /// and deduplication statistics. Also reports server uptime.
 pub async fn api_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
     let stats = match storage.get_stats().await {
         Ok(s) => s,
         Err(e) => {

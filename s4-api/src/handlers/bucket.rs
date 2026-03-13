@@ -162,17 +162,16 @@ pub async fn create_bucket(
         .unwrap_or(false);
 
     // Create bucket marker (this tracks bucket existence)
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
 
     // Check if marker exists
     if storage.head_object("__system__", &bucket_marker_key).await.is_ok() {
         return S3Error::BucketAlreadyExists.into_response();
     }
-    drop(storage);
 
     // Create the bucket marker
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
     if let Err(e) = storage
         .put_object(
             "__system__",
@@ -263,7 +262,7 @@ pub async fn delete_bucket(
 ) -> impl IntoResponse {
     info!("DeleteBucket: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
 
     // Check if bucket exists
@@ -311,7 +310,7 @@ pub async fn delete_bucket(
 pub async fn list_buckets(State(state): State<AppState>) -> impl IntoResponse {
     debug!("ListBuckets");
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // List all bucket markers
     let markers = storage.list_objects("__system__", "__s4_bucket_marker_", 1000).await;
@@ -350,7 +349,7 @@ pub async fn head_bucket(
 ) -> impl IntoResponse {
     debug!("HeadBucket: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
 
     if storage.head_object("__system__", &bucket_marker_key).await.is_ok() {
@@ -374,7 +373,7 @@ pub async fn list_objects(
 ) -> impl IntoResponse {
     debug!("ListObjects: bucket={}, params={:?}", bucket, params);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
 
     // Check if bucket exists
@@ -490,7 +489,7 @@ pub async fn list_object_versions(
         }
     }
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
 
     // Check if bucket exists
@@ -615,7 +614,7 @@ pub async fn delete_objects(
     };
 
     let versioning_status = get_bucket_versioning_status(&state, &bucket).await;
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
