@@ -58,7 +58,7 @@ pub async fn get_bucket_cors(
 ) -> impl IntoResponse {
     debug!("GetBucketCors: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -100,7 +100,7 @@ pub async fn put_bucket_cors(
 ) -> impl IntoResponse {
     info!("PutBucketCors: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -162,7 +162,7 @@ pub async fn delete_bucket_cors(
 ) -> impl IntoResponse {
     info!("DeleteBucketCors: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -197,7 +197,7 @@ pub async fn get_bucket_versioning(
 ) -> impl IntoResponse {
     debug!("GetBucketVersioning: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -233,7 +233,7 @@ pub async fn put_bucket_versioning(
 ) -> impl IntoResponse {
     info!("PutBucketVersioning: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -357,7 +357,7 @@ pub async fn get_bucket_lifecycle(
 ) -> impl IntoResponse {
     debug!("GetBucketLifecycle: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -395,7 +395,7 @@ pub async fn put_bucket_lifecycle(
 ) -> impl IntoResponse {
     info!("PutBucketLifecycle: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -461,7 +461,7 @@ pub async fn delete_bucket_lifecycle(
 ) -> impl IntoResponse {
     info!("DeleteBucketLifecycle: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -485,7 +485,7 @@ pub async fn delete_bucket_lifecycle(
 ///
 /// This is the primary function for object handlers to get versioning state.
 pub async fn get_bucket_versioning_status(state: &AppState, bucket: &str) -> VersioningStatus {
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
     get_versioning_status_internal(&*storage, bucket).await
 }
 
@@ -498,7 +498,7 @@ pub async fn is_versioning_enabled(state: &AppState, bucket: &str) -> bool {
 
 /// Gets the CORS configuration for a bucket (if any).
 pub async fn get_cors_config(state: &AppState, bucket: &str) -> Option<CORSConfiguration> {
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
     let cors_key = format!("{}{}", CORS_CONFIG_PREFIX, bucket);
 
     match storage.get_object("__system__", &cors_key).await {
@@ -515,7 +515,7 @@ pub async fn get_lifecycle_config(
     state: &AppState,
     bucket: &str,
 ) -> Option<LifecycleConfiguration> {
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
     let lifecycle_key = format!("{}{}", LIFECYCLE_CONFIG_PREFIX, bucket);
 
     match storage.get_object("__system__", &lifecycle_key).await {
@@ -539,7 +539,7 @@ pub async fn get_bucket_location(
 ) -> impl IntoResponse {
     debug!("GetBucketLocation: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -573,7 +573,7 @@ pub async fn get_bucket_policy(
 ) -> impl IntoResponse {
     debug!("GetBucketPolicy: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -625,7 +625,7 @@ pub async fn put_bucket_policy(
 ) -> impl IntoResponse {
     info!("PutBucketPolicy: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -668,7 +668,7 @@ pub async fn delete_bucket_policy(
 ) -> impl IntoResponse {
     info!("DeleteBucketPolicy: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -692,7 +692,7 @@ pub async fn get_bucket_policy_status(
 ) -> impl IntoResponse {
     debug!("GetBucketPolicyStatus: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -742,7 +742,7 @@ pub async fn put_bucket_encryption(
 ) -> impl IntoResponse {
     debug!("PutBucketEncryption: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -786,7 +786,7 @@ pub async fn get_bucket_encryption(
 ) -> impl IntoResponse {
     debug!("GetBucketEncryption: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -820,7 +820,7 @@ pub async fn delete_bucket_encryption(
 ) -> impl IntoResponse {
     debug!("DeleteBucketEncryption: {}", bucket);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);

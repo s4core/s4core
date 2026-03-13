@@ -69,7 +69,7 @@ pub async fn create_multipart_upload(
 ) -> impl IntoResponse {
     info!("CreateMultipartUpload: bucket={}, key={}", bucket, key);
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -176,7 +176,7 @@ pub async fn upload_part(
         }
     };
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check for server-side copy (x-amz-copy-source header)
     let is_copy_request = headers.get("x-amz-copy-source").is_some();
@@ -376,7 +376,7 @@ pub async fn complete_multipart_upload(
         String::from_utf8_lossy(&body)
     );
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
@@ -520,7 +520,7 @@ pub async fn abort_multipart_upload(
         bucket, key, upload_id
     );
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Delete all parts from in-memory store
     let part_prefix = format!("__s4_part_{}_{}_", upload_id, key);
@@ -583,7 +583,7 @@ pub async fn list_parts(
         bucket, key, upload_id, max_parts, part_number_marker
     );
 
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Check if bucket exists
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);

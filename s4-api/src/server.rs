@@ -33,7 +33,6 @@ use crate::s3::errors::S3Error;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
@@ -46,13 +45,13 @@ use crate::middleware::{admin_auth_middleware, iam_auth_middleware, metrics_midd
 pub const DEFAULT_MAX_UPLOAD_SIZE: usize = 5 * 1024 * 1024 * 1024;
 
 /// In-memory store for multipart upload parts, keyed by part identifier.
-pub type PartStore = Arc<RwLock<HashMap<String, Vec<u8>>>>;
+pub type PartStore = Arc<tokio::sync::RwLock<HashMap<String, Vec<u8>>>>;
 
 /// Shared application state for all handlers.
 #[derive(Clone)]
 pub struct AppState {
     /// Storage engine instance.
-    pub storage: Arc<RwLock<BitcaskStorageEngine>>,
+    pub storage: Arc<BitcaskStorageEngine>,
     /// IAM storage for user management.
     pub iam_storage: Arc<IamStorage>,
     /// Authentication service (JWT + credential verification).
@@ -96,14 +95,12 @@ impl AppState {
         secret_access_key: String,
         max_upload_size: usize,
     ) -> Self {
-        let storage_arc = Arc::new(RwLock::new(storage));
+        let storage_arc = Arc::new(storage);
 
         // Initialize IAM components
         // Use storage as Arc<dyn StorageEngine> for IAM
         let iam_storage_engine: Arc<dyn StorageEngine> = {
-            // Clone the Arc and convert to trait object
             let storage_clone = storage_arc.clone();
-            // Create a new Arc that implements StorageEngine trait
             Arc::new(IamStorageAdapter(storage_clone))
         };
         let iam_storage = Arc::new(IamStorage::new(iam_storage_engine));
@@ -132,7 +129,7 @@ impl AppState {
             max_upload_size,
             prometheus_handle: None,
             start_time: std::time::Instant::now(),
-            part_store: Arc::new(RwLock::new(HashMap::new())),
+            part_store: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         }
     }
 
@@ -148,9 +145,9 @@ impl AppState {
 
 /// Adapter to make BitcaskStorageEngine work with StorageEngine trait for IAM.
 ///
-/// This adapter wraps Arc<RwLock<BitcaskStorageEngine>> and implements
+/// This adapter wraps Arc<BitcaskStorageEngine> and implements
 /// the async StorageEngine trait required by IamStorage.
-struct IamStorageAdapter(Arc<RwLock<BitcaskStorageEngine>>);
+struct IamStorageAdapter(Arc<BitcaskStorageEngine>);
 
 #[async_trait::async_trait]
 impl StorageEngine for IamStorageAdapter {
@@ -162,8 +159,7 @@ impl StorageEngine for IamStorageAdapter {
         content_type: &str,
         metadata: &std::collections::HashMap<String, String>,
     ) -> Result<String, s4_core::error::StorageError> {
-        let storage = self.0.write().await;
-        storage.put_object(bucket, key, data, content_type, metadata).await
+        self.0.put_object(bucket, key, data, content_type, metadata).await
     }
 
     async fn get_object(
@@ -171,8 +167,7 @@ impl StorageEngine for IamStorageAdapter {
         bucket: &str,
         key: &str,
     ) -> Result<(Vec<u8>, s4_core::types::IndexRecord), s4_core::error::StorageError> {
-        let storage = self.0.read().await;
-        storage.get_object(bucket, key).await
+        self.0.get_object(bucket, key).await
     }
 
     async fn delete_object(
@@ -180,8 +175,7 @@ impl StorageEngine for IamStorageAdapter {
         bucket: &str,
         key: &str,
     ) -> Result<(), s4_core::error::StorageError> {
-        let storage = self.0.write().await;
-        storage.delete_object(bucket, key).await
+        self.0.delete_object(bucket, key).await
     }
 
     async fn head_object(
@@ -189,8 +183,7 @@ impl StorageEngine for IamStorageAdapter {
         bucket: &str,
         key: &str,
     ) -> Result<s4_core::types::IndexRecord, s4_core::error::StorageError> {
-        let storage = self.0.read().await;
-        storage.head_object(bucket, key).await
+        self.0.head_object(bucket, key).await
     }
 
     async fn list_objects(
@@ -199,8 +192,7 @@ impl StorageEngine for IamStorageAdapter {
         prefix: &str,
         max_keys: usize,
     ) -> Result<Vec<(String, s4_core::types::IndexRecord)>, s4_core::error::StorageError> {
-        let storage = self.0.read().await;
-        storage.list_objects(bucket, prefix, max_keys).await
+        self.0.list_objects(bucket, prefix, max_keys).await
     }
 
     // Versioning methods - not needed for IAM but required by trait

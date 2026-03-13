@@ -65,7 +65,7 @@ pub async fn select_object_content(
     );
 
     // 2. Fetch the object from storage
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
     let (data, _record) = match storage.get_object(&bucket, &key).await {
         Ok(result) => result,
         Err(e) => {
@@ -76,7 +76,7 @@ pub async fn select_object_content(
             return S3Error::InternalError(err_str).into_response();
         }
     };
-    drop(storage); // Release read lock before query execution
+    // No lock to release — storage is accessed directly via Arc
 
     let bytes_scanned = data.len() as u64;
 
@@ -150,7 +150,7 @@ pub async fn bucket_sql_query(
     };
 
     // 3. List and fetch matching objects
-    let storage = state.storage.read().await;
+    let storage = &*state.storage;
 
     // Determine which objects to query
     let keys: Vec<String> = if let Some(ref pattern) = glob_pattern {
@@ -201,7 +201,7 @@ pub async fn bucket_sql_query(
             }
         }
     }
-    drop(storage); // Release read lock before query execution
+    // No lock to release — storage is accessed directly via Arc
 
     // Build references for the engine
     for (key, data) in &fetched_data {

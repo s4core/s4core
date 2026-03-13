@@ -21,7 +21,10 @@ use crate::error::StorageError;
 use crate::types::BlobHeader;
 use std::path::{Path, PathBuf};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
+
+#[cfg(not(unix))]
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 /// Writes data to append-only volume files.
 pub struct VolumeWriter {
@@ -177,6 +180,9 @@ impl VolumeReader {
 
     /// Reads a blob from a volume.
     ///
+    /// Uses `pread` (via `FileExt::read_exact_at`) on Unix to avoid
+    /// seek+read syscall pairs, reducing from 6 syscalls to 3.
+    ///
     /// # Arguments
     ///
     /// * `volume_id` - Volume file ID
@@ -193,44 +199,81 @@ impl VolumeReader {
         let volume_filename = format!("volume_{:06}.dat", volume_id);
         let volume_path = self.volumes_dir.join(&volume_filename);
 
-        let mut file = File::open(&volume_path)
+        #[cfg(unix)]
+        {
+            let volume_path = volume_path.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                use std::os::unix::fs::FileExt;
+
+                let file = std::fs::File::open(&volume_path)
+                    .map_err(|_e| StorageError::VolumeNotFound { volume_id })?;
+
+                // pread header (up to 1KB) without seeking
+                let mut header_buffer = vec![0u8; 1024];
+                let bytes_read = file.read_at(&mut header_buffer, offset)
+                    .map_err(StorageError::Io)?;
+                header_buffer.truncate(bytes_read);
+
+                // Deserialize header to find actual size
+                let header: BlobHeader = bincode::deserialize(&header_buffer)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+                let actual_header_size = bincode::serialized_size(&header)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?
+                    as u64;
+
+                // pread key + data in one call
+                let key_len = header.key_len as usize;
+                let data_len = header.blob_len as usize;
+                let mut payload = vec![0u8; key_len + data_len];
+                file.read_exact_at(&mut payload, offset + actual_header_size)
+                    .map_err(StorageError::Io)?;
+
+                let key = String::from_utf8(payload[..key_len].to_vec())
+                    .map_err(|e| StorageError::InvalidData(format!("Invalid key encoding: {}", e)))?;
+                let data = payload[key_len..].to_vec();
+
+                Ok::<_, StorageError>((header, key, data))
+            })
             .await
-            .map_err(|_e| StorageError::VolumeNotFound { volume_id })?;
+            .map_err(|e| StorageError::Database(e.to_string()))??;
 
-        file.seek(std::io::SeekFrom::Start(offset)).await.map_err(StorageError::Io)?;
+            return Ok(result);
+        }
 
-        // Read header (we need to know the size first, so we'll read a fixed buffer)
-        // For now, assume header is at most 1KB
-        let mut header_buffer = vec![0u8; 1024];
-        let bytes_read = file.read(&mut header_buffer).await.map_err(StorageError::Io)?;
-        header_buffer.truncate(bytes_read);
+        #[cfg(not(unix))]
+        {
+            let mut file = File::open(&volume_path)
+                .await
+                .map_err(|_e| StorageError::VolumeNotFound { volume_id })?;
 
-        // Deserialize header to find actual size
-        let header: BlobHeader = bincode::deserialize(&header_buffer)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            file.seek(std::io::SeekFrom::Start(offset)).await.map_err(StorageError::Io)?;
 
-        // Calculate actual serialized header size
-        let actual_header_size = bincode::serialized_size(&header)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?
-            as u64;
+            let mut header_buffer = vec![0u8; 1024];
+            let bytes_read = file.read(&mut header_buffer).await.map_err(StorageError::Io)?;
+            header_buffer.truncate(bytes_read);
 
-        // Reposition file pointer to after the actual header
-        // We read up to 1024 bytes, but the actual header is smaller
-        file.seek(std::io::SeekFrom::Start(offset + actual_header_size))
-            .await
-            .map_err(StorageError::Io)?;
+            let header: BlobHeader = bincode::deserialize(&header_buffer)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
-        // Read key
-        let mut key_bytes = vec![0u8; header.key_len as usize];
-        file.read_exact(&mut key_bytes).await.map_err(StorageError::Io)?;
-        let key = String::from_utf8(key_bytes)
-            .map_err(|e| StorageError::InvalidData(format!("Invalid key encoding: {}", e)))?;
+            let actual_header_size = bincode::serialized_size(&header)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?
+                as u64;
 
-        // Read data
-        let mut data = vec![0u8; header.blob_len as usize];
-        file.read_exact(&mut data).await.map_err(StorageError::Io)?;
+            file.seek(std::io::SeekFrom::Start(offset + actual_header_size))
+                .await
+                .map_err(StorageError::Io)?;
 
-        Ok((header, key, data))
+            let mut key_bytes = vec![0u8; header.key_len as usize];
+            file.read_exact(&mut key_bytes).await.map_err(StorageError::Io)?;
+            let key = String::from_utf8(key_bytes)
+                .map_err(|e| StorageError::InvalidData(format!("Invalid key encoding: {}", e)))?;
+
+            let mut data = vec![0u8; header.blob_len as usize];
+            file.read_exact(&mut data).await.map_err(StorageError::Io)?;
+
+            Ok((header, key, data))
+        }
     }
 }
 

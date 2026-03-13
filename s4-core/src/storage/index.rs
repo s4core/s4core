@@ -19,15 +19,16 @@ use crate::types::IndexRecord;
 use redb::{Database, ReadableTable, TableDefinition};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::task;
 
 const INDEX_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("index");
 
 /// Wrapper around redb for storing metadata index.
-/// Uses a single database connection with mutex for thread-safe access.
+///
+/// redb's `Database` is `Send + Sync` and supports concurrent reads
+/// alongside a single writer internally, so no external Mutex is needed.
 pub struct IndexDb {
-    db: Arc<Mutex<Database>>,
+    db: Arc<Database>,
 }
 
 impl IndexDb {
@@ -55,7 +56,7 @@ impl IndexDb {
         write_txn.commit().map_err(|e| StorageError::Database(e.to_string()))?;
 
         Ok(Self {
-            db: Arc::new(Mutex::new(db)),
+            db: Arc::new(db),
         })
     }
 
@@ -72,11 +73,8 @@ impl IndexDb {
             bincode::serialize(record).map_err(|e| StorageError::Serialization(e.to_string()))?;
 
         task::spawn_blocking(move || {
-            // Block on acquiring the mutex in the blocking task
-            let db_guard = futures::executor::block_on(db.lock());
-
             let write_txn =
-                db_guard.begin_write().map_err(|e| StorageError::Database(e.to_string()))?;
+                db.begin_write().map_err(|e| StorageError::Database(e.to_string()))?;
             {
                 let mut table = write_txn
                     .open_table(INDEX_TABLE)
@@ -107,10 +105,8 @@ impl IndexDb {
         let key = key.to_string();
 
         task::spawn_blocking(move || {
-            let db_guard = futures::executor::block_on(db.lock());
-
             let read_txn =
-                db_guard.begin_read().map_err(|e| StorageError::Database(e.to_string()))?;
+                db.begin_read().map_err(|e| StorageError::Database(e.to_string()))?;
             let table = read_txn
                 .open_table(INDEX_TABLE)
                 .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -143,10 +139,8 @@ impl IndexDb {
         let key = key.to_string();
 
         task::spawn_blocking(move || {
-            let db_guard = futures::executor::block_on(db.lock());
-
             let write_txn =
-                db_guard.begin_write().map_err(|e| StorageError::Database(e.to_string()))?;
+                db.begin_write().map_err(|e| StorageError::Database(e.to_string()))?;
             {
                 let mut table = write_txn
                     .open_table(INDEX_TABLE)
@@ -180,10 +174,8 @@ impl IndexDb {
         let prefix = prefix.to_string();
 
         task::spawn_blocking(move || {
-            let db_guard = futures::executor::block_on(db.lock());
-
             let read_txn =
-                db_guard.begin_read().map_err(|e| StorageError::Database(e.to_string()))?;
+                db.begin_read().map_err(|e| StorageError::Database(e.to_string()))?;
             let table = read_txn
                 .open_table(INDEX_TABLE)
                 .map_err(|e| StorageError::Database(e.to_string()))?;
