@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! HTTP request handlers for S3-compatible API.
+//! HTTP request handlers for S3-compatible  API.
 //!
 //! This module provides handlers for:
 //! - Bucket operations (create, delete, list, head)

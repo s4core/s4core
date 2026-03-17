@@ -17,11 +17,15 @@
 //! This module exports the public API for the S4 server, including
 //! configuration types and the main application.
 
+pub mod compaction_worker;
 pub mod config;
 pub mod lifecycle_worker;
+pub mod multipart_cleanup_worker;
 
 mod app;
 
 pub use app::App;
+pub use compaction_worker::CompactionWorker;
 pub use config::Config;
 pub use lifecycle_worker::LifecycleWorker;
+pub use multipart_cleanup_worker::MultipartCleanupWorker;

@@ -20,8 +20,10 @@
 //! - TLS/HTTPS configuration
 //! - Graceful shutdown
 
+use crate::compaction_worker::CompactionWorker;
 use crate::config::Config;
 use crate::lifecycle_worker::LifecycleWorker;
+use crate::multipart_cleanup_worker::MultipartCleanupWorker;
 use anyhow::{Context, Result};
 use axum::http::Uri;
 use axum::ServiceExt;
@@ -192,13 +194,40 @@ impl App {
             self.config.security.access_key_id.clone(),
             self.config.security.secret_access_key.clone(),
             self.config.server.max_upload_size,
-        );
+            &self.config.storage.data_path,
+        )
+        .await;
         if let Some(handle) = prometheus_handle {
             state = state.with_prometheus_handle(handle);
         }
 
         // Initialize root user from environment variables if configured
         initialize_root_user(&state).await?;
+
+        // Cleanup orphaned multipart temp files from previous server instance
+        match state.part_store.cleanup_orphaned().await {
+            Ok(count) if count > 0 => {
+                info!("Cleaned up {} orphaned multipart temp files", count);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to cleanup orphaned multipart temp files: {:?}", e);
+            }
+            _ => {}
+        }
+
+        // Spawn multipart cleanup worker
+        let multipart_cleanup_handle = {
+            info!(
+                "Starting multipart cleanup worker (TTL: {} hours, interval: {} hours)",
+                self.config.multipart.upload_ttl_hours,
+                self.config.multipart.cleanup_interval_hours,
+            );
+            let worker = MultipartCleanupWorker::new(
+                state.part_store.clone(),
+                self.config.multipart.clone(),
+            );
+            worker.spawn()
+        };
 
         // Spawn lifecycle worker if enabled
         let lifecycle_handle = if self.config.lifecycle.enabled {
@@ -210,6 +239,22 @@ impl App {
             Some(worker.spawn())
         } else {
             info!("Lifecycle worker disabled");
+            None
+        };
+
+        // Spawn compaction worker if enabled
+        let compaction_handle = if self.config.compaction.enabled {
+            info!(
+                "Starting compaction worker (interval: {} hours, threshold: {:.0}%, dry_run: {})",
+                self.config.compaction.interval_hours,
+                self.config.compaction.fragmentation_threshold * 100.0,
+                self.config.compaction.dry_run,
+            );
+            let worker =
+                CompactionWorker::new(state.storage.clone(), self.config.compaction.clone());
+            Some(worker.spawn())
+        } else {
+            info!("Compaction worker disabled");
             None
         };
 
@@ -225,10 +270,16 @@ impl App {
             run_http_server(addr, router).await
         };
 
-        // Abort lifecycle worker on shutdown
+        // Abort background workers on shutdown
+        multipart_cleanup_handle.abort();
+        info!("Multipart cleanup worker stopped");
         if let Some(handle) = lifecycle_handle {
             handle.abort();
             info!("Lifecycle worker stopped");
+        }
+        if let Some(handle) = compaction_handle {
+            handle.abort();
+            info!("Compaction worker stopped");
         }
 
         result

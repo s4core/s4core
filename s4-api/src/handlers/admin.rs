@@ -451,6 +451,61 @@ pub async fn list_bucket_objects(
     Ok(Json(result))
 }
 
+/// Trigger on-demand volume compaction — requires SuperUser role.
+///
+/// POST /api/admin/compaction/run
+/// Headers: `Authorization: Bearer <token>`
+/// Query: `?dry_run=true` (optional, default false)
+/// Query: `?threshold=0.1` (optional, fragmentation threshold, default 0.0 for on-demand)
+/// Returns: `{ "volumes_scanned": N, "volumes_compacted": N, "bytes_reclaimed": N, "errors": N }`
+pub async fn run_compaction(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+    Query(params): Query<CompactionParams>,
+) -> Result<Json<serde_json::Value>, AdminError> {
+    if !claims.role.can_admin() {
+        return Err(AdminError::Forbidden);
+    }
+
+    let storage = state.storage.read().await;
+
+    let config = s4_compactor::CompactionConfig {
+        fragmentation_threshold: params.threshold.unwrap_or(0.0),
+        dry_run: params.dry_run.unwrap_or(false),
+        ..Default::default()
+    };
+
+    let compactor = s4_compactor::VolumeCompactor::new(
+        storage.volumes_dir().to_path_buf(),
+        storage.index_db().clone(),
+        storage.deduplicator().clone(),
+        storage.volume_writer().clone(),
+        config,
+    );
+
+    let stats = compactor
+        .run()
+        .await
+        .map_err(|e| AdminError::Storage(format!("Compaction failed: {}", e)))?;
+
+    Ok(Json(json!({
+        "volumes_scanned": stats.volumes_scanned,
+        "volumes_compacted": stats.volumes_compacted,
+        "bytes_reclaimed": stats.total_bytes_reclaimed,
+        "errors": stats.errors,
+        "dry_run": params.dry_run.unwrap_or(false),
+    })))
+}
+
+/// Query parameters for the compaction endpoint.
+#[derive(Debug, Deserialize)]
+pub struct CompactionParams {
+    /// If true, analyze without compacting.
+    pub dry_run: Option<bool>,
+    /// Fragmentation threshold (0.0-1.0). Default 0.0 = compact all fragmented volumes.
+    pub threshold: Option<f64>,
+}
+
 /// Admin API error type.
 #[derive(Debug)]
 pub enum AdminError {

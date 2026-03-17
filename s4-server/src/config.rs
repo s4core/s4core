@@ -34,6 +34,10 @@ pub struct Config {
     pub metrics: MetricsConfig,
     /// Lifecycle worker configuration
     pub lifecycle: LifecycleConfig,
+    /// Volume compaction worker configuration
+    pub compaction: CompactionConfig,
+    /// Multipart upload cleanup configuration
+    pub multipart: MultipartCleanupConfig,
 }
 
 /// Server configuration.
@@ -212,6 +216,76 @@ pub struct LifecycleConfig {
     pub dry_run: bool,
 }
 
+/// Volume compaction worker configuration.
+///
+/// The compactor runs as a background task and periodically reclaims
+/// dead space from append-only volume files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionConfig {
+    /// Enable compaction worker.
+    /// Can be set via S4_COMPACTION_ENABLED environment variable.
+    pub enabled: bool,
+    /// Compaction check interval in hours (default: 6).
+    /// Can be set via S4_COMPACTION_INTERVAL_HOURS environment variable.
+    pub interval_hours: u64,
+    /// Minimum fragmentation ratio to trigger compaction (0.0-1.0, default: 0.3).
+    /// Can be set via S4_COMPACTION_THRESHOLD environment variable.
+    pub fragmentation_threshold: f64,
+    /// Dry-run mode — analyze without compacting.
+    /// Can be set via S4_COMPACTION_DRY_RUN environment variable.
+    pub dry_run: bool,
+}
+
+/// Multipart upload cleanup worker configuration.
+///
+/// The cleanup worker runs as a background task and periodically removes
+/// temp files from abandoned multipart uploads.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultipartCleanupConfig {
+    /// TTL for incomplete multipart uploads in hours (default: 24).
+    /// Can be set via S4_MULTIPART_UPLOAD_TTL_HOURS environment variable.
+    pub upload_ttl_hours: u64,
+    /// Cleanup check interval in hours (default: 1).
+    /// Can be set via S4_MULTIPART_CLEANUP_INTERVAL_HOURS environment variable.
+    pub cleanup_interval_hours: u64,
+}
+
+impl Default for MultipartCleanupConfig {
+    fn default() -> Self {
+        Self {
+            upload_ttl_hours: std::env::var("S4_MULTIPART_UPLOAD_TTL_HOURS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(24),
+            cleanup_interval_hours: std::env::var("S4_MULTIPART_CLEANUP_INTERVAL_HOURS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1),
+        }
+    }
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: std::env::var("S4_COMPACTION_ENABLED")
+                .map(|s| s.to_lowercase() == "true" || s == "1")
+                .unwrap_or(true),
+            interval_hours: std::env::var("S4_COMPACTION_INTERVAL_HOURS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(6),
+            fragmentation_threshold: std::env::var("S4_COMPACTION_THRESHOLD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.3),
+            dry_run: std::env::var("S4_COMPACTION_DRY_RUN")
+                .map(|s| s.to_lowercase() == "true" || s == "1")
+                .unwrap_or(false),
+        }
+    }
+}
+
 impl Default for LifecycleConfig {
     fn default() -> Self {
         Self {
@@ -269,7 +343,7 @@ impl Default for Config {
             },
             storage: StorageConfig {
                 data_path: data_dir.join("volumes"),
-                metadata_path: data_dir.join("metadata.redb"),
+                metadata_path: data_dir.join("metadata_db"),
             },
             tuning: TuningConfig {
                 inline_threshold: 4096,
@@ -303,6 +377,8 @@ impl Default for Config {
             },
             metrics: MetricsConfig::default(),
             lifecycle: LifecycleConfig::default(),
+            compaction: CompactionConfig::default(),
+            multipart: MultipartCleanupConfig::default(),
         }
     }
 }

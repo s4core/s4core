@@ -43,6 +43,13 @@ pub struct BlobHeaderFlags {
     pub is_multipart: bool,
     /// Part number for multipart uploads
     pub part_number: Option<u32>,
+    /// True if this blob represents an S3 delete marker (Phase 5).
+    ///
+    /// Delete markers carry zero-length data in the volume. During recovery,
+    /// this flag allows the system to reconstruct delete marker records that
+    /// were previously stored only in the metadata database and lost on crash.
+    #[serde(default)]
+    pub is_delete_marker: bool,
 }
 
 impl BlobHeader {

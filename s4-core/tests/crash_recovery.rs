@@ -31,7 +31,7 @@ use tempfile::TempDir;
 async fn test_crash_recovery_volume_storage() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let data_path = temp_dir.path().join("volumes");
-    let metadata_path = temp_dir.path().join("metadata.redb");
+    let metadata_path = temp_dir.path().join("metadata_db");
 
     std::fs::create_dir_all(&data_path).expect("Failed to create data dir");
 
@@ -179,7 +179,7 @@ async fn test_crash_recovery_volume_storage() {
 async fn test_crash_recovery_mixed_sizes() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let data_path = temp_dir.path().join("volumes");
-    let metadata_path = temp_dir.path().join("metadata.redb");
+    let metadata_path = temp_dir.path().join("metadata_db");
 
     std::fs::create_dir_all(&data_path).expect("Failed to create data dir");
 
@@ -352,7 +352,7 @@ async fn test_crash_recovery_mixed_sizes() {
 async fn test_crash_recovery_inline_only() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let data_path = temp_dir.path().join("volumes");
-    let metadata_path = temp_dir.path().join("metadata.redb");
+    let metadata_path = temp_dir.path().join("metadata_db");
 
     std::fs::create_dir_all(&data_path).expect("Failed to create data dir");
 

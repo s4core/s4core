@@ -21,7 +21,7 @@ use crate::error::StorageError;
 use crate::types::BlobHeader;
 use std::path::{Path, PathBuf};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, Take};
 
 /// Writes data to append-only volume files.
 pub struct VolumeWriter {
@@ -112,6 +112,134 @@ impl VolumeWriter {
         Ok((volume_id, offset))
     }
 
+    /// Appends a blob from an `AsyncRead` source with seek-back header update.
+    ///
+    /// Writes a placeholder header, streams data while computing CRC32
+    /// incrementally, then seeks back to overwrite the header with the final CRC.
+    ///
+    /// Returns `(volume_id, offset, crc32)`.
+    pub async fn write_blob_streaming<R: AsyncRead + Unpin + Send>(
+        &mut self,
+        key: &str,
+        content_length: u64,
+        reader: R,
+        buffer_size: usize,
+    ) -> Result<(u32, u64, u32), StorageError> {
+        // Build a placeholder header (crc will be overwritten after streaming)
+        let placeholder_header = BlobHeader::new(key.len() as u32, content_length, 0);
+        let header_size = placeholder_header.serialized_size().map_err(|e| {
+            StorageError::Serialization(format!("Failed to calculate header size: {}", e))
+        })?;
+        let total_size = header_size as u64 + key.len() as u64 + content_length;
+
+        if self.current_offset + total_size > self.max_volume_size {
+            self.rotate_volume().await?;
+        }
+
+        let blob_offset = self.current_offset;
+        let volume_id = self.current_volume_id;
+
+        let file = self.current_file.as_mut().ok_or_else(|| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "Volume file not open",
+            ))
+        })?;
+
+        // Seek to write position (defensive — should already be at end)
+        file.seek(std::io::SeekFrom::Start(blob_offset))
+            .await
+            .map_err(StorageError::Io)?;
+
+        // Write placeholder header
+        let header_bytes = bincode::serialize(&placeholder_header)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        file.write_all(&header_bytes).await?;
+
+        // Write key
+        file.write_all(key.as_bytes()).await?;
+
+        // Stream data from reader, computing CRC32 incrementally
+        let mut buf_reader = BufReader::with_capacity(buffer_size, reader);
+        let mut crc_hasher = crc32fast::Hasher::new();
+        let mut bytes_written: u64 = 0;
+        let mut buf = vec![0u8; buffer_size];
+
+        let stream_result: Result<(), StorageError> = async {
+            loop {
+                let n = buf_reader.read(&mut buf).await.map_err(StorageError::Io)?;
+                if n == 0 {
+                    break;
+                }
+                crc_hasher.update(&buf[..n]);
+                file.write_all(&buf[..n]).await?;
+                bytes_written += n as u64;
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = stream_result {
+            // Rollback: truncate the volume back to the original offset to avoid
+            // leaving a corrupt partial blob in the volume tail.
+            if let Err(truncate_err) = file.set_len(blob_offset).await {
+                tracing::error!(
+                    "Failed to truncate volume after I/O error (volume_id={}, offset={}): {}",
+                    volume_id,
+                    blob_offset,
+                    truncate_err
+                );
+            }
+            let _ = file.seek(std::io::SeekFrom::Start(blob_offset)).await;
+            self.current_offset = blob_offset;
+            return Err(e);
+        }
+
+        if bytes_written != content_length {
+            // Rollback: truncate the volume back to the original offset to avoid
+            // leaving a corrupt partial blob that would confuse the compactor.
+            if let Err(truncate_err) = file.set_len(blob_offset).await {
+                tracing::error!(
+                    "Failed to truncate volume after short read (volume_id={}, offset={}): {}",
+                    volume_id,
+                    blob_offset,
+                    truncate_err
+                );
+            }
+            file.seek(std::io::SeekFrom::Start(blob_offset))
+                .await
+                .map_err(StorageError::Io)?;
+            self.current_offset = blob_offset;
+            return Err(StorageError::InvalidData(format!(
+                "Expected {} bytes but read {}",
+                content_length, bytes_written
+            )));
+        }
+
+        let crc32 = crc_hasher.finalize();
+
+        // Seek back and overwrite header with final CRC
+        let final_header = BlobHeader::new(key.len() as u32, content_length, crc32);
+        let final_header_bytes = bincode::serialize(&final_header)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        file.seek(std::io::SeekFrom::Start(blob_offset))
+            .await
+            .map_err(StorageError::Io)?;
+        file.write_all(&final_header_bytes).await?;
+
+        // Seek back to end for next write
+        let new_offset = blob_offset + header_bytes.len() as u64 + key.len() as u64 + bytes_written;
+        file.seek(std::io::SeekFrom::Start(new_offset))
+            .await
+            .map_err(StorageError::Io)?;
+
+        file.flush().await?;
+
+        self.current_offset = new_offset;
+
+        Ok((volume_id, blob_offset, crc32))
+    }
+
     /// Rotates to a new volume file.
     async fn rotate_volume(&mut self) -> Result<(), StorageError> {
         if let Some(file) = self.current_file.take() {
@@ -125,20 +253,26 @@ impl VolumeWriter {
     }
 
     /// Opens or creates the current volume file.
+    ///
+    /// Uses read-write mode (not append) to support seek-back for streaming writes.
+    /// The offset is tracked manually and all writes go to `current_offset`.
     async fn open_or_create_volume(&mut self) -> Result<(), StorageError> {
         let volume_filename = format!("volume_{:06}.dat", self.current_volume_id);
         self.current_volume_path = self.volumes_dir.join(&volume_filename);
 
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .create(true)
-            .append(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
             .open(&self.current_volume_path)
             .await
             .map_err(StorageError::Io)?;
 
-        // Get current file size
+        // Get current file size and seek to end
         let metadata = file.metadata().await.map_err(StorageError::Io)?;
         self.current_offset = metadata.len();
+        file.seek(std::io::SeekFrom::End(0)).await.map_err(StorageError::Io)?;
 
         self.current_file = Some(file);
         Ok(())
@@ -231,6 +365,101 @@ impl VolumeReader {
         file.read_exact(&mut data).await.map_err(StorageError::Io)?;
 
         Ok((header, key, data))
+    }
+
+    /// Opens a streaming reader for a blob's data section.
+    ///
+    /// Returns `(BlobHeader, key, data_reader)` where `data_reader` is a
+    /// bounded `AsyncRead` that yields exactly `header.blob_len` bytes
+    /// starting from the data section of the blob. No allocation proportional
+    /// to blob size is performed.
+    ///
+    /// For range reads, the caller can further seek/take on the returned reader.
+    pub async fn open_blob_stream(
+        &self,
+        volume_id: u32,
+        offset: u64,
+    ) -> Result<(BlobHeader, String, Take<File>), StorageError> {
+        let volume_filename = format!("volume_{:06}.dat", volume_id);
+        let volume_path = self.volumes_dir.join(&volume_filename);
+
+        let mut file = File::open(&volume_path)
+            .await
+            .map_err(|_e| StorageError::VolumeNotFound { volume_id })?;
+
+        file.seek(std::io::SeekFrom::Start(offset)).await.map_err(StorageError::Io)?;
+
+        // Read header (max 1KB)
+        let mut header_buffer = vec![0u8; 1024];
+        let bytes_read = file.read(&mut header_buffer).await.map_err(StorageError::Io)?;
+        header_buffer.truncate(bytes_read);
+
+        let header: BlobHeader = bincode::deserialize(&header_buffer)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let actual_header_size = bincode::serialized_size(&header)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?
+            as u64;
+
+        // Seek past header
+        file.seek(std::io::SeekFrom::Start(offset + actual_header_size))
+            .await
+            .map_err(StorageError::Io)?;
+
+        // Read key
+        let mut key_bytes = vec![0u8; header.key_len as usize];
+        file.read_exact(&mut key_bytes).await.map_err(StorageError::Io)?;
+        let key = String::from_utf8(key_bytes)
+            .map_err(|e| StorageError::InvalidData(format!("Invalid key encoding: {}", e)))?;
+
+        // Return a bounded reader over exactly the data section
+        let data_reader = file.take(header.blob_len);
+
+        Ok((header, key, data_reader))
+    }
+
+    /// Opens a streaming reader for a range within a blob's data.
+    ///
+    /// Seeks directly to `data_offset + range_start` and returns a reader
+    /// bounded to `range_len` bytes. Memory usage is O(1) regardless of
+    /// object size.
+    pub async fn open_blob_range_stream(
+        &self,
+        volume_id: u32,
+        offset: u64,
+        range_start: u64,
+        range_len: u64,
+    ) -> Result<(BlobHeader, Take<File>), StorageError> {
+        let volume_filename = format!("volume_{:06}.dat", volume_id);
+        let volume_path = self.volumes_dir.join(&volume_filename);
+
+        let mut file = File::open(&volume_path)
+            .await
+            .map_err(|_e| StorageError::VolumeNotFound { volume_id })?;
+
+        file.seek(std::io::SeekFrom::Start(offset)).await.map_err(StorageError::Io)?;
+
+        // Read header
+        let mut header_buffer = vec![0u8; 1024];
+        let bytes_read = file.read(&mut header_buffer).await.map_err(StorageError::Io)?;
+        header_buffer.truncate(bytes_read);
+
+        let header: BlobHeader = bincode::deserialize(&header_buffer)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+        let actual_header_size = bincode::serialized_size(&header)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?
+            as u64;
+
+        // Seek to: blob_start + header + key + range_start
+        let data_start = offset + actual_header_size + header.key_len as u64;
+        file.seek(std::io::SeekFrom::Start(data_start + range_start))
+            .await
+            .map_err(StorageError::Io)?;
+
+        let data_reader = file.take(range_len);
+
+        Ok((header, data_reader))
     }
 }
 

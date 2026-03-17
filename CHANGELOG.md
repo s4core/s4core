@@ -58,7 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Core storage engine with append-only volumes (Bitcask-style)
-- Metadata indexing with redb (ACID transactions)
+- Metadata indexing with fjall (LSM-tree, MVCC, atomic cross-keyspace batches)
 - Content-addressable deduplication (SHA-256)
 - S3 API compatibility (AWS Signature V4)
 - Bucket operations (create, list, delete)

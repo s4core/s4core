@@ -18,18 +18,27 @@ pub mod bitcask;
 pub mod dedup;
 pub mod engine;
 pub mod index;
+pub mod journal;
+pub mod placement;
 pub mod recovery;
 pub mod version_index;
 pub mod versioning;
 pub mod volume;
 
 pub use bitcask::BitcaskStorageEngine;
-pub use dedup::Deduplicator;
+pub use dedup::{DedupEntry, Deduplicator};
 pub use engine::{
-    DeleteMarkerEntry, DeleteResult, ListVersionsResult, ObjectVersion, StorageEngine,
+    DeleteMarkerEntry, DeleteResult, KeyspaceSnapshot, ListVersionsResult, ObjectStream,
+    ObjectVersion, ReadOptions, Snapshot, StateMachine, StorageEngine, StreamingPutResult,
+    VolumeFileInfo,
 };
-pub use index::IndexDb;
-pub use recovery::recover_index_from_volumes;
+pub use index::{BatchAction, BatchOp, IndexDb, KeyspaceId};
+pub use journal::{JournalEntry, JournalEventType, MetadataJournal};
+pub use placement::PlacementGroupId;
+pub use recovery::{recover_index, recover_index_from_volumes};
 pub use version_index::VersionList;
 pub use versioning::{generate_version_id, is_null_version, NULL_VERSION_ID};
 pub use volume::{VolumeReader, VolumeWriter};
+
+#[cfg(test)]
+mod crash_tests;

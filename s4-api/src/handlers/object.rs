@@ -28,9 +28,10 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use s4_core::StorageEngine;
+use s4_core::{ReadOptions, StorageEngine};
 use serde::Deserialize;
 use std::collections::HashMap;
+use tokio_util::io::ReaderStream;
 use tracing::{debug, error, info};
 
 use crate::handlers::{get_bucket_versioning_status, object_lock::get_object_lock_config_internal};
@@ -526,46 +527,84 @@ pub async fn get_object(
         return S3Error::NoSuchBucket.into_response();
     }
 
-    // Get the object (with or without specific version)
-    let result = if let Some(ref version_id) = query.version_id {
-        storage.get_object_version(&bucket, &key, version_id).await
+    // We need HEAD first to know total_size for range parsing.
+    // For non-range requests we skip HEAD and go straight to streaming.
+    let has_range_header = headers.get(header::RANGE).is_some();
+
+    // Build ReadOptions based on Range header
+    let read_options = if has_range_header {
+        // We need the total size to parse suffix ranges (bytes=-N).
+        // HEAD is cheap (metadata only, no volume I/O).
+        let head_result = if let Some(ref version_id) = query.version_id {
+            storage.head_object_version(&bucket, &key, version_id).await
+        } else {
+            storage.head_object(&bucket, &key).await
+        };
+
+        let total_size = match head_result {
+            Ok(rec) => rec.size,
+            Err(s4_core::StorageError::ObjectNotFound { .. }) => {
+                return S3Error::NoSuchKey.into_response();
+            }
+            Err(s4_core::StorageError::VersionNotFound { version_id, .. }) => {
+                debug!("Version not found: {}", version_id);
+                return S3Error::NoSuchVersion.into_response();
+            }
+            Err(s4_core::StorageError::DeleteMarker { version_id, .. }) => {
+                return build_delete_marker_response(&query, &version_id);
+            }
+            Err(e) => {
+                error!("Failed to head object: {:?}", e);
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to get object: {}", e),
+                )
+                    .into_response();
+            }
+        };
+
+        let range_header_str =
+            headers.get(header::RANGE).and_then(|v| v.to_str().ok()).unwrap_or("");
+
+        match parse_range_header_u64(range_header_str, total_size) {
+            Some((start, end)) => ReadOptions {
+                range: Some((start, end)),
+            },
+            None => {
+                // RFC 7233: unsatisfiable range → 416
+                let cr = format!("bytes */{}", total_size);
+                return Response::builder()
+                    .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                    .header(header::CONTENT_RANGE, cr)
+                    .body(Body::empty())
+                    .unwrap();
+            }
+        }
     } else {
-        storage.get_object(&bucket, &key).await
+        ReadOptions::default()
+    };
+
+    // Open streaming reader
+    let result = if let Some(ref version_id) = query.version_id {
+        storage
+            .open_object_version_stream(&bucket, &key, version_id, read_options)
+            .await
+    } else {
+        storage.open_object_stream(&bucket, &key, read_options).await
     };
 
     match result {
-        Ok((data, record)) => {
-            // Parse Range header if present
-            let has_range_header = headers.get(header::RANGE).is_some();
-            let range = headers
-                .get(header::RANGE)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| parse_range_header(v, data.len()));
-
-            let (status, response_data, content_range) = if has_range_header {
-                match range {
-                    Some((start, end)) => {
-                        let slice = data[start..=end].to_vec();
-                        let cr = format!("bytes {}-{}/{}", start, end, data.len());
-                        (StatusCode::PARTIAL_CONTENT, slice, Some(cr))
-                    }
-                    None => {
-                        // RFC 7233: unsatisfiable range → 416
-                        let cr = format!("bytes */{}", data.len());
-                        return Response::builder()
-                            .status(StatusCode::RANGE_NOT_SATISFIABLE)
-                            .header(header::CONTENT_RANGE, cr)
-                            .body(Body::empty())
-                            .unwrap();
-                    }
-                }
+        Ok(stream) => {
+            let record = &stream.record;
+            let status = if stream.content_range.is_some() {
+                StatusCode::PARTIAL_CONTENT
             } else {
-                (StatusCode::OK, data, None)
+                StatusCode::OK
             };
 
             let mut builder = Response::builder()
                 .status(status)
-                .header(header::CONTENT_LENGTH, response_data.len())
+                .header(header::CONTENT_LENGTH, stream.content_length)
                 .header(header::CONTENT_TYPE, &record.content_type)
                 .header("ETag", format!("\"{}\"", record.etag))
                 .header(header::ACCEPT_RANGES, "bytes")
@@ -578,8 +617,11 @@ pub async fn get_object(
                     record.metadata.get("_storage_class").map(|s| s.as_str()).unwrap_or("STANDARD"),
                 );
 
-            if let Some(cr) = content_range {
-                builder = builder.header(header::CONTENT_RANGE, cr);
+            if let Some((start, end, total)) = stream.content_range {
+                builder = builder.header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", start, end, total),
+                );
             }
 
             // Add version ID header if present
@@ -588,34 +630,23 @@ pub async fn get_object(
             }
 
             // Add custom metadata headers
-            for (key, value) in &record.metadata {
-                if !key.starts_with('_') {
-                    // Skip internal metadata
-                    builder = builder.header(format!("x-amz-meta-{}", key), value);
+            for (meta_key, value) in &record.metadata {
+                if !meta_key.starts_with('_') {
+                    builder = builder.header(format!("x-amz-meta-{}", meta_key), value);
                 }
             }
 
-            builder.body(Body::from(response_data)).unwrap()
+            // Stream the body — memory usage is O(buffer_size), not O(object_size)
+            let reader_stream = ReaderStream::new(stream.body);
+            builder.body(Body::from_stream(reader_stream)).unwrap()
         }
         Err(s4_core::StorageError::ObjectNotFound { .. }) => S3Error::NoSuchKey.into_response(),
         Err(s4_core::StorageError::VersionNotFound { version_id, .. }) => {
-            // Return NoSuchVersion with the version ID
             debug!("Version not found: {}", version_id);
             S3Error::NoSuchVersion.into_response()
         }
         Err(s4_core::StorageError::DeleteMarker { version_id, .. }) => {
-            if query.version_id.is_some() {
-                // S3 returns 405 MethodNotAllowed when requesting a specific delete marker version
-                S3Error::MethodNotAllowed.into_response()
-            } else {
-                // S3 returns 404 with x-amz-delete-marker header when latest version is a delete marker
-                Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .header("x-amz-delete-marker", "true")
-                    .header("x-amz-version-id", version_id)
-                    .body(Body::empty())
-                    .unwrap()
-            }
+            build_delete_marker_response(&query, &version_id)
         }
         Err(e) => {
             error!("Failed to get object: {:?}", e);
@@ -625,6 +656,22 @@ pub async fn get_object(
             )
                 .into_response()
         }
+    }
+}
+
+/// Builds the appropriate response for a delete marker.
+fn build_delete_marker_response(query: &ObjectVersionQuery, version_id: &str) -> Response {
+    if query.version_id.is_some() {
+        // S3 returns 405 MethodNotAllowed when requesting a specific delete marker version
+        S3Error::MethodNotAllowed.into_response()
+    } else {
+        // S3 returns 404 with x-amz-delete-marker header when latest version is a delete marker
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .header("x-amz-delete-marker", "true")
+            .header("x-amz-version-id", version_id)
+            .body(Body::empty())
+            .unwrap()
     }
 }
 
@@ -936,7 +983,11 @@ pub async fn head_object(
 /// Parses an HTTP Range header value like "bytes=0-499" or "bytes=-500" or "bytes=500-".
 ///
 /// Returns `Some((start, end))` where both are inclusive byte positions, or `None` if invalid.
-fn parse_range_header(value: &str, total_len: usize) -> Option<(usize, usize)> {
+/// Parses an HTTP Range header into inclusive (start, end) byte positions.
+///
+/// Works with u64 sizes to support objects larger than 4 GB.
+/// Returns `None` for unsatisfiable or malformed ranges.
+fn parse_range_header_u64(value: &str, total_len: u64) -> Option<(u64, u64)> {
     let value = value.strip_prefix("bytes=")?;
     let (start_str, end_str) = value.split_once('-')?;
 
@@ -946,20 +997,20 @@ fn parse_range_header(value: &str, total_len: usize) -> Option<(usize, usize)> {
 
     if start_str.is_empty() {
         // Suffix range: bytes=-N (last N bytes)
-        let suffix_len: usize = end_str.parse().ok()?;
+        let suffix_len: u64 = end_str.parse().ok()?;
         if suffix_len == 0 || suffix_len > total_len {
             return None;
         }
         Some((total_len - suffix_len, total_len - 1))
     } else {
-        let start: usize = start_str.parse().ok()?;
+        let start: u64 = start_str.parse().ok()?;
         if start >= total_len {
             return None;
         }
         let end = if end_str.is_empty() {
             total_len - 1
         } else {
-            let end: usize = end_str.parse().ok()?;
+            let end: u64 = end_str.parse().ok()?;
             end.min(total_len - 1)
         };
         if start > end {
@@ -1510,6 +1561,11 @@ pub async fn post_object(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_range_header(value: &str, total_len: usize) -> Option<(usize, usize)> {
+        let (s, e) = parse_range_header_u64(value, total_len as u64)?;
+        Some((s as usize, e as usize))
+    }
 
     #[test]
     fn test_format_last_modified() {

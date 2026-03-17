@@ -66,10 +66,9 @@ bind = "0.0.0.0:9000"
 
 [storage]
 data_path = "/var/lib/s4/volumes"
-metadata_path = "/var/lib/s4/metadata.redb"
+metadata_path = "/var/lib/s4/metadata_db"
 
 [tuning]
-inline_threshold = 4096  # 4KB — objects below this are stored inline in the database
 volume_size_mb = 1024    # 1GB — maximum size of each append-only volume file
 strict_sync = true       # fsync after every write
 ```

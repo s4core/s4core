@@ -58,6 +58,9 @@ pub struct ListObjectsQuery {
     /// Continuation token for ListObjectsV2.
     #[serde(rename = "continuation-token")]
     pub continuation_token: Option<String>,
+    /// StartAfter for ListObjectsV2 — returns keys after this value.
+    #[serde(rename = "start-after")]
+    pub start_after: Option<String>,
 }
 
 /// Query parameters for ListObjectVersions.
@@ -396,13 +399,36 @@ pub async fn list_objects(
         None => 1000,
     };
 
+    // Determine start_after for pagination:
+    // - ListObjectsV2: use continuation-token (which is the last key from previous page)
+    //   or start-after parameter
+    // - ListObjects v1: use marker
+    let is_v2 = params.list_type.as_deref() == Some("2");
+    let start_after = if is_v2 {
+        params.continuation_token.as_deref().or(params.start_after.as_deref())
+    } else {
+        params.marker.as_deref()
+    };
+
     // Fetch max_keys + 1 to determine if there are more results (proper truncation detection)
     let fetch_limit = max_keys + 1;
-    let mut objects = match storage.list_objects(&bucket, &prefix, fetch_limit).await {
-        Ok(list) => list,
-        Err(e) => {
-            error!("Failed to list objects: {:?}", e);
-            return S3Error::InternalError("Failed to list objects".to_string()).into_response();
+    let mut objects = if let Some(start_after_key) = start_after {
+        match storage.list_objects_after(&bucket, &prefix, start_after_key, fetch_limit).await {
+            Ok(list) => list,
+            Err(e) => {
+                error!("Failed to list objects: {:?}", e);
+                return S3Error::InternalError("Failed to list objects".to_string())
+                    .into_response();
+            }
+        }
+    } else {
+        match storage.list_objects(&bucket, &prefix, fetch_limit).await {
+            Ok(list) => list,
+            Err(e) => {
+                error!("Failed to list objects: {:?}", e);
+                return S3Error::InternalError("Failed to list objects".to_string())
+                    .into_response();
+            }
         }
     };
 
@@ -417,9 +443,6 @@ pub async fn list_objects(
     // Strip version IDs from keys (S4 internal format: "key#version_id")
     // ListObjects should return only the latest version of each object, with clean keys
     let objects = strip_version_ids_from_keys(objects);
-
-    // Check if this is ListObjectsV2 request
-    let is_v2 = params.list_type.as_deref() == Some("2");
 
     let xml_response = if is_v2 {
         xml::list_objects_v2_response(

@@ -17,20 +17,19 @@ S4 solves this completely:
 
 S4 stores objects differently based on their size:
 
-### Tiny Objects (< 4KB)
+### All Objects
 
-Stored **inline** in the redb metadata database. This avoids the overhead of volume I/O for very small objects.
+Stored in **append-only volume files**. Each volume is approximately 1GB. When a volume fills up, a new one is created. Volumes are the single source of truth for object data — no data is stored exclusively in the metadata database.
 
-### Large Objects (>= 4KB)
+### Metadata
 
-Stored in **append-only volume files**. Each volume is approximately 1GB. When a volume fills up, a new one is created.
+Stored in **fjall** (LSM-tree, MVCC, LZ4 compression) with separate keyspaces for different data types (objects, versions, buckets, IAM, dedup). Fjall provides lock-free concurrent reads, atomic cross-keyspace batch writes, and native prefix scans.
 
 ## Data Layout on Disk
 
 ```
 /data/
-  +-- redb/                    # Metadata (1 file)
-  |   +-- data.redb
+  +-- metadata_db/             # Metadata (fjall LSM directory)
   +-- volumes/                 # Object data (minimal files)
   |   +-- volume_000001.dat    # ~1GB append-only log
   |   +-- volume_000002.dat
@@ -56,7 +55,7 @@ struct BlobHeader {
 
 ### IndexRecord
 
-Metadata for each object is stored in redb:
+Metadata for each object is stored in fjall:
 
 ```rust
 struct IndexRecord {
@@ -88,7 +87,7 @@ S4 guarantees data integrity through:
 
 1. **fsync on every write** — data is durable before returning HTTP 200
 2. **CRC32 checksums** — every blob is verified on read
-3. **ACID transactions** — metadata updates in redb are atomic
+3. **Atomic batch writes** — metadata updates in fjall are atomic across keyspaces
 4. **Recovery on startup** — the engine scans volumes and rebuilds the index if needed
 
 ## Volume Compaction

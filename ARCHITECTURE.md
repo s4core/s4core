@@ -22,7 +22,7 @@ S4 is built as a single-node, high-performance object storage server with a focu
                            ⬇
 ┌─────────────────────────────────────────┐
 │  LAYER 3: Storage Engine (Bitcask)      │
-│  • Hot Index: redb (Metadata)          │
+│  • Hot Index: fjall (LSM, MVCC, LZ4)  │
 │  • Cold Data: Append-only Log Volumes  │
 │  • Compactor (Background GC)            │
 └─────────────────────────────────────────┘
@@ -33,14 +33,14 @@ S4 is built as a single-node, high-performance object storage server with a focu
 ### Design Principles
 
 1. **Append-Only Logs**: All writes are sequential (maximum disk performance)
-2. **Metadata Separation**: Fast metadata in ACID database (redb)
+2. **Metadata Separation**: Fast metadata in ACID database (fjall)
 3. **Content Deduplication**: Same content stored only once
 4. **Crash Recovery**: Metadata can be rebuilt from volume headers
 
 ### Storage Strategy
 
-- **Tiny Objects (< 4KB)**: Stored inline in redb database
-- **All Other Objects (> 4KB)**: Stored in append-only volume files
+- **All Objects**: Stored in append-only volume files (volumes are the single source of truth for object data)
+- **Metadata**: Stored in fjall database with separate keyspaces (objects, versions, buckets, IAM, dedup)
 
 ### Volume Structure
 
@@ -60,13 +60,19 @@ The `BlobHeader` contains:
 
 ### Index Database
 
-The redb database stores `IndexRecord` entries mapping:
-- Key (bucket/path) → Volume ID, Offset, Size, Metadata, Content Hash
+The fjall database stores `IndexRecord` entries across multiple keyspaces:
+- **objects**: bucket/key → Volume ID, Offset, Size, Metadata, Content Hash
+- **versions**: bucket/key → Version list
+- **buckets**: bucket_name → Bucket configuration
+- **iam**: user/key → IAM records
+- **dedup**: content_hash → DedupEntry (ref count, volume location)
 
 This allows:
-- Fast lookups (O(log n))
-- Atomic operations (ACID transactions)
-- Efficient listing with prefix filtering
+- Fast lookups (O(log n) with LSM-tree)
+- Lock-free concurrent reads (MVCC)
+- Atomic cross-keyspace batch writes
+- Native prefix scans (O(log n) seek, not full table scan)
+- Built-in LZ4 compression
 
 ## Data Flow
 
@@ -78,14 +84,14 @@ This allows:
    - If yes: Create new index entry pointing to existing blob (reference counting)
    - If no: Write blob to current volume, register in deduplicator
 4. Create IndexRecord with metadata
-5. Store IndexRecord in redb (ACID transaction)
+5. Store IndexRecord in fjall (atomic batch write)
 6. fsync volume file (if strict_sync enabled)
 7. Return 200 OK to client
 
 ### Read Path (GET Object)
 
 1. Client sends GET request
-2. Lookup IndexRecord in redb by key
+2. Lookup IndexRecord in fjall by key (lock-free MVCC read)
 3. If not found, return 404
 4. Read blob from volume file at (volume_id, offset)
 5. Verify CRC32 checksum
@@ -94,9 +100,9 @@ This allows:
 ### Delete Path (DELETE Object)
 
 1. Client sends DELETE request
-2. Lookup IndexRecord in redb
+2. Lookup IndexRecord in fjall
 3. Mark blob as deleted (tombstone in volume or index)
-4. Remove IndexRecord from redb
+4. Remove IndexRecord from fjall (atomic batch)
 5. Update deduplicator (decrement reference count)
 6. Return 204 No Content
 
@@ -116,7 +122,7 @@ This saves 30-50% storage space for typical workloads with duplicate content.
 Directory operations are atomic because "directories" are virtual - they're just key prefixes in the index database.
 
 To rename a directory:
-1. Start ACID transaction in redb
+1. Start atomic batch in fjall
 2. Find all keys with old prefix
 3. Update all keys to new prefix (in-memory operation)
 4. Commit transaction
@@ -132,18 +138,41 @@ If the process crashes:
 3. Reconstruct index database from headers
 4. Rebuild deduplicator map
 
-This ensures data integrity even if the metadata database is lost.
+This ensures data integrity even if the metadata database is lost. The fjall WAL provides instant crash recovery in the normal case.
 
-## Compaction
+## Volume Compaction (s4-compactor)
 
-Background compaction process:
+S4 uses append-only volume files — when objects are deleted or overwritten, the old
+blob data remains as dead space. The compactor reclaims this space:
 
-1. Scan old volume files
-2. Check which blobs are still referenced in index
-3. Copy live blobs to new volume
-4. Delete old volume file
+### How It Works
 
-This reclaims space from deleted objects.
+1. **Discover** all volume files (skipping the currently active one)
+2. **Build dedup index**: `(volume_id, offset) → content_hash` from the dedup keyspace
+3. **Analyze** each volume — scan all blobs, classify as live or dead based on dedup index
+4. **Compact** volumes where fragmentation exceeds the threshold (default: 30% dead space):
+   - Copy live blobs to a new volume via `VolumeWriter`
+   - Atomically update all `IndexRecord` and `DedupEntry` locations in a single fjall batch
+   - Rename old volume to `.dat.compacted`, then delete (crash-safe two-phase removal)
+5. **Report** statistics: volumes compacted, bytes reclaimed, errors
+
+### Key Invariants
+
+- **Never lose confirmed data** — old volume is deleted only after all live blobs are verified relocated
+- **Crash-safe** — incomplete compaction is recoverable (idempotent restart)
+- **Non-blocking** — runs in background while normal reads/writes continue
+- **Dedup-aware** — updates DedupEntry locations, not just IndexRecords
+
+### Architecture
+
+- **s4-compactor** crate provides `VolumeCompactor` (compaction) and `VolumeScrubber` (CRC32 integrity verification)
+- **s4-server** runs a `CompactionWorker` background task (same pattern as `LifecycleWorker`)
+- Compaction interval, threshold, and dry-run mode are configurable via environment variables
+
+### Volume Scrubber
+
+The scrubber verifies CRC32 checksums of all blobs in all volumes, detecting bit rot
+or data corruption. It reports the number of healthy and corrupted blobs.
 
 ## Performance Characteristics
 

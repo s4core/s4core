@@ -21,7 +21,7 @@ S4 uses a three-layer architecture inspired by the Bitcask storage model.
                      |
 +--------------------v---------------------+
 |  Layer 3: Storage Engine (Bitcask-style) |
-|  Hot Index: redb (ACID metadata)         |
+|  Hot Index: fjall (LSM, MVCC, LZ4)      |
 |  Cold Data: Append-only volume files     |
 |  Compactor (background GC)              |
 +------------------------------------------+
@@ -31,6 +31,6 @@ S4 uses a three-layer architecture inspired by the Bitcask storage model.
 
 - **Single-node focus** — optimized for maximum performance on one machine, no distributed consensus overhead
 - **Append-only writes** — all data is written sequentially for maximum throughput
-- **ACID metadata** — redb provides crash-safe metadata storage
+- **ACID metadata** — fjall provides crash-safe metadata storage with MVCC and atomic cross-keyspace batches
 - **Strict consistency** — every write is fsynced before returning success
 - **Content-addressable** — SHA-256 hashing enables automatic deduplication

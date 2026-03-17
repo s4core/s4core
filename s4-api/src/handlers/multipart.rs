@@ -12,13 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Multipart upload handlers.
+//! Multipart upload handlers — native composite multipart.
 //!
 //! Implements S3-compatible multipart upload operations:
 //! - CreateMultipartUpload (POST /{bucket}/{key}?uploads)
 //! - UploadPart (PUT /{bucket}/{key}?partNumber=N&uploadId=X)
 //! - CompleteMultipartUpload (POST /{bucket}/{key}?uploadId=X)
 //! - AbortMultipartUpload (DELETE /{bucket}/{key}?uploadId=X)
+//!
+//! Parts are written directly to volume storage during UploadPart.
+//! CompleteMultipartUpload publishes a CompositeManifest (O(num_parts),
+//! not O(total_bytes)) — no re-reading or re-writing of part data.
 
 use axum::{
     body::{Body, Bytes},
@@ -29,12 +33,23 @@ use axum::{
 use s4_core::StorageEngine;
 use serde::Deserialize;
 use std::collections::HashMap;
-use tracing::{debug, error, info, warn};
+use tokio_stream::wrappers::ReceiverStream;
+use tracing::{debug, error, info};
 use uuid::Uuid;
+
+use s4_core::types::composite::MultipartPartRecord;
+use tokio_stream::StreamExt;
 
 use crate::middleware::{decode_aws_chunked, is_aws_chunked, validate_decoded_content_length};
 use crate::s3::errors::S3Error;
 use crate::server::AppState;
+
+/// A part entry parsed from the CompleteMultipartUpload XML manifest.
+#[derive(Debug)]
+struct ManifestPart {
+    part_number: u32,
+    etag: String,
+}
 
 /// Query parameters for multipart operations.
 #[derive(Debug, Deserialize, Default)]
@@ -59,9 +74,7 @@ pub struct MultipartQuery {
 ///
 /// S3 API: POST /{bucket}/{key}?uploads
 ///
-/// # Returns
-///
-/// XML response with uploadId.
+/// Creates a durable upload session in the storage engine (fjall keyspace).
 pub async fn create_multipart_upload(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
@@ -98,25 +111,12 @@ pub async fn create_multipart_upload(
         }
     }
 
-    // Store upload metadata (including custom metadata)
-    let upload_marker_key = format!("__s4_multipart_{}_{}", upload_id, key);
-    let meta_json = serde_json::to_string(&custom_metadata).unwrap_or_default();
-    let metadata = format!(
-        "{{\"bucket\":\"{}\",\"key\":\"{}\",\"content_type\":\"{}\",\"custom_metadata\":{}}}",
-        bucket, key, content_type, meta_json
-    );
-
+    // Create durable session in storage engine
     if let Err(e) = storage
-        .put_object(
-            "__system__",
-            &upload_marker_key,
-            metadata.as_bytes(),
-            "application/json",
-            &HashMap::new(),
-        )
+        .create_multipart_session(&upload_id, &bucket, &key, content_type, &custom_metadata)
         .await
     {
-        error!("Failed to create multipart upload marker: {:?}", e);
+        error!("Failed to create multipart session: {:?}", e);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to initiate multipart upload",
@@ -153,15 +153,14 @@ pub async fn create_multipart_upload(
 ///
 /// S3 API: PUT /{bucket}/{key}?partNumber=N&uploadId=X
 ///
-/// # Returns
-///
-/// - 200 OK with ETag header
+/// Streams the request body directly into volume storage (not temp files).
+/// SHA-256, MD5, and CRC32 are computed in a single streaming pass.
 pub async fn upload_part(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<MultipartQuery>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> impl IntoResponse {
     let upload_id = match params.upload_id {
         Some(id) => id,
@@ -178,203 +177,315 @@ pub async fn upload_part(
 
     let storage = state.storage.read().await;
 
+    // Validate bucket exists
+    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
+    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
+        return S3Error::NoSuchBucket.into_response();
+    }
+
+    // Verify multipart upload session exists
+    if storage.get_multipart_session(&upload_id).await.is_err() {
+        return S3Error::NoSuchUpload.into_response();
+    }
+
     // Check for server-side copy (x-amz-copy-source header)
-    let is_copy_request = headers.get("x-amz-copy-source").is_some();
-    let body = if let Some(copy_source) = headers.get("x-amz-copy-source") {
-        // Parse copy source: bucket/key or /bucket/key
-        let copy_source_str = copy_source.to_str().unwrap_or("");
-        let copy_source_str = copy_source_str.trim_start_matches('/');
+    if let Some(copy_source) = headers.get("x-amz-copy-source") {
+        return upload_part_copy(&storage, &upload_id, part_number, copy_source, &headers).await;
+    }
 
-        let (src_bucket, src_key) = match copy_source_str.split_once('/') {
-            Some((b, k)) => (b.to_string(), k.to_string()),
-            None => {
-                return S3Error::InvalidRequest("Invalid x-amz-copy-source format".to_string())
-                    .into_response()
-            }
-        };
+    // Check for AWS chunked encoding (needs full body to decode)
+    if is_aws_chunked(&headers) {
+        return upload_part_chunked(&storage, &upload_id, part_number, &headers, body).await;
+    }
 
-        debug!(
-            "UploadPart: server-side copy from bucket={}, key={}",
-            src_bucket, src_key
-        );
+    // Normal upload: stream body directly into volume storage
+    let content_length = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
 
-        // Get the source object
-        let (src_data, _) = match storage.get_object(&src_bucket, &src_key).await {
-            Ok(data) => data,
-            Err(e) => {
-                error!("Failed to get source object for copy: {:?}", e);
-                return S3Error::NoSuchKey.into_response();
-            }
-        };
-
-        // Check for range copy (x-amz-copy-source-range header)
-        let data = if let Some(range_header) = headers.get("x-amz-copy-source-range") {
-            let range_str = range_header.to_str().unwrap_or("");
-            // Parse "bytes=start-end"
-            let range_str = range_str.trim_start_matches("bytes=");
-            let (start, end) = match range_str.split_once('-') {
-                Some((s, e)) => {
-                    let start: usize = s.parse().unwrap_or(0);
-                    let end: usize = e.parse().unwrap_or(src_data.len() - 1);
-                    (start, end)
+    // If Content-Length is missing/zero, buffer the body to determine size.
+    // (S3 spec requires Content-Length, but some clients omit it.)
+    let (reader, actual_length): (Box<dyn tokio::io::AsyncRead + Unpin + Send>, u64) =
+        if content_length > 0 {
+            let body_stream = body.into_data_stream().map(|item: Result<Bytes, _>| {
+                item.map_err(|e| std::io::Error::other(e.to_string()))
+            });
+            (
+                Box::new(tokio_util::io::StreamReader::new(body_stream)),
+                content_length,
+            )
+        } else {
+            // Buffer to learn the size
+            match collect_body(body).await {
+                Ok(bytes) => {
+                    let len = bytes.len() as u64;
+                    (Box::new(std::io::Cursor::new(bytes.to_vec())), len)
                 }
-                None => (0, src_data.len() - 1),
-            };
-
-            debug!(
-                "UploadPart: copying range bytes={}-{} (total size={})",
-                start,
-                end,
-                src_data.len()
-            );
-
-            // Extract the range (end is inclusive in S3 range syntax)
-            let end_exclusive = (end + 1).min(src_data.len());
-            if start >= src_data.len() || start > end_exclusive {
-                return S3Error::InvalidRequest("Invalid range".to_string()).into_response();
+                Err(e) => {
+                    error!("Failed to read part body: {:?}", e);
+                    return S3Error::InternalError("Failed to read request body".to_string())
+                        .into_response();
+                }
             }
-
-            Bytes::from(src_data[start..end_exclusive].to_vec())
-        } else {
-            Bytes::from(src_data)
         };
 
-        data
-    } else {
-        // Check for AWS chunked encoding and decode if necessary
-        if is_aws_chunked(&headers) {
-            debug!(
-                "UploadPart: detected aws-chunked encoding, decoding body (raw size={})",
-                body.len()
+    info!(
+        "UploadPart: bucket={}, key={}, uploadId={}, partNumber={}, content_length={} (streaming)",
+        bucket, key, upload_id, part_number, actual_length
+    );
+
+    let result = storage
+        .upload_part_streaming(&upload_id, part_number, reader, actual_length)
+        .await;
+
+    match result {
+        Ok(native_result) => {
+            info!(
+                "Part uploaded: uploadId={}, partNumber={}, etag={}, size={}",
+                upload_id, part_number, native_result.etag, native_result.record.size
             );
-            let decoded = match decode_aws_chunked(&body) {
-                Ok(d) => d,
-                Err(e) => return e.into_response(),
-            };
-            debug!(
-                "UploadPart: decoded aws-chunked body (decoded size={})",
-                decoded.len()
-            );
-            if let Err(e) = validate_decoded_content_length(&headers, &decoded) {
-                return e.into_response();
-            }
-            Bytes::from(decoded)
-        } else {
-            body
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("ETag", format!("\"{}\"", native_result.etag))
+                .body(Body::empty())
+                .unwrap()
+        }
+        Err(e) => {
+            error!("Failed to store part: {:?}", e);
+            S3Error::InternalError("Failed to store part".to_string()).into_response()
+        }
+    }
+}
+
+/// Handles UploadPart with server-side copy (x-amz-copy-source).
+///
+/// Source data is fetched from another object and written as a part
+/// directly to volume storage via the native multipart API.
+async fn upload_part_copy(
+    storage: &s4_core::BitcaskStorageEngine,
+    upload_id: &str,
+    part_number: u32,
+    copy_source: &axum::http::HeaderValue,
+    headers: &HeaderMap,
+) -> Response {
+    let copy_source_str = copy_source.to_str().unwrap_or("");
+    let copy_source_str = copy_source_str.trim_start_matches('/');
+
+    let (src_bucket, src_key) = match copy_source_str.split_once('/') {
+        Some((b, k)) => (b.to_string(), k.to_string()),
+        None => {
+            return S3Error::InvalidRequest("Invalid x-amz-copy-source format".to_string())
+                .into_response()
         }
     };
 
-    // Log early before any potential blocking operations
-    info!(
-        "UploadPart: bucket={}, key={}, uploadId={}, partNumber={}, size={}",
-        bucket,
-        key,
-        upload_id,
-        part_number,
-        body.len()
+    debug!(
+        "UploadPart: server-side copy from bucket={}, key={}",
+        src_bucket, src_key
     );
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    match storage.head_object("__system__", &bucket_marker_key).await {
-        Ok(_) => {}
+    // Get the source object
+    let (src_data, _) = match storage.get_object(&src_bucket, &src_key).await {
+        Ok(data) => data,
         Err(e) => {
-            error!(
-                "UploadPart bucket check failed: bucket={}, error={:?}",
-                bucket, e
-            );
-            return S3Error::NoSuchBucket.into_response();
+            error!("Failed to get source object for copy: {:?}", e);
+            return S3Error::NoSuchKey.into_response();
         }
-    }
+    };
 
-    // Verify multipart upload exists
-    let upload_marker_key = format!("__s4_multipart_{}_{}", upload_id, key);
-    match storage.head_object("__system__", &upload_marker_key).await {
-        Ok(_) => {}
-        Err(e) => {
-            error!(
-                "UploadPart upload check failed: uploadId={}, error={:?}",
-                upload_id, e
-            );
-            return S3Error::NoSuchUpload.into_response();
+    // Check for range copy (x-amz-copy-source-range header)
+    let data = if let Some(range_header) = headers.get("x-amz-copy-source-range") {
+        let range_str = range_header.to_str().unwrap_or("");
+        let range_str = range_str.trim_start_matches("bytes=");
+        let (start, end) = match range_str.split_once('-') {
+            Some((s, e)) => {
+                let start: usize = s.parse().unwrap_or(0);
+                let end: usize = e.parse().unwrap_or(src_data.len() - 1);
+                (start, end)
+            }
+            None => (0, src_data.len() - 1),
+        };
+
+        let end_exclusive = (end + 1).min(src_data.len());
+        if start >= src_data.len() || start > end_exclusive {
+            return S3Error::InvalidRequest("Invalid range".to_string()).into_response();
         }
-    }
 
-    // Store the part in memory (avoids polluting append-only volumes with temp data)
-    let part_key = format!("__s4_part_{}_{}_{:05}", upload_id, key, part_number);
-    let etag = format!("{:x}", md5::compute(&body));
+        src_data[start..end_exclusive].to_vec()
+    } else {
+        src_data
+    };
 
+    let content_length = data.len() as u64;
+    let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(std::io::Cursor::new(data));
+
+    match storage
+        .upload_part_streaming(upload_id, part_number, reader, content_length)
+        .await
     {
-        let mut parts = state.part_store.write().await;
-        parts.insert(part_key.clone(), body.to_vec());
-        let total_bytes: usize = parts.values().map(|v| v.len()).sum();
-        if total_bytes > 512 * 1024 * 1024 {
-            warn!(
-                "In-memory part store is large: {} parts, {} bytes total",
-                parts.len(),
-                total_bytes
+        Ok(native_result) => {
+            info!(
+                "Part uploaded: uploadId={}, partNumber={}, etag={} (copy)",
+                upload_id, part_number, native_result.etag
             );
-        }
-    }
-
-    info!(
-        "Part uploaded: uploadId={}, partNumber={}, etag={}",
-        upload_id, part_number, etag
-    );
-
-    // For server-side copy, return XML CopyPartResult
-    if is_copy_request {
-        use chrono::Utc;
-        let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
-        let xml = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
+            use chrono::Utc;
+            let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+            let xml = format!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
 <CopyPartResult>
     <ETag>"{}"</ETag>
     <LastModified>{}</LastModified>
 </CopyPartResult>"#,
-            etag, now
-        );
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/xml")
-            .body(Body::from(xml))
-            .unwrap()
-    } else {
-        Response::builder()
-            .status(StatusCode::OK)
-            .header("ETag", format!("\"{}\"", etag))
-            .body(Body::empty())
-            .unwrap()
+                native_result.etag, now
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/xml")
+                .body(Body::from(xml))
+                .unwrap()
+        }
+        Err(e) => {
+            error!("Failed to store copied part: {:?}", e);
+            S3Error::InternalError("Failed to store part".to_string()).into_response()
+        }
     }
 }
 
-/// Completes a multipart upload.
+/// Handles UploadPart with AWS chunked transfer encoding.
+///
+/// AWS chunked encoding requires the full body to decode, so this path
+/// buffers the body, decodes, then writes to volume storage.
+async fn upload_part_chunked(
+    storage: &s4_core::BitcaskStorageEngine,
+    upload_id: &str,
+    part_number: u32,
+    headers: &HeaderMap,
+    body: Body,
+) -> Response {
+    // Collect body chunks for decoding (aws-chunked requires full body)
+    let body_bytes = match collect_body(body).await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("Failed to read aws-chunked body: {:?}", e);
+            return S3Error::InternalError("Failed to read request body".to_string())
+                .into_response();
+        }
+    };
+
+    debug!(
+        "UploadPart: detected aws-chunked encoding, decoding body (raw size={})",
+        body_bytes.len()
+    );
+    let decoded = match decode_aws_chunked(&body_bytes) {
+        Ok(d) => d,
+        Err(e) => return e.into_response(),
+    };
+    debug!(
+        "UploadPart: decoded aws-chunked body (decoded size={})",
+        decoded.len()
+    );
+    if let Err(e) = validate_decoded_content_length(headers, &decoded) {
+        return e.into_response();
+    }
+
+    let content_length = decoded.len() as u64;
+    let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
+        Box::new(std::io::Cursor::new(decoded));
+
+    match storage
+        .upload_part_streaming(upload_id, part_number, reader, content_length)
+        .await
+    {
+        Ok(native_result) => {
+            info!(
+                "Part uploaded: uploadId={}, partNumber={}, etag={} (aws-chunked)",
+                upload_id, part_number, native_result.etag
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("ETag", format!("\"{}\"", native_result.etag))
+                .body(Body::empty())
+                .unwrap()
+        }
+        Err(e) => {
+            error!("Failed to store chunked part: {:?}", e);
+            S3Error::InternalError("Failed to store part".to_string()).into_response()
+        }
+    }
+}
+
+/// Collects a Body into a contiguous Bytes buffer.
+async fn collect_body(body: Body) -> Result<Bytes, String> {
+    use tokio_stream::StreamExt;
+    let mut chunks = Vec::new();
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let data = chunk.map_err(|e| e.to_string())?;
+        chunks.push(data);
+    }
+    // Concatenate all chunks
+    let total_len: usize = chunks.iter().map(|c| c.len()).sum();
+    let mut result = Vec::with_capacity(total_len);
+    for chunk in chunks {
+        result.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(result))
+}
+
+/// Completes a multipart upload — native metadata-only completion.
 ///
 /// S3 API: POST /{bucket}/{key}?uploadId=X
 ///
-/// # Returns
+/// This is O(num_parts), NOT O(total_bytes). No part data is re-read or
+/// re-written. Builds a CompositeManifest and publishes it atomically.
 ///
-/// XML response with final ETag and location.
+/// Uses AWS S3-compatible streaming response: sends 200 OK immediately with
+/// keep-alive whitespace, then sends final XML. This pattern is required by
+/// the S3 spec even though our completion is fast (milliseconds).
 pub async fn complete_multipart_upload(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
     Query(params): Query<MultipartQuery>,
-    _headers: HeaderMap,
+    headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
     let upload_id = match params.upload_id {
-        Some(id) => id,
-        None => return S3Error::InvalidRequest("Missing uploadId".to_string()).into_response(),
+        Some(id) if !id.is_empty() => id,
+        _ => return S3Error::InvalidRequest("Missing uploadId".to_string()).into_response(),
     };
 
-    info!(
+    // Decode aws-chunked encoding if present (AWS CLI may use it even for small bodies)
+    let decoded_body = if is_aws_chunked(&headers) {
+        debug!("CompleteMultipartUpload: decoding aws-chunked body");
+        match decode_aws_chunked(&body) {
+            Ok(d) => d,
+            Err(e) => return e.into_response(),
+        }
+    } else {
+        body.to_vec()
+    };
+
+    let body_str = String::from_utf8_lossy(&decoded_body);
+    debug!(
         "CompleteMultipartUpload: bucket={}, key={}, uploadId={}",
         bucket, key, upload_id
     );
-    debug!(
-        "Complete request body: {:?}",
-        String::from_utf8_lossy(&body)
-    );
+
+    // --- SYNC VALIDATION PHASE ---
+
+    // Parse the XML manifest from the request body
+    let manifest_parts = match parse_complete_manifest(&body_str) {
+        Ok(parts) => parts,
+        Err(e) => {
+            error!(
+                "CompleteMultipartUpload: failed to parse manifest XML: {:?}",
+                e
+            );
+            return e.into_response();
+        }
+    };
 
     let storage = state.storage.read().await;
 
@@ -384,117 +495,146 @@ pub async fn complete_multipart_upload(
         return S3Error::NoSuchBucket.into_response();
     }
 
-    // Verify multipart upload exists and get metadata
-    let upload_marker_key = format!("__s4_multipart_{}_{}", upload_id, key);
-    let upload_metadata = match storage.get_object("__system__", &upload_marker_key).await {
-        Ok((data, _)) => String::from_utf8_lossy(&data).to_string(),
-        Err(_) => return S3Error::NoSuchUpload.into_response(),
+    // Get upload session from durable storage
+    let session = match storage.mark_session_completing(&upload_id).await {
+        Ok(s) => s,
+        Err(_) => {
+            return S3Error::NoSuchUpload.into_response();
+        }
     };
 
-    // Parse content type from metadata
-    let content_type = if let Some(start) = upload_metadata.find("\"content_type\":\"") {
-        let start = start + "\"content_type\":\"".len();
-        if let Some(end) = upload_metadata[start..].find('"') {
-            &upload_metadata[start..start + end]
-        } else {
-            "binary/octet-stream"
+    let content_type = session.content_type.clone();
+    let metadata = session.metadata.clone();
+
+    // Get all uploaded parts from durable storage (metadata only — no data reads)
+    let all_parts = match storage.list_multipart_parts(&upload_id) {
+        Ok(parts) => parts,
+        Err(e) => {
+            error!("CompleteMultipartUpload: failed to list parts: {:?}", e);
+            let _ = storage.revert_session_to_open(&upload_id).await;
+            return S3Error::InternalError("Failed to list parts".to_string()).into_response();
         }
-    } else {
-        "binary/octet-stream"
     };
 
-    // Collect parts from in-memory store
-    let part_prefix = format!("__s4_part_{}_{}_", upload_id, key);
-    let sorted_parts: Vec<(String, Vec<u8>)> = {
-        let parts = state.part_store.read().await;
-        let mut matching: Vec<(String, Vec<u8>)> = parts
-            .iter()
-            .filter(|(k, _)| k.starts_with(&part_prefix))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        matching.sort_by(|a, b| a.0.cmp(&b.0));
-        matching
+    // Validate manifest against uploaded parts and check part sizes.
+    // On any validation failure, revert session to Open so abort/retry works.
+    let selected_parts = match validate_manifest_parts(&manifest_parts, &all_parts) {
+        Ok(parts) => parts,
+        Err(e) => {
+            let _ = storage.revert_session_to_open(&upload_id).await;
+            return e.into_response();
+        }
     };
 
-    if sorted_parts.is_empty() {
-        return S3Error::InvalidRequest("No parts uploaded".to_string()).into_response();
-    }
-
-    // S3 spec: all parts except the last must be at least 5MB
-    const MIN_PART_SIZE: usize = 5 * 1024 * 1024; // 5MB
-    if sorted_parts.len() > 1 {
-        for (_, data) in &sorted_parts[..sorted_parts.len() - 1] {
-            if data.len() < MIN_PART_SIZE {
-                return S3Error::EntityTooSmall.into_response();
-            }
-        }
-    }
-
-    let mut combined_data = Vec::new();
-    for (_, data) in &sorted_parts {
-        combined_data.extend_from_slice(data);
-    }
-
-    // Extract custom metadata from upload initiation metadata (not from complete request headers)
-    let metadata: HashMap<String, String> =
-        if let Some(start) = upload_metadata.find("\"custom_metadata\":") {
-            let json_start = start + "\"custom_metadata\":".len();
-            serde_json::from_str(&upload_metadata[json_start..upload_metadata.len() - 1])
-                .unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
-
-    // Store the combined object
-    let etag =
-        match storage.put_object(&bucket, &key, &combined_data, content_type, &metadata).await {
-            Ok(etag) => etag,
-            Err(e) => {
-                error!("Failed to store combined object: {:?}", e);
-                return S3Error::InternalError("Failed to store object".to_string())
-                    .into_response();
-            }
-        };
-
-    // Clean up parts from in-memory store and upload marker from storage
-    {
-        let mut parts = state.part_store.write().await;
-        for (part_key, _) in &sorted_parts {
-            parts.remove(part_key);
-        }
-    }
-    if let Err(e) = storage.delete_object("__system__", &upload_marker_key).await {
-        debug!("Failed to delete upload marker: {:?}", e);
-    }
-
+    let total_size: u64 = selected_parts.iter().map(|p| p.size).sum();
     info!(
-        "Multipart upload completed: bucket={}, key={}, etag={}, size={}",
+        "CompleteMultipartUpload: bucket={}, key={}, uploadId={}, parts={}, total_size={}",
         bucket,
         key,
-        etag,
-        combined_data.len()
+        upload_id,
+        selected_parts.len(),
+        total_size
     );
 
-    // Return XML response
-    let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
+    // Compute S3 multipart ETag from part MD5 hashes (no data reads needed)
+    let s3_etag = compute_native_multipart_etag(&selected_parts);
+
+    // --- STREAMING RESPONSE PHASE ---
+    // Send 200 OK immediately (S3 spec), complete in background
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+
+    let upload_id_clone = upload_id.clone();
+    let bucket_clone = bucket.clone();
+    let key_clone = key.clone();
+    let s3_etag_clone = s3_etag.clone();
+
+    // Drop storage lock before spawning — will re-acquire in the task
+    drop(storage);
+
+    let storage_arc = state.storage.clone();
+
+    tokio::spawn(async move {
+        // Keep-alive: send whitespace periodically (safety mechanism —
+        // native complete is fast but we keep this for S3 spec compliance)
+        let keepalive_tx = tx.clone();
+        let keepalive_handle = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                if keepalive_tx
+                    .send(Ok::<Bytes, std::io::Error>(Bytes::from_static(b" ")))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // Native metadata-only completion — O(num_parts)
+        let storage = storage_arc.read().await;
+        let result = storage
+            .complete_multipart_native(
+                &bucket_clone,
+                &key_clone,
+                &upload_id_clone,
+                &selected_parts,
+                &s3_etag_clone,
+                &content_type,
+                &metadata,
+            )
+            .await;
+        drop(storage);
+
+        keepalive_handle.abort();
+
+        match result {
+            Ok(_) => {
+                info!(
+                    "Multipart upload completed (native): bucket={}, key={}, etag={}, size={}, parts={}",
+                    bucket_clone, key_clone, s3_etag_clone, total_size, selected_parts.len()
+                );
+
+                let xml = format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
 <CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
   <Location>http://localhost:9000/{}/{}</Location>
   <Bucket>{}</Bucket>
   <Key>{}</Key>
   <ETag>"{}"</ETag>
 </CompleteMultipartUploadResult>"#,
-        escape_xml(&bucket),
-        escape_xml(&key),
-        escape_xml(&bucket),
-        escape_xml(&key),
-        etag
-    );
+                    escape_xml(&bucket_clone),
+                    escape_xml(&key_clone),
+                    escape_xml(&bucket_clone),
+                    escape_xml(&key_clone),
+                    s3_etag_clone
+                );
+
+                let _ = tx.send(Ok(Bytes::from(xml))).await;
+            }
+            Err(e) => {
+                error!("Failed to complete multipart upload: {:?}", e);
+                let error_xml = format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>InternalError</Code>
+  <Message>Failed to complete multipart upload: {}</Message>
+  <RequestId>0</RequestId>
+</Error>"#,
+                    escape_xml(&format!("{:?}", e))
+                );
+                let _ = tx.send(Ok(Bytes::from(error_xml))).await;
+            }
+        }
+    });
+
+    let stream = ReceiverStream::new(rx);
+    let body = Body::from_stream(stream);
 
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/xml")
-        .body(Body::from(xml))
+        .body(body)
         .unwrap()
 }
 
@@ -502,9 +642,8 @@ pub async fn complete_multipart_upload(
 ///
 /// S3 API: DELETE /{bucket}/{key}?uploadId=X
 ///
-/// # Returns
-///
-/// - 204 No Content on success
+/// Decrements staged blob refs for all uploaded parts and removes
+/// the session and part metadata from durable storage.
 pub async fn abort_multipart_upload(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
@@ -522,16 +661,34 @@ pub async fn abort_multipart_upload(
 
     let storage = state.storage.read().await;
 
-    // Delete all parts from in-memory store
-    let part_prefix = format!("__s4_part_{}_{}_", upload_id, key);
-    {
-        let mut parts = state.part_store.write().await;
-        parts.retain(|k, _| !k.starts_with(&part_prefix));
+    // Check session state — reject only if actively completing
+    match storage.get_multipart_session(&upload_id).await {
+        Ok(session) => {
+            if session.state == s4_core::types::composite::MultipartUploadState::Completing {
+                info!(
+                    "AbortMultipartUpload: rejected — upload {} is currently being completed",
+                    upload_id
+                );
+                return S3Error::InvalidRequest(
+                    "Cannot abort upload while CompleteMultipartUpload is in progress".to_string(),
+                )
+                .into_response();
+            }
+            // Session exists and is Open — proceed with abort
+            if let Err(e) = storage.abort_multipart_native(&upload_id).await {
+                error!("Failed to abort multipart upload: {:?}", e);
+                return S3Error::InternalError("Failed to abort multipart upload".to_string())
+                    .into_response();
+            }
+        }
+        Err(_) => {
+            // Session doesn't exist — S3 abort is idempotent, return 204
+            debug!(
+                "AbortMultipartUpload: upload {} not found, returning 204 (idempotent)",
+                upload_id
+            );
+        }
     }
-
-    // Delete upload marker
-    let upload_marker_key = format!("__s4_multipart_{}_{}", upload_id, key);
-    let _ = storage.delete_object("__system__", &upload_marker_key).await;
 
     info!("Multipart upload aborted: uploadId={}", upload_id);
     StatusCode::NO_CONTENT.into_response()
@@ -541,9 +698,7 @@ pub async fn abort_multipart_upload(
 ///
 /// S3 API: GET /{bucket}/{key}?uploadId=X
 ///
-/// # Returns
-///
-/// XML response listing parts with ETags and sizes.
+/// Returns metadata from fjall MultipartParts keyspace — no data reads needed.
 pub async fn list_parts(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
@@ -591,30 +746,25 @@ pub async fn list_parts(
         return S3Error::NoSuchBucket.into_response();
     }
 
-    // Verify multipart upload exists
-    let upload_marker_key = format!("__s4_multipart_{}_{}", upload_id, key);
-    if storage.head_object("__system__", &upload_marker_key).await.is_err() {
+    // Verify multipart upload session exists
+    if storage.get_multipart_session(&upload_id).await.is_err() {
         return S3Error::NoSuchUpload.into_response();
     }
 
-    // List parts from in-memory store
-    let part_prefix = format!("__s4_part_{}_{}_", upload_id, key);
-    let parts_list: Vec<(u32, String, usize)> = {
-        let parts = state.part_store.read().await;
-        let mut matching: Vec<(u32, String, usize)> = parts
-            .iter()
-            .filter(|(k, _)| k.starts_with(&part_prefix))
-            .filter_map(|(k, v)| {
-                // Extract part number from key: __s4_part_{upload_id}_{key}_{part_number:05}
-                let suffix = k.strip_prefix(&part_prefix)?;
-                let part_num: u32 = suffix.parse().ok()?;
-                let etag = format!("{:x}", md5::compute(v));
-                Some((part_num, etag, v.len()))
-            })
-            .collect();
-        matching.sort_by_key(|(num, _, _)| *num);
-        matching
+    // Get parts from durable storage (metadata only — no data reads)
+    let all_parts = match storage.list_multipart_parts(&upload_id) {
+        Ok(parts) => parts,
+        Err(e) => {
+            error!("ListParts: failed to list parts: {:?}", e);
+            return S3Error::InternalError("Failed to list parts".to_string()).into_response();
+        }
     };
+
+    // Convert to display tuples
+    let parts_list: Vec<(u32, String, u64)> = all_parts
+        .iter()
+        .map(|p| (p.part_number, p.etag_md5_hex.clone(), p.size))
+        .collect();
 
     // Apply part-number-marker filter (return parts AFTER the marker)
     let filtered_parts: Vec<_> = if let Some(marker) = part_number_marker {
@@ -679,6 +829,133 @@ pub async fn list_parts(
         .header(header::CONTENT_TYPE, "application/xml")
         .body(Body::from(xml))
         .unwrap()
+}
+
+/// Computes the S3-compatible multipart ETag from part MD5 hashes.
+///
+/// S3 multipart ETag = MD5(concat(part_md5_bytes...)) + "-" + num_parts.
+/// This uses the raw MD5 bytes stored in each part record — no data reads.
+fn compute_native_multipart_etag(parts: &[MultipartPartRecord]) -> String {
+    let mut ctx = md5::Context::new();
+    for part in parts {
+        ctx.consume(part.etag_md5_bytes);
+    }
+    let hash = ctx.compute();
+    format!("{:x}-{}", hash, parts.len())
+}
+
+/// Parses the CompleteMultipartUpload XML manifest into a list of parts.
+///
+/// Expected format:
+/// ```xml
+/// <CompleteMultipartUpload>
+///   <Part><PartNumber>1</PartNumber><ETag>"abc123"</ETag></Part>
+///   <Part><PartNumber>2</PartNumber><ETag>"def456"</ETag></Part>
+/// </CompleteMultipartUpload>
+/// ```
+fn parse_complete_manifest(xml: &str) -> Result<Vec<ManifestPart>, S3Error> {
+    let mut parts = Vec::new();
+    let mut remaining = xml;
+
+    // Find each <Part>...</Part> block
+    while let Some(part_start) = remaining.find("<Part>") {
+        let after_tag = &remaining[part_start + 6..];
+        let part_end = after_tag.find("</Part>").ok_or(S3Error::MalformedXML)?;
+        let part_content = &after_tag[..part_end];
+
+        // Extract <PartNumber>
+        let pn_start = part_content.find("<PartNumber>").ok_or(S3Error::MalformedXML)?;
+        let pn_value_start = pn_start + 12;
+        let pn_end = part_content[pn_value_start..]
+            .find("</PartNumber>")
+            .ok_or(S3Error::MalformedXML)?;
+        let part_number: u32 = part_content[pn_value_start..pn_value_start + pn_end]
+            .trim()
+            .parse()
+            .map_err(|_| S3Error::MalformedXML)?;
+
+        // Extract <ETag>
+        let etag_start = part_content.find("<ETag>").ok_or(S3Error::MalformedXML)?;
+        let etag_value_start = etag_start + 6;
+        let etag_end =
+            part_content[etag_value_start..].find("</ETag>").ok_or(S3Error::MalformedXML)?;
+        let etag = part_content[etag_value_start..etag_value_start + etag_end]
+            .trim()
+            .replace("&quot;", "\"")
+            .replace("&#34;", "\"")
+            .trim_matches('"')
+            .to_string();
+
+        parts.push(ManifestPart { part_number, etag });
+        remaining = &after_tag[part_end + 7..];
+    }
+
+    if parts.is_empty() {
+        return Err(S3Error::MalformedXML);
+    }
+
+    // S3 requires parts to be in ascending order in the manifest
+    for window in parts.windows(2) {
+        if window[0].part_number >= window[1].part_number {
+            return Err(S3Error::InvalidRequest(
+                "Part numbers must be in ascending order".to_string(),
+            ));
+        }
+    }
+
+    Ok(parts)
+}
+
+/// Validates the manifest parts against uploaded parts.
+///
+/// Checks that every part in the manifest exists, ETags match, and all
+/// parts except the last are at least 5 MB. Returns the selected parts
+/// in manifest order.
+fn validate_manifest_parts(
+    manifest_parts: &[ManifestPart],
+    all_parts: &[MultipartPartRecord],
+) -> Result<Vec<MultipartPartRecord>, S3Error> {
+    let mut selected_parts = Vec::with_capacity(manifest_parts.len());
+    for mp in manifest_parts {
+        match all_parts.iter().find(|p| p.part_number == mp.part_number) {
+            Some(stored) => {
+                if stored.etag_md5_hex != mp.etag {
+                    error!(
+                        "CompleteMultipartUpload: ETag mismatch for part {}: manifest={}, stored={}",
+                        mp.part_number, mp.etag, stored.etag_md5_hex
+                    );
+                    return Err(S3Error::InvalidRequest(format!(
+                        "ETag mismatch for part {}: expected \"{}\", got \"{}\"",
+                        mp.part_number, mp.etag, stored.etag_md5_hex
+                    )));
+                }
+                selected_parts.push(stored.clone());
+            }
+            None => {
+                error!("CompleteMultipartUpload: part {} not found", mp.part_number);
+                return Err(S3Error::InvalidRequest(format!(
+                    "One or more of the specified parts could not be found: part {}",
+                    mp.part_number
+                )));
+            }
+        }
+    }
+
+    if selected_parts.is_empty() {
+        return Err(S3Error::InvalidRequest("No parts uploaded".to_string()));
+    }
+
+    // S3 spec: all parts except the last must be at least 5MB
+    const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
+    if selected_parts.len() > 1 {
+        for part in &selected_parts[..selected_parts.len() - 1] {
+            if part.size < MIN_PART_SIZE {
+                return Err(S3Error::EntityTooSmall);
+            }
+        }
+    }
+
+    Ok(selected_parts)
 }
 
 /// Escapes special XML characters.

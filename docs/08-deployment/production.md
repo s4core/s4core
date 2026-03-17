@@ -54,14 +54,14 @@ export S4_DATA_DIR=/var/lib/s4
 
 ### NVMe for Metadata
 
-For best performance, place the metadata database on NVMe storage. The redb database handles frequent small writes and benefits from low-latency storage.
+For best performance, place the metadata database on NVMe storage. The fjall database handles frequent small writes and benefits from low-latency storage.
 
 ### Disk Space Monitoring
 
 Monitor disk usage and set alerts before running out of space. S4 needs space for:
 
 - Volume files (object data)
-- redb database (metadata)
+- fjall database directory (metadata)
 - Temporary files (multipart uploads in progress)
 
 ## Performance
@@ -127,7 +127,7 @@ For zero-downtime backups, use filesystem-level snapshots (LVM, ZFS, or cloud vo
 
 ### Metadata Backup
 
-The redb database file can be backed up independently for faster metadata recovery.
+The fjall database directory can be backed up independently for faster metadata recovery.
 
 ## High Availability
 

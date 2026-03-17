@@ -56,5 +56,5 @@ A ratio of 2.13 means that on average, each unique blob is referenced by 2.13 ob
 
 - Hashing algorithm: **SHA-256** (cryptographically strong, no collisions in practice)
 - Dedup granularity: **whole-object** (not block-level)
-- Only objects >= 4KB are deduplicated (inline objects in redb are not deduplicated)
-- Dedup index is stored in redb alongside other metadata
+- All objects are deduplicated regardless of size
+- Dedup index is stored in a dedicated fjall keyspace alongside other metadata

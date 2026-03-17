@@ -38,7 +38,7 @@ const TEST_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 async fn create_test_storage() -> (BitcaskStorageEngine, TempDir) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let data_path = temp_dir.path().join("volumes");
-    let metadata_path = temp_dir.path().join("metadata.redb");
+    let metadata_path = temp_dir.path().join("metadata_db");
 
     std::fs::create_dir_all(&data_path).expect("Failed to create data dir");
 
@@ -50,12 +50,14 @@ async fn create_test_storage() -> (BitcaskStorageEngine, TempDir) {
 }
 
 /// Creates an AppState with test credentials.
-fn create_test_state(storage: BitcaskStorageEngine) -> AppState {
+async fn create_test_state(storage: BitcaskStorageEngine, data_dir: &std::path::Path) -> AppState {
     AppState::new(
         storage,
         TEST_ACCESS_KEY.to_string(),
         TEST_SECRET_KEY.to_string(),
+        data_dir,
     )
+    .await
 }
 
 /// Computes HMAC-SHA1 and returns Base64-encoded result.
@@ -85,7 +87,7 @@ fn build_v2_auth_header(
 #[tokio::test]
 async fn test_v2_valid_header_auth() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // First create the bucket so we get 200 instead of 404
     let app = create_router(state.clone());
@@ -121,7 +123,7 @@ async fn test_v2_valid_header_auth() {
 #[tokio::test]
 async fn test_v2_wrong_access_key() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     let date = "Tue, 04 Mar 2026 12:00:00 GMT";
     let path = "/test-bucket";
@@ -153,7 +155,7 @@ async fn test_v2_wrong_access_key() {
 #[tokio::test]
 async fn test_v2_wrong_signature() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     let date = "Tue, 04 Mar 2026 12:00:00 GMT";
     let auth = format!("AWS {}:aW52YWxpZHNpZ25hdHVyZQ==", TEST_ACCESS_KEY);
@@ -184,7 +186,7 @@ async fn test_v2_wrong_signature() {
 #[tokio::test]
 async fn test_v2_valid_presigned_url() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket first
     let app = create_router(state.clone());
@@ -251,7 +253,7 @@ async fn test_v2_valid_presigned_url() {
 #[tokio::test]
 async fn test_v2_expired_presigned_url() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     let expires = 1000000000; // Year 2001, definitely expired
     let path = "/test-bucket";
@@ -288,7 +290,7 @@ async fn test_v2_expired_presigned_url() {
 #[tokio::test]
 async fn test_v2_with_amz_headers() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     let date = "Tue, 04 Mar 2026 12:00:00 GMT";
     let path = "/test-bucket/test-key";
@@ -331,7 +333,7 @@ async fn test_v2_with_amz_headers() {
 #[tokio::test]
 async fn test_v2_with_sub_resources() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     let date = "Tue, 04 Mar 2026 12:00:00 GMT";
     let path = "/test-bucket";
@@ -367,7 +369,7 @@ async fn test_v2_with_sub_resources() {
 #[tokio::test]
 async fn test_v4_still_works_with_v2_support() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     // Standard V4 auth header (invalid signature, but tests that V4 path is reached)
     let auth_header = format!(
@@ -402,7 +404,7 @@ async fn test_v4_still_works_with_v2_support() {
 #[tokio::test]
 async fn test_same_credentials_both_versions() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // V2 request to create bucket
     let app = create_router(state.clone());

@@ -20,7 +20,7 @@ Client --PUT--> S4 API
           |                |
           v                v
      Increment         Store IndexRecord
-     ref count         in redb
+     ref count         in fjall (atomic batch)
           |                |
           v                v
             fsync to disk
@@ -41,7 +41,7 @@ Client --PUT--> S4 API
 Client --GET--> S4 API
                   |
                   v
-            Lookup IndexRecord in redb
+            Lookup IndexRecord in fjall
                   |
                   v
             Read blob from volume file
@@ -54,9 +54,8 @@ Client --GET--> S4 API
 ```
 
 **Key points:**
-- Metadata lookup in redb is fast (B-tree index)
+- Metadata lookup in fjall is fast (LSM-tree with MVCC lock-free reads)
 - CRC32 is verified on every read to detect bit-rot
-- For inline objects (< 4KB), data is read directly from redb
 
 ## Delete (DELETE Object)
 
@@ -69,7 +68,7 @@ Client --DELETE--> S4 API
                Mark as tombstone
                      |
                      v
-               Remove IndexRecord from redb
+               Remove IndexRecord from fjall
                      |
                      v
                Decrement dedup ref count

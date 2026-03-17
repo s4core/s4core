@@ -15,11 +15,16 @@
 //! Core data types for storage.
 
 pub mod blob;
+pub mod composite;
 pub mod metadata;
 pub mod object_lock;
 pub mod versioning;
 
 pub use blob::{BlobHeader, BlobHeaderFlags};
+pub use composite::{
+    BlobId, BlobLocation, BlobRefEntry, CompositeManifest, ManifestSegmentRef, MultipartPartRecord,
+    MultipartUploadSession, MultipartUploadState, ObjectLayout, MANIFEST_FORMAT_VERSION,
+};
 pub use metadata::{IndexRecord, DELETE_MARKER_FILE_ID};
 pub use object_lock::{DefaultRetention, RetentionMode};
 pub use versioning::VersioningStatus;

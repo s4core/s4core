@@ -331,7 +331,10 @@ pub async fn verify_signature_v4_with_iam_data(
             S3Error::AccessDenied
         })?
         .ok_or_else(|| {
-            tracing::warn!("Access key not found: {}", auth.credential.access_key_id);
+            tracing::debug!(
+                "Access key not found in IAM: {}",
+                auth.credential.access_key_id
+            );
             S3Error::AccessDenied
         })?;
 

@@ -23,6 +23,7 @@
 pub mod auth;
 pub mod handlers;
 pub mod middleware;
+pub mod multipart_store;
 pub mod s3;
 pub mod server;
 

@@ -19,6 +19,8 @@ repository = "https://github.com/org/s4"
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
+tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["io"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -39,6 +41,9 @@ config = "0.14"
 metrics = "0.22"
 metrics-exporter-prometheus = "0.13"
 
+# CRC
+crc32fast = "1.3"
+
 # Hashing
 blake3 = "1.5"
 sha1 = "0.10"
@@ -57,7 +62,7 @@ tower-http = { version = "0.5", features = ["cors", "trace", "normalize-path"] }
 quick-xml = { version = "0.31", features = ["serialize"] }
 
 # Database
-redb = "1.0"
+fjall = "3"
 
 # Utilities
 anyhow = "1.0"

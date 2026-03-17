@@ -41,7 +41,7 @@ async fn create_test_storage() -> (BitcaskStorageEngine, TempDir) {
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let data_path = temp_dir.path().join("volumes");
-    let metadata_path = temp_dir.path().join("metadata.redb");
+    let metadata_path = temp_dir.path().join("metadata_db");
 
     std::fs::create_dir_all(&data_path).expect("Failed to create data dir");
 
@@ -52,12 +52,14 @@ async fn create_test_storage() -> (BitcaskStorageEngine, TempDir) {
     (engine, temp_dir)
 }
 
-fn create_test_state(storage: BitcaskStorageEngine) -> AppState {
+async fn create_test_state(storage: BitcaskStorageEngine, data_dir: &std::path::Path) -> AppState {
     AppState::new(
         storage,
         "test-access-key".to_string(),
         "test-secret-key".to_string(),
+        data_dir,
     )
+    .await
 }
 
 async fn body_to_string(body: Body) -> String {
@@ -72,7 +74,7 @@ async fn body_to_string(body: Body) -> String {
 #[tokio::test]
 async fn test_prometheus_metrics_endpoint_returns_ok() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     let response = app
         .oneshot(Request::builder().method("GET").uri("/metrics").body(Body::empty()).unwrap())
@@ -93,7 +95,7 @@ async fn test_prometheus_metrics_with_recorder() {
     let builder = metrics_exporter_prometheus::PrometheusBuilder::new();
     let handle = builder.install_recorder().expect("Failed to install recorder");
 
-    let state = create_test_state(storage).with_prometheus_handle(handle);
+    let state = create_test_state(storage, _temp.path()).await.with_prometheus_handle(handle);
     let app = create_router(state);
 
     // Make a request to generate some metrics first
@@ -133,7 +135,7 @@ async fn test_prometheus_metrics_with_recorder() {
 #[tokio::test]
 async fn test_api_stats_returns_json() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     let response = app
         .oneshot(Request::builder().method("GET").uri("/api/stats").body(Body::empty()).unwrap())
@@ -176,7 +178,7 @@ async fn test_api_stats_returns_json() {
 #[tokio::test]
 async fn test_api_stats_after_operations() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create a bucket
     let app = create_router(state.clone());

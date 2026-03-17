@@ -15,6 +15,7 @@ path = "src/main.rs"
 s4-core = { path = "../s4-core" }
 s4-api = { path = "../s4-api" }
 s4-features = { path = "../s4-features" }
+s4-compactor = { path = "../s4-compactor" }
 tokio = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }

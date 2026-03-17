@@ -41,7 +41,7 @@ type HmacSha256 = Hmac<Sha256>;
 async fn create_test_storage() -> (BitcaskStorageEngine, TempDir) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let data_path = temp_dir.path().join("volumes");
-    let metadata_path = temp_dir.path().join("metadata.redb");
+    let metadata_path = temp_dir.path().join("metadata_db");
 
     std::fs::create_dir_all(&data_path).expect("Failed to create data dir");
 
@@ -59,12 +59,14 @@ async fn create_test_storage() -> (BitcaskStorageEngine, TempDir) {
 }
 
 /// Creates an AppState with test credentials.
-fn create_test_state(storage: BitcaskStorageEngine) -> AppState {
+async fn create_test_state(storage: BitcaskStorageEngine, data_dir: &std::path::Path) -> AppState {
     AppState::new(
         storage,
         "test-access-key".to_string(),
         "test-secret-key".to_string(),
+        data_dir,
     )
+    .await
 }
 
 /// Helper to read response body as string.
@@ -201,7 +203,7 @@ fn build_signed_request(
 #[tokio::test]
 async fn test_reader_can_list_buckets() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create a reader user
     let (access_key, secret_key) =
@@ -222,7 +224,7 @@ async fn test_reader_can_list_buckets() {
 #[tokio::test]
 async fn test_reader_can_head_bucket() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // First create a bucket as a writer
     let (writer_ak, writer_sk) =
@@ -252,7 +254,7 @@ async fn test_reader_can_head_bucket() {
 #[tokio::test]
 async fn test_reader_cannot_create_bucket() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create a reader user
     let (access_key, secret_key) =
@@ -276,7 +278,7 @@ async fn test_reader_cannot_create_bucket() {
 #[tokio::test]
 async fn test_reader_cannot_put_object() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // First create a bucket as a writer
     let (writer_ak, writer_sk) =
@@ -311,7 +313,7 @@ async fn test_reader_cannot_put_object() {
 #[tokio::test]
 async fn test_reader_cannot_delete_bucket() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // First create a bucket as a writer
     let (writer_ak, writer_sk) =
@@ -350,7 +352,7 @@ async fn test_reader_cannot_delete_bucket() {
 #[tokio::test]
 async fn test_writer_can_create_bucket() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     let (access_key, secret_key) =
         create_user_with_credentials(&state, "writer_create", "password123", Role::Writer).await;
@@ -370,7 +372,7 @@ async fn test_writer_can_create_bucket() {
 #[tokio::test]
 async fn test_writer_can_put_and_get_object() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     let (access_key, secret_key) =
         create_user_with_credentials(&state, "writer_putget", "password123", Role::Writer).await;
@@ -420,7 +422,7 @@ async fn test_writer_can_put_and_get_object() {
 #[tokio::test]
 async fn test_writer_can_delete_object() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     let (access_key, secret_key) =
         create_user_with_credentials(&state, "writer_del_obj", "password123", Role::Writer).await;
@@ -466,7 +468,7 @@ async fn test_writer_can_delete_object() {
 #[tokio::test]
 async fn test_superuser_can_do_everything() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     let (access_key, secret_key) =
         create_user_with_credentials(&state, "superuser", "password123", Role::SuperUser).await;
@@ -527,7 +529,7 @@ async fn test_superuser_can_do_everything() {
 #[tokio::test]
 async fn test_invalid_access_key_rejected() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
     let app = create_router(state);
 
     let request = build_signed_request("GET", "/", "INVALID_KEY", "invalid_secret", vec![]);
@@ -543,7 +545,7 @@ async fn test_invalid_access_key_rejected() {
 #[tokio::test]
 async fn test_wrong_signature_rejected() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     let (access_key, _secret_key) =
         create_user_with_credentials(&state, "wrong_sig", "password123", Role::Writer).await;
@@ -564,7 +566,7 @@ async fn test_wrong_signature_rejected() {
 #[tokio::test]
 async fn test_reader_can_get_object() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket and object as writer
     let (writer_ak, writer_sk) =

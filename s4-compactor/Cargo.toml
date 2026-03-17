@@ -16,6 +16,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+crc32fast = { workspace = true }
+bincode = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.10"
 
 [lints]
 workspace = true

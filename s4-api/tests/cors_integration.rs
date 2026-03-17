@@ -39,7 +39,7 @@ async fn create_test_state() -> (AppState, TempDir) {
     disable_auth();
     let temp_dir = TempDir::new().unwrap();
     let volumes_path = temp_dir.path().join("volumes");
-    let metadata_path = temp_dir.path().join("metadata.redb");
+    let metadata_path = temp_dir.path().join("metadata_db");
 
     std::fs::create_dir_all(&volumes_path).unwrap();
 
@@ -57,7 +57,9 @@ async fn create_test_state() -> (AppState, TempDir) {
         storage,
         "test-access-key".to_string(),
         "test-secret-key".to_string(),
-    );
+        temp_dir.path(),
+    )
+    .await;
 
     (state, temp_dir)
 }

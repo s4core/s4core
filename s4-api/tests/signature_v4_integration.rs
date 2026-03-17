@@ -35,7 +35,7 @@ use tower::ServiceExt;
 async fn create_test_storage() -> (BitcaskStorageEngine, TempDir) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let data_path = temp_dir.path().join("volumes");
-    let metadata_path = temp_dir.path().join("metadata.redb");
+    let metadata_path = temp_dir.path().join("metadata_db");
 
     std::fs::create_dir_all(&data_path).expect("Failed to create data dir");
 
@@ -53,12 +53,14 @@ async fn create_test_storage() -> (BitcaskStorageEngine, TempDir) {
 }
 
 /// Creates an AppState with test credentials.
-fn create_test_state(storage: BitcaskStorageEngine) -> AppState {
+async fn create_test_state(storage: BitcaskStorageEngine, data_dir: &std::path::Path) -> AppState {
     AppState::new(
         storage,
         "AKIAIOSFODNN7EXAMPLE".to_string(),
         "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+        data_dir,
     )
+    .await
 }
 
 /// Helper to read response body as string.
@@ -71,7 +73,7 @@ async fn body_to_string(body: Body) -> String {
 #[tokio::test]
 async fn test_missing_authorization_header() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     let response = app
         .oneshot(
@@ -105,7 +107,7 @@ async fn test_missing_authorization_header() {
 #[tokio::test]
 async fn test_invalid_authorization_header_format() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     let response = app
         .oneshot(
@@ -134,7 +136,7 @@ async fn test_invalid_authorization_header_format() {
 #[tokio::test]
 async fn test_wrong_access_key() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     // Create a request with wrong access key in Authorization header
     let auth_header = "AWS4-HMAC-SHA256 Credential=WRONG_KEY/20240101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=invalid";
@@ -166,7 +168,7 @@ async fn test_wrong_access_key() {
 #[tokio::test]
 async fn test_invalid_signature() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     // Create a request with correct access key but invalid signature
     let auth_header = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000";
@@ -198,7 +200,7 @@ async fn test_invalid_signature() {
 #[tokio::test]
 async fn test_missing_date_header() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     let auth_header = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=invalid";
 
@@ -228,7 +230,7 @@ async fn test_missing_date_header() {
 #[tokio::test]
 async fn test_canonical_uri_encoding() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     // Test with URL-encoded path
     let response = app

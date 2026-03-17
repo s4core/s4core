@@ -18,7 +18,7 @@
 //! including routing for S3-compatible API endpoints.
 
 use axum::{
-    body::Bytes,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, Extension, Path, Query, State},
     http::{header, header::HeaderName, HeaderMap, HeaderValue, Method, StatusCode},
     middleware,
@@ -31,7 +31,6 @@ use s4_features::iam::{models::User, AuthService, IamStorage, JwtManager};
 
 use crate::s3::errors::S3Error;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_http::{
@@ -41,12 +40,10 @@ use tower_http::{
 
 use crate::handlers;
 use crate::middleware::{admin_auth_middleware, iam_auth_middleware, metrics_middleware};
+use crate::multipart_store::DiskPartStore;
 
 /// Default maximum upload size (5GB).
 pub const DEFAULT_MAX_UPLOAD_SIZE: usize = 5 * 1024 * 1024 * 1024;
-
-/// In-memory store for multipart upload parts, keyed by part identifier.
-pub type PartStore = Arc<RwLock<HashMap<String, Vec<u8>>>>;
 
 /// Shared application state for all handlers.
 #[derive(Clone)]
@@ -67,34 +64,38 @@ pub struct AppState {
     pub prometheus_handle: Option<metrics_exporter_prometheus::PrometheusHandle>,
     /// Server start time for uptime calculation.
     pub start_time: std::time::Instant,
-    /// In-memory store for multipart upload parts (avoids writing temp data to volumes).
+    /// Disk-backed store for multipart upload parts.
     ///
-    /// **Note**: Parts are held in RAM until `CompleteMultipartUpload` or `AbortMultipartUpload`.
+    /// Parts are written to temp files on disk, keeping memory usage flat.
     /// Data is lost on server crash — incomplete multipart uploads are not recoverable.
-    pub part_store: PartStore,
+    pub part_store: Arc<DiskPartStore>,
 }
 
 impl AppState {
     /// Creates a new application state.
-    pub fn new(
+    pub async fn new(
         storage: BitcaskStorageEngine,
         access_key_id: String,
         secret_access_key: String,
+        data_dir: &std::path::Path,
     ) -> Self {
         Self::with_max_upload_size(
             storage,
             access_key_id,
             secret_access_key,
             DEFAULT_MAX_UPLOAD_SIZE,
+            data_dir,
         )
+        .await
     }
 
     /// Creates a new application state with custom max upload size.
-    pub fn with_max_upload_size(
+    pub async fn with_max_upload_size(
         storage: BitcaskStorageEngine,
         access_key_id: String,
         secret_access_key: String,
         max_upload_size: usize,
+        data_dir: &std::path::Path,
     ) -> Self {
         let storage_arc = Arc::new(RwLock::new(storage));
 
@@ -123,6 +124,13 @@ impl AppState {
         // Create auth service (needs a clone of iam_storage since AuthService takes ownership)
         let auth_service = Arc::new(AuthService::new((*iam_storage).clone(), jwt_manager));
 
+        // Initialize disk-backed part store for multipart uploads
+        let part_store = Arc::new(
+            DiskPartStore::with_defaults(data_dir)
+                .await
+                .expect("Failed to initialize multipart part store"),
+        );
+
         Self {
             storage: storage_arc,
             iam_storage,
@@ -132,7 +140,7 @@ impl AppState {
             max_upload_size,
             prometheus_handle: None,
             start_time: std::time::Instant::now(),
-            part_store: Arc::new(RwLock::new(HashMap::new())),
+            part_store,
         }
     }
 
@@ -201,6 +209,17 @@ impl StorageEngine for IamStorageAdapter {
     ) -> Result<Vec<(String, s4_core::types::IndexRecord)>, s4_core::error::StorageError> {
         let storage = self.0.read().await;
         storage.list_objects(bucket, prefix, max_keys).await
+    }
+
+    async fn list_objects_after(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: &str,
+        max_keys: usize,
+    ) -> Result<Vec<(String, s4_core::types::IndexRecord)>, s4_core::error::StorageError> {
+        let storage = self.0.read().await;
+        storage.list_objects_after(bucket, prefix, start_after, max_keys).await
     }
 
     // Versioning methods - not needed for IAM but required by trait
@@ -295,6 +314,47 @@ impl StorageEngine for IamStorageAdapter {
     ) -> Result<(), s4_core::error::StorageError> {
         Err(s4_core::error::StorageError::InvalidOperation {
             operation: "metadata_update".to_string(),
+            reason: "Not needed for IAM storage".to_string(),
+        })
+    }
+
+    async fn put_object_streaming(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+        _content_length: u64,
+        _content_type: &str,
+        _metadata: &std::collections::HashMap<String, String>,
+        _etag: &str,
+    ) -> Result<s4_core::storage::StreamingPutResult, s4_core::error::StorageError> {
+        Err(s4_core::error::StorageError::InvalidOperation {
+            operation: "streaming_put".to_string(),
+            reason: "Not needed for IAM storage".to_string(),
+        })
+    }
+
+    async fn open_object_stream(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _options: s4_core::storage::ReadOptions,
+    ) -> Result<s4_core::storage::ObjectStream, s4_core::error::StorageError> {
+        Err(s4_core::error::StorageError::InvalidOperation {
+            operation: "streaming_read".to_string(),
+            reason: "Not needed for IAM storage".to_string(),
+        })
+    }
+
+    async fn open_object_version_stream(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version_id: &str,
+        _options: s4_core::storage::ReadOptions,
+    ) -> Result<s4_core::storage::ObjectStream, s4_core::error::StorageError> {
+        Err(s4_core::error::StorageError::InvalidOperation {
+            operation: "streaming_read".to_string(),
             reason: "Not needed for IAM storage".to_string(),
         })
     }
@@ -581,18 +641,49 @@ async fn post_bucket_router(
 }
 
 /// Routes PUT requests - either PutObject, UploadPart, PutObjectRetention, or PutObjectLegalHold.
+///
+/// For UploadPart, the body is passed as `Body` (streaming) to avoid buffering
+/// the entire part in memory. For other operations, the body is collected into `Bytes`.
 async fn put_object_router(
     state: State<AppState>,
     path: Path<(String, String)>,
     user: Option<Extension<User>>,
     Query(params): Query<ObjectQueryParams>,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> axum::response::Response {
     // Check write permission (all PUT object operations require write)
     if let Err(response) = check_write_permission(user.as_ref().map(|e| &e.0)) {
         return response;
     }
+
+    // UploadPart: pass Body directly for streaming (no full buffering)
+    if params.part_number.is_some() && params.upload_id.is_some() {
+        let query = handlers::multipart::MultipartQuery {
+            upload_id: params.upload_id,
+            part_number: params.part_number,
+            uploads: None,
+            max_parts: None,
+            part_number_marker: None,
+        };
+        return handlers::upload_part(state, path, Query(query), headers, body)
+            .await
+            .into_response();
+    }
+
+    // CopyObject: no body needed
+    if headers.get("x-amz-copy-source").is_some() {
+        return handlers::copy_object(state, path, headers).await.into_response();
+    }
+
+    // All other PUT operations need the body as Bytes
+    let body = match axum::body::to_bytes(body, state.max_upload_size).await {
+        Ok(b) => b,
+        Err(_) => {
+            return S3Error::InternalError("Failed to read request body".to_string())
+                .into_response()
+        }
+    };
 
     // Check for Object Lock operations first
     if params.retention.is_some() {
@@ -617,21 +708,6 @@ async fn put_object_router(
         handlers::put_object_tagging(state, path, Query(version_query), body)
             .await
             .into_response()
-    } else if params.part_number.is_some() && params.upload_id.is_some() {
-        // UploadPart
-        let query = handlers::multipart::MultipartQuery {
-            upload_id: params.upload_id,
-            part_number: params.part_number,
-            uploads: None,
-            max_parts: None,
-            part_number_marker: None,
-        };
-        handlers::upload_part(state, path, Query(query), headers, body)
-            .await
-            .into_response()
-    } else if headers.get("x-amz-copy-source").is_some() {
-        // CopyObject
-        handlers::copy_object(state, path, headers).await.into_response()
     } else {
         // Default: PutObject
         handlers::put_object(state, path, headers, body).await.into_response()
@@ -983,6 +1059,7 @@ pub fn create_router(state: AppState) -> Router {
             "/buckets/:name/objects",
             get(handlers::admin::list_bucket_objects),
         )
+        .route("/compaction/run", post(handlers::admin::run_compaction))
         // Add JWT authentication middleware
         .layer(middleware::from_fn_with_state(
             state.clone(),

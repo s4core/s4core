@@ -35,7 +35,7 @@ The foundation of S4. Contains the storage engine, metadata indexing, deduplicat
 - `storage/engine.rs` — `StorageEngine` trait defining the storage API
 - `storage/bitcask.rs` — Bitcask-style implementation
 - `storage/volume.rs` — Append-only volume file reader/writer
-- `storage/index.rs` — redb metadata index wrapper
+- `storage/index.rs` — fjall metadata index wrapper
 - `storage/dedup.rs` — Content-addressable deduplication
 - `storage/recovery.rs` — Crash recovery logic
 - `types/` — Core data types (`BlobHeader`, `IndexRecord`)

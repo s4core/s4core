@@ -41,7 +41,7 @@ async fn create_test_storage() -> (BitcaskStorageEngine, TempDir) {
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let data_path = temp_dir.path().join("volumes");
-    let metadata_path = temp_dir.path().join("metadata.redb");
+    let metadata_path = temp_dir.path().join("metadata_db");
 
     std::fs::create_dir_all(&data_path).expect("Failed to create data dir");
 
@@ -52,12 +52,14 @@ async fn create_test_storage() -> (BitcaskStorageEngine, TempDir) {
     (engine, temp_dir)
 }
 
-fn create_test_state(storage: BitcaskStorageEngine) -> AppState {
+async fn create_test_state(storage: BitcaskStorageEngine, data_dir: &std::path::Path) -> AppState {
     AppState::new(
         storage,
         "test-access-key".to_string(),
         "test-secret-key".to_string(),
+        data_dir,
     )
+    .await
 }
 
 /// Helper to create a bucket and upload an object.
@@ -139,7 +141,7 @@ fn build_select_xml(expression: &str, input_format: &str, output_format: &str) -
 #[tokio::test]
 async fn test_select_csv_basic() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
     let app = create_router(state);
 
     let csv_data = b"name,age,city\nAlice,30,NYC\nBob,25,LA\nCharlie,35,Chicago\n";
@@ -182,7 +184,7 @@ async fn test_select_csv_basic() {
 #[tokio::test]
 async fn test_select_csv_where_clause() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
     let app = create_router(state);
 
     let csv_data = b"name,age,city\nAlice,30,NYC\nBob,25,LA\nCharlie,35,Chicago\n";
@@ -214,7 +216,7 @@ async fn test_select_csv_where_clause() {
 #[tokio::test]
 async fn test_select_csv_aggregate() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
     let app = create_router(state);
 
     let csv_data = b"name,age,city\nAlice,30,NYC\nBob,25,LA\nCharlie,35,Chicago\n";
@@ -240,7 +242,7 @@ async fn test_select_csv_aggregate() {
 #[tokio::test]
 async fn test_select_json_basic() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
     let app = create_router(state);
 
     let json_data = b"{\"name\":\"Alice\",\"age\":30}\n{\"name\":\"Bob\",\"age\":25}\n";
@@ -273,7 +275,7 @@ async fn test_select_json_basic() {
 #[tokio::test]
 async fn test_select_nonexistent_object() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
     let app = create_router(state);
 
     // Create bucket but don't upload object
@@ -304,7 +306,7 @@ async fn test_select_nonexistent_object() {
 #[tokio::test]
 async fn test_select_invalid_sql() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
     let app = create_router(state);
 
     let csv_data = b"name,age\nAlice,30\n";
@@ -332,7 +334,7 @@ async fn test_select_invalid_sql() {
 #[tokio::test]
 async fn test_select_invalid_xml_body() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
     let app = create_router(state);
 
     let csv_data = b"name,age\nAlice,30\n";
@@ -360,7 +362,7 @@ async fn test_select_invalid_xml_body() {
 #[tokio::test]
 async fn test_sql_query_basic() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
     let app = create_router(state);
 
     let csv_data = b"name,age,city\nAlice,30,NYC\nBob,25,LA\n";
@@ -401,7 +403,7 @@ async fn test_sql_query_basic() {
 #[tokio::test]
 async fn test_sql_query_csv_output() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
     let app = create_router(state);
 
     let csv_data = b"name,age\nAlice,30\nBob,25\n";
@@ -432,7 +434,7 @@ async fn test_sql_query_csv_output() {
 #[tokio::test]
 async fn test_sql_query_json_input() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
     let app = create_router(state);
 
     let json_data = b"{\"name\":\"Alice\",\"score\":95}\n{\"name\":\"Bob\",\"score\":87}\n";
@@ -475,7 +477,7 @@ async fn test_sql_query_json_input() {
 #[tokio::test]
 async fn test_sql_query_invalid_json_body() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
     let app = create_router(state);
 
     // Create bucket
@@ -509,7 +511,7 @@ async fn test_sql_query_invalid_json_body() {
 #[tokio::test]
 async fn test_sql_query_unsupported_format() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
     let app = create_router(state);
 
     let csv_data = b"name,age\nAlice,30\n";

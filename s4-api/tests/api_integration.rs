@@ -50,7 +50,7 @@ async fn create_test_storage() -> (BitcaskStorageEngine, TempDir) {
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let data_path = temp_dir.path().join("volumes");
-    let metadata_path = temp_dir.path().join("metadata.redb");
+    let metadata_path = temp_dir.path().join("metadata_db");
 
     std::fs::create_dir_all(&data_path).expect("Failed to create data dir");
 
@@ -68,12 +68,14 @@ async fn create_test_storage() -> (BitcaskStorageEngine, TempDir) {
 }
 
 /// Creates an AppState with test credentials.
-fn create_test_state(storage: BitcaskStorageEngine) -> AppState {
+async fn create_test_state(storage: BitcaskStorageEngine, data_dir: &std::path::Path) -> AppState {
     AppState::new(
         storage,
         "test-access-key".to_string(),
         "test-secret-key".to_string(),
+        data_dir,
     )
+    .await
 }
 
 /// Helper to read response body as string.
@@ -89,7 +91,7 @@ async fn body_to_string(body: Body) -> String {
 #[tokio::test]
 async fn test_create_bucket() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     let response = app
         .oneshot(
@@ -108,7 +110,7 @@ async fn test_create_bucket() {
 #[tokio::test]
 async fn test_create_bucket_invalid_name() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     // Bucket name too short
     let response = app
@@ -122,7 +124,7 @@ async fn test_create_bucket_invalid_name() {
 #[tokio::test]
 async fn test_create_bucket_already_exists() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create first bucket
     let app1 = create_router(state.clone());
@@ -156,7 +158,7 @@ async fn test_create_bucket_already_exists() {
 #[tokio::test]
 async fn test_list_buckets_empty() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     let response = app
         .oneshot(Request::builder().method("GET").uri("/").body(Body::empty()).unwrap())
@@ -173,7 +175,7 @@ async fn test_list_buckets_empty() {
 #[tokio::test]
 async fn test_list_buckets_with_buckets() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create a bucket first
     let app1 = create_router(state.clone());
@@ -203,7 +205,7 @@ async fn test_list_buckets_with_buckets() {
 #[tokio::test]
 async fn test_head_bucket_exists() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app1 = create_router(state.clone());
@@ -236,7 +238,7 @@ async fn test_head_bucket_exists() {
 #[tokio::test]
 async fn test_head_bucket_not_exists() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     let response = app
         .oneshot(
@@ -255,7 +257,7 @@ async fn test_head_bucket_not_exists() {
 #[tokio::test]
 async fn test_delete_bucket() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app1 = create_router(state.clone());
@@ -303,7 +305,7 @@ async fn test_delete_bucket() {
 #[tokio::test]
 async fn test_delete_bucket_not_exists() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     let response = app
         .oneshot(
@@ -326,7 +328,7 @@ async fn test_delete_bucket_not_exists() {
 #[tokio::test]
 async fn test_put_object() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket first
     let app1 = create_router(state.clone());
@@ -361,7 +363,7 @@ async fn test_put_object() {
 #[tokio::test]
 async fn test_put_object_bucket_not_exists() {
     let (storage, _temp) = create_test_storage().await;
-    let app = create_router(create_test_state(storage));
+    let app = create_router(create_test_state(storage, _temp.path()).await);
 
     let response = app
         .oneshot(
@@ -380,7 +382,7 @@ async fn test_put_object_bucket_not_exists() {
 #[tokio::test]
 async fn test_get_object() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app1 = create_router(state.clone());
@@ -432,7 +434,7 @@ async fn test_get_object() {
 #[tokio::test]
 async fn test_get_object_not_exists() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app1 = create_router(state.clone());
@@ -465,7 +467,7 @@ async fn test_get_object_not_exists() {
 #[tokio::test]
 async fn test_head_object() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app1 = create_router(state.clone());
@@ -517,7 +519,7 @@ async fn test_head_object() {
 #[tokio::test]
 async fn test_delete_object() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app1 = create_router(state.clone());
@@ -577,7 +579,7 @@ async fn test_delete_object() {
 #[tokio::test]
 async fn test_list_objects_empty() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app1 = create_router(state.clone());
@@ -615,7 +617,7 @@ async fn test_list_objects_empty() {
 #[tokio::test]
 async fn test_list_objects_with_objects() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app1 = create_router(state.clone());
@@ -667,7 +669,7 @@ async fn test_list_objects_with_objects() {
 #[tokio::test]
 async fn test_list_objects_with_prefix() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app1 = create_router(state.clone());
@@ -723,7 +725,7 @@ async fn test_list_objects_with_prefix() {
 #[tokio::test]
 async fn test_object_custom_metadata() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app1 = create_router(state.clone());
@@ -783,7 +785,7 @@ async fn test_object_custom_metadata() {
 #[tokio::test]
 async fn test_full_s3_workflow() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // 1. List buckets (empty)
     let app = create_router(state.clone());
@@ -922,7 +924,7 @@ async fn body_to_bytes(body: Body) -> Vec<u8> {
 #[tokio::test]
 async fn test_large_object_roundtrip() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app = create_router(state.clone());
@@ -999,7 +1001,7 @@ async fn test_large_object_roundtrip() {
 #[tokio::test]
 async fn test_large_object_with_text_content() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app = create_router(state.clone());
@@ -1074,7 +1076,7 @@ async fn test_large_object_with_text_content() {
 #[tokio::test]
 async fn test_multipart_upload_large_file() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app = create_router(state.clone());
@@ -1167,6 +1169,8 @@ async fn test_multipart_upload_large_file() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
+    // Must consume the full body to wait for streaming assembly to complete
+    let _ = body_to_bytes(response.into_body()).await;
 
     // Download and verify
     let app = create_router(state);
@@ -1208,7 +1212,7 @@ async fn test_multipart_upload_large_file() {
 #[tokio::test]
 async fn test_object_just_under_inline_threshold() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app = create_router(state.clone());
@@ -1262,7 +1266,7 @@ async fn test_object_just_under_inline_threshold() {
 #[tokio::test]
 async fn test_object_just_over_inline_threshold() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app = create_router(state.clone());
@@ -1323,7 +1327,7 @@ async fn test_object_just_over_inline_threshold() {
 #[tokio::test]
 async fn test_aws_chunked_encoding() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app = create_router(state.clone());
@@ -1407,7 +1411,7 @@ async fn test_aws_chunked_encoding() {
 #[tokio::test]
 async fn test_aws_chunked_encoding_large_file() {
     let (storage, _temp) = create_test_storage().await;
-    let state = create_test_state(storage);
+    let state = create_test_state(storage, _temp.path()).await;
 
     // Create bucket
     let app = create_router(state.clone());
@@ -1474,4 +1478,782 @@ async fn test_aws_chunked_encoding_large_file() {
 
     assert_eq!(retrieved_data.len(), original_content.len());
     assert_eq!(retrieved_data, original_content);
+}
+
+// ============================================================================
+// Multipart Upload — Disk Storage Tests
+// ============================================================================
+
+/// Helper: runs a full multipart upload flow. Returns (upload_id, etags, original_data).
+async fn do_multipart_upload(
+    state: &AppState,
+    key: &str,
+    part_size: usize,
+    num_parts: usize,
+) -> (String, Vec<(usize, String)>, Vec<u8>) {
+    let total = part_size * num_parts;
+    let data: Vec<u8> = (0..total).map(|i| (i % 256) as u8).collect();
+
+    // Initiate
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/test-bucket/{}?uploads", key))
+                .header("content-type", "application/octet-stream")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_to_string(resp.into_body()).await;
+    let upload_id =
+        body[body.find("<UploadId>").unwrap() + 10..body.find("</UploadId>").unwrap()].to_string();
+
+    // Upload parts
+    let mut etags = Vec::new();
+    for pn in 1..=num_parts {
+        let start = (pn - 1) * part_size;
+        let end = pn * part_size;
+
+        let app = create_router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!(
+                        "/test-bucket/{}?uploadId={}&partNumber={}",
+                        key, upload_id, pn
+                    ))
+                    .body(Body::from(data[start..end].to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let etag = resp.headers().get("etag").unwrap().to_str().unwrap().to_string();
+        etags.push((pn, etag));
+    }
+
+    (upload_id, etags, data)
+}
+
+/// Helper: sends CompleteMultipartUpload.
+async fn complete_multipart(
+    state: &AppState,
+    key: &str,
+    upload_id: &str,
+    etags: &[(usize, String)],
+) -> StatusCode {
+    let parts_xml: String = etags
+        .iter()
+        .map(|(pn, etag)| {
+            format!(
+                "  <Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>",
+                pn, etag
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<CompleteMultipartUpload>\n{}\n</CompleteMultipartUpload>",
+        parts_xml
+    );
+
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/test-bucket/{}?uploadId={}", key, upload_id))
+                .header("content-type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = resp.status();
+    // Must consume the full body to wait for streaming assembly to complete
+    let _ = body_to_bytes(resp.into_body()).await;
+    status
+}
+
+#[tokio::test]
+async fn test_multipart_disk_storage() {
+    let (storage, _temp) = create_test_storage().await;
+    let state = create_test_state(storage, _temp.path()).await;
+
+    // Create bucket
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::builder()
+            .method("PUT")
+            .uri("/test-bucket")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    // Upload parts and verify they are stored durably
+    let part_size = 6 * 1024 * 1024; // 6MB
+    let (upload_id, etags, _data) =
+        do_multipart_upload(&state, "disk-test.bin", part_size, 2).await;
+
+    // Parts should be listed via ListParts API (stored in fjall, data in volumes)
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/test-bucket/disk-test.bin?uploadId={}", upload_id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_to_string(resp.into_body()).await;
+    // Verify both parts are present in the ListParts response
+    assert!(
+        body.contains("<PartNumber>1</PartNumber>"),
+        "Part 1 should be listed"
+    );
+    assert!(
+        body.contains("<PartNumber>2</PartNumber>"),
+        "Part 2 should be listed"
+    );
+    // Verify ETags match
+    for (_pn, etag) in &etags {
+        let clean_etag = etag.trim_matches('"');
+        assert!(
+            body.contains(clean_etag),
+            "ETag {} should be in ListParts",
+            clean_etag
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_multipart_temp_files_cleaned_on_complete() {
+    let (storage, _temp) = create_test_storage().await;
+    let state = create_test_state(storage, _temp.path()).await;
+
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::builder()
+            .method("PUT")
+            .uri("/test-bucket")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let part_size = 6 * 1024 * 1024;
+    let (upload_id, etags, _data) =
+        do_multipart_upload(&state, "cleanup-test.bin", part_size, 2).await;
+
+    // Complete the upload
+    let status = complete_multipart(&state, "cleanup-test.bin", &upload_id, &etags).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Temp files should be cleaned up
+    let tmp_dir = _temp.path().join("multipart_tmp");
+    let remaining: Vec<_> = std::fs::read_dir(&tmp_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with(&upload_id)))
+        .collect();
+    assert_eq!(
+        remaining.len(),
+        0,
+        "Temp files should be removed after CompleteMultipartUpload"
+    );
+}
+
+#[tokio::test]
+async fn test_multipart_temp_files_cleaned_on_abort() {
+    let (storage, _temp) = create_test_storage().await;
+    let state = create_test_state(storage, _temp.path()).await;
+
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::builder()
+            .method("PUT")
+            .uri("/test-bucket")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let part_size = 6 * 1024 * 1024;
+    let (upload_id, _etags, _data) =
+        do_multipart_upload(&state, "abort-test.bin", part_size, 2).await;
+
+    // Abort the upload
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/test-bucket/abort-test.bin?uploadId={}",
+                    upload_id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Temp files should be cleaned up
+    let tmp_dir = _temp.path().join("multipart_tmp");
+    let remaining: Vec<_> = std::fs::read_dir(&tmp_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.starts_with(&upload_id)))
+        .collect();
+    assert_eq!(
+        remaining.len(),
+        0,
+        "Temp files should be removed after AbortMultipartUpload"
+    );
+}
+
+#[tokio::test]
+async fn test_multipart_streaming_assembly() {
+    let (storage, _temp) = create_test_storage().await;
+    let state = create_test_state(storage, _temp.path()).await;
+
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::builder()
+            .method("PUT")
+            .uri("/test-bucket")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let part_size = 6 * 1024 * 1024; // 6MB per part
+    let (upload_id, etags, original_data) =
+        do_multipart_upload(&state, "stream-assembly.bin", part_size, 3).await;
+
+    // Complete
+    let status = complete_multipart(&state, "stream-assembly.bin", &upload_id, &etags).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Download and verify data integrity
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/test-bucket/stream-assembly.bin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let retrieved = body_to_bytes(resp.into_body()).await;
+    assert_eq!(retrieved.len(), original_data.len());
+    assert_eq!(retrieved, original_data);
+}
+
+#[tokio::test]
+async fn test_multipart_s3_etag_format() {
+    let (storage, _temp) = create_test_storage().await;
+    let state = create_test_state(storage, _temp.path()).await;
+
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::builder()
+            .method("PUT")
+            .uri("/test-bucket")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let part_size = 6 * 1024 * 1024;
+    let (upload_id, etags, _data) =
+        do_multipart_upload(&state, "etag-test.bin", part_size, 2).await;
+
+    let status = complete_multipart(&state, "etag-test.bin", &upload_id, &etags).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // HEAD to get the final ETag
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/test-bucket/etag-test.bin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let etag = resp.headers().get("etag").unwrap().to_str().unwrap().trim_matches('"');
+
+    // S3 multipart ETag format: hex_md5-N
+    assert!(
+        etag.contains('-'),
+        "Multipart ETag should contain '-': got {}",
+        etag
+    );
+    let parts: Vec<&str> = etag.split('-').collect();
+    assert_eq!(parts.len(), 2, "ETag should have exactly one '-'");
+    assert_eq!(parts[0].len(), 32, "Hash portion should be 32 hex chars");
+    assert_eq!(
+        parts[1], "2",
+        "Part count should match number of uploaded parts"
+    );
+}
+
+#[tokio::test]
+async fn test_multipart_ttl_expiration() {
+    use s4_api::multipart_store::DiskPartStore;
+    use std::time::Duration;
+
+    let tmp = TempDir::new().unwrap();
+    let store = DiskPartStore::with_defaults(tmp.path()).await.unwrap();
+
+    // Store a part
+    store.store_part("old-upload", 1, b"data").await.unwrap();
+    assert!(store.upload_exists("old-upload").await);
+
+    // With a zero TTL, the upload should be considered expired immediately
+    // (created_at was set to Instant::now(), and any elapsed time > Duration::ZERO)
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    let cleaned = store.cleanup_expired(Duration::ZERO).await.unwrap();
+    assert_eq!(cleaned, 1);
+
+    assert!(!store.upload_exists("old-upload").await);
+}
+
+#[tokio::test]
+async fn test_multipart_startup_cleanup() {
+    use s4_api::multipart_store::DiskPartStore;
+
+    let tmp = TempDir::new().unwrap();
+
+    // Create orphaned temp files (simulating crash leftovers)
+    let mp_dir = tmp.path().join("multipart_tmp");
+    std::fs::create_dir_all(&mp_dir).unwrap();
+    std::fs::write(mp_dir.join("crashed_upload_00001.part"), b"orphan1").unwrap();
+    std::fs::write(mp_dir.join("crashed_upload_00002.part"), b"orphan2").unwrap();
+    std::fs::write(mp_dir.join("other_upload_00001.part"), b"orphan3").unwrap();
+
+    // Create a fresh DiskPartStore (simulating server restart)
+    let store = DiskPartStore::with_defaults(tmp.path()).await.unwrap();
+
+    // Cleanup orphaned files
+    let cleaned = store.cleanup_orphaned().await.unwrap();
+    assert_eq!(cleaned, 3);
+
+    // No .part files should remain
+    let remaining: Vec<_> = std::fs::read_dir(&mp_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "part"))
+        .collect();
+    assert!(remaining.is_empty());
+}
+
+// -- Native composite multipart integration tests ----------------------------
+
+#[tokio::test]
+async fn test_multipart_list_parts_api() {
+    let (storage, _temp) = create_test_storage().await;
+    let state = create_test_state(storage, _temp.path()).await;
+
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::builder()
+            .method("PUT")
+            .uri("/test-bucket")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let part_size = 6 * 1024 * 1024;
+    let (upload_id, etags, _data) =
+        do_multipart_upload(&state, "list-parts.bin", part_size, 3).await;
+
+    // ListParts
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/test-bucket/list-parts.bin?uploadId={}",
+                    upload_id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_to_string(resp.into_body()).await;
+    assert!(body.contains("<PartNumber>1</PartNumber>"));
+    assert!(body.contains("<PartNumber>2</PartNumber>"));
+    assert!(body.contains("<PartNumber>3</PartNumber>"));
+    assert!(body.contains(&format!("<UploadId>{}</UploadId>", upload_id)));
+
+    // Verify ETags
+    for (_pn, etag) in &etags {
+        let clean_etag = etag.trim_matches('"');
+        assert!(
+            body.contains(clean_etag),
+            "ETag {} should appear in ListParts",
+            clean_etag
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_multipart_list_parts_pagination() {
+    let (storage, _temp) = create_test_storage().await;
+    let state = create_test_state(storage, _temp.path()).await;
+
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::builder()
+            .method("PUT")
+            .uri("/test-bucket")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let part_size = 6 * 1024 * 1024;
+    let (upload_id, _etags, _data) =
+        do_multipart_upload(&state, "paginate.bin", part_size, 3).await;
+
+    // ListParts with max-parts=2
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/test-bucket/paginate.bin?uploadId={}&max-parts=2",
+                    upload_id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = body_to_string(resp.into_body()).await;
+    assert!(body.contains("<IsTruncated>true</IsTruncated>"));
+    assert!(body.contains("<MaxParts>2</MaxParts>"));
+    assert!(body.contains("<PartNumber>1</PartNumber>"));
+    assert!(body.contains("<PartNumber>2</PartNumber>"));
+    // Part 3 should NOT be in this page
+    assert!(!body.contains("<PartNumber>3</PartNumber>"));
+}
+
+#[tokio::test]
+async fn test_multipart_abort_prevents_access() {
+    let (storage, _temp) = create_test_storage().await;
+    let state = create_test_state(storage, _temp.path()).await;
+
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::builder()
+            .method("PUT")
+            .uri("/test-bucket")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let part_size = 6 * 1024 * 1024;
+    let (upload_id, _etags, _data) =
+        do_multipart_upload(&state, "abort-test.bin", part_size, 2).await;
+
+    // Abort the upload
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/test-bucket/abort-test.bin?uploadId={}",
+                    upload_id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // ListParts should fail (session gone)
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/test-bucket/abort-test.bin?uploadId={}",
+                    upload_id
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // UploadPart should fail (session gone)
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!(
+                    "/test-bucket/abort-test.bin?uploadId={}&partNumber=1",
+                    upload_id
+                ))
+                .body(Body::from(vec![0u8; 1024]))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_multipart_delete_composite_object() {
+    let (storage, _temp) = create_test_storage().await;
+    let state = create_test_state(storage, _temp.path()).await;
+
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::builder()
+            .method("PUT")
+            .uri("/test-bucket")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let part_size = 6 * 1024 * 1024;
+    let (upload_id, etags, _data) =
+        do_multipart_upload(&state, "delete-composite.bin", part_size, 2).await;
+
+    let status = complete_multipart(&state, "delete-composite.bin", &upload_id, &etags).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Verify it exists
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/test-bucket/delete-composite.bin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Delete the composite object
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/test-bucket/delete-composite.bin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Verify it's gone
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/test-bucket/delete-composite.bin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_multipart_head_composite_object() {
+    let (storage, _temp) = create_test_storage().await;
+    let state = create_test_state(storage, _temp.path()).await;
+
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::builder()
+            .method("PUT")
+            .uri("/test-bucket")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let part_size = 6 * 1024 * 1024;
+    let total_size = part_size * 2;
+    let (upload_id, etags, _data) =
+        do_multipart_upload(&state, "head-composite.bin", part_size, 2).await;
+
+    let status = complete_multipart(&state, "head-composite.bin", &upload_id, &etags).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // HEAD
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/test-bucket/head-composite.bin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Verify Content-Length matches total size
+    let content_length: usize =
+        resp.headers().get("content-length").unwrap().to_str().unwrap().parse().unwrap();
+    assert_eq!(content_length, total_size);
+
+    // Verify Content-Type
+    let content_type = resp.headers().get("content-type").unwrap().to_str().unwrap();
+    assert_eq!(content_type, "application/octet-stream");
+
+    // Verify ETag has multipart format
+    let etag = resp.headers().get("etag").unwrap().to_str().unwrap().trim_matches('"');
+    assert!(etag.contains('-'), "ETag should be multipart format");
+}
+
+#[tokio::test]
+async fn test_multipart_complete_invalid_etag() {
+    let (storage, _temp) = create_test_storage().await;
+    let state = create_test_state(storage, _temp.path()).await;
+
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::builder()
+            .method("PUT")
+            .uri("/test-bucket")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let part_size = 6 * 1024 * 1024;
+    let (upload_id, _etags, _data) =
+        do_multipart_upload(&state, "bad-etag.bin", part_size, 1).await;
+
+    // Complete with wrong ETag
+    let complete_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUpload>
+  <Part><PartNumber>1</PartNumber><ETag>"0000000000000000000000000000dead"</ETag></Part>
+</CompleteMultipartUpload>"#
+        .to_string();
+
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/test-bucket/bad-etag.bin?uploadId={}", upload_id))
+                .body(Body::from(complete_xml))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Should fail with 400 (ETag mismatch)
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_multipart_complete_missing_part() {
+    let (storage, _temp) = create_test_storage().await;
+    let state = create_test_state(storage, _temp.path()).await;
+
+    let app = create_router(state.clone());
+    app.oneshot(
+        Request::builder()
+            .method("PUT")
+            .uri("/test-bucket")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let part_size = 6 * 1024 * 1024;
+    let (upload_id, etags, _data) =
+        do_multipart_upload(&state, "missing-part.bin", part_size, 1).await;
+
+    // Complete referencing part 2 (which was never uploaded)
+    let complete_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUpload>
+  <Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>
+  <Part><PartNumber>2</PartNumber><ETag>"deadbeef"</ETag></Part>
+</CompleteMultipartUpload>"#,
+        etags[0].1
+    );
+
+    let app = create_router(state.clone());
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/test-bucket/missing-part.bin?uploadId={}",
+                    upload_id
+                ))
+                .body(Body::from(complete_xml))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }

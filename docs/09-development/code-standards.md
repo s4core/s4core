@@ -29,7 +29,7 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
 
     #[error("Database error: {0}")]
-    Database(#[from] redb::Error),
+    Database(#[from] fjall::Error),
 }
 ```
 

@@ -4,7 +4,7 @@
 # ============================================
 # Stage 1: Build
 # ============================================
-FROM rust:1.88-alpine AS builder
+FROM rust:1.90-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static

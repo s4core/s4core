@@ -1,4 +1,4 @@
-# S4 - Modern S3-Compatible Object Storage
+# 💫 S4 - Modern S3-Compatible Object Storage
 
 S4 is a high-performance, S3-compatible object storage server written in Rust. It solves the inode exhaustion problem common with traditional file-based storage systems and provides advanced features like atomic directory operations and content-addressable deduplication.
 
@@ -25,15 +25,16 @@ S4 is a high-performance, S3-compatible object storage server written in Rust. I
 
 ## Architecture
 
-S4 uses a hybrid storage approach:
+S4 uses a Bitcask-style storage approach:
 
-- **Tiny Objects (< 4KB)**: Stored inline in the metadata database
-- **All Other Objects (> 4KB)**: Stored in append-only volume files (~1GB each)
+- **All objects**: Stored in append-only volume files (~1GB each)
+- **Metadata**: Stored in fjall (LSM-tree, MVCC, LZ4 compression) with separate keyspaces
 
 This approach ensures:
 - Minimal inode usage (1 billion objects = ~1000 files)
 - Maximum write performance (sequential writes)
-- Fast recovery (metadata in ACID database)
+- Atomic metadata operations (fjall cross-keyspace batches)
+- Fast recovery (metadata in ACID database + crash-safe journal)
 
 ## Quick Start
 
@@ -163,6 +164,10 @@ S4 is configured through environment variables:
 | `S4_LIFECYCLE_ENABLED` | Enable lifecycle policy worker | `true` | `true`, `false`, `1`, `0` |
 | `S4_LIFECYCLE_INTERVAL_HOURS` | Lifecycle evaluation interval (hours) | `24` | `1`, `6`, `24`, `168` |
 | `S4_LIFECYCLE_DRY_RUN` | Dry-run mode (log without deleting) | `false` | `true`, `false`, `1`, `0` |
+| `S4_COMPACTION_ENABLED` | Enable volume compaction worker | `true` | `true`, `false`, `1`, `0` |
+| `S4_COMPACTION_INTERVAL_HOURS` | Compaction check interval (hours) | `6` | `1`, `6`, `12`, `24` |
+| `S4_COMPACTION_THRESHOLD` | Min fragmentation ratio to compact | `0.3` | `0.1`–`0.9` |
+| `S4_COMPACTION_DRY_RUN` | Analyze without compacting | `false` | `true`, `false`, `1`, `0` |
 | `S4_METRICS_ENABLED` | Prometheus metrics | true) | false |
 | `S4_SELECT_ENABLED` | Enable/disable S3 Select SQL engine | `true` | `false` |
 | `S4_SELECT_MAX_MEMORY` | Per-query memory limit for SQL engine | `256MB` | `512MB`, `1GB` |
@@ -515,10 +520,9 @@ bind = "0.0.0.0:9000"
 
 [storage]
 data_path = "/var/lib/s4/volumes"
-metadata_path = "/var/lib/s4/metadata.redb"
+metadata_path = "/var/lib/s4/metadata_db"
 
 [tuning]
-inline_threshold = 4096  # 4KB
 volume_size_mb = 1024    # 1GB
 strict_sync = true
 ```
@@ -527,7 +531,7 @@ strict_sync = true
 
 - [Architecture Guide](ARCHITECTURE.md) - Detailed architecture documentation
 - [Contributing Guide](CONTRIBUTING.md) - How to contribute to S4
-- [API Documentation](docs/api/) - API reference documentation
+- [API Documentation](docs/) - API reference documentation
 
 ## Development
 

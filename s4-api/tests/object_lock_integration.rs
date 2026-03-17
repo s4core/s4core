@@ -44,7 +44,7 @@ async fn create_test_app() -> (axum::Router, TempDir) {
 
     let temp_dir = TempDir::new().unwrap();
     let volumes_dir = temp_dir.path().join("volumes");
-    let metadata_path = temp_dir.path().join("metadata.redb");
+    let metadata_path = temp_dir.path().join("metadata_db");
 
     std::fs::create_dir_all(&volumes_dir).unwrap();
 
@@ -52,7 +52,13 @@ async fn create_test_app() -> (axum::Router, TempDir) {
         .await
         .unwrap();
 
-    let state = AppState::new(engine, "test-key".to_string(), "test-secret".to_string());
+    let state = AppState::new(
+        engine,
+        "test-key".to_string(),
+        "test-secret".to_string(),
+        temp_dir.path(),
+    )
+    .await;
     let app = create_router(state);
 
     (app, temp_dir)

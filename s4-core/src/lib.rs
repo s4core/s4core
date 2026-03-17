@@ -16,19 +16,21 @@
 //!
 //! This crate provides the core storage functionality for S4, including:
 //! - Append-only volume management
-//! - Metadata indexing with redb
+//! - Metadata indexing (fjall LSM-tree with MVCC and LZ4 compression)
 //! - Content-addressable deduplication
-//! - Crash recovery
+//! - Crash recovery from volume files
 //! - S3-compatible object versioning
+//! - Diagnostic counters for monitoring storage health
 
 pub mod error;
 pub mod storage;
 pub mod types;
 
 pub use error::StorageError;
-pub use storage::bitcask::{BitcaskStorageEngine, StorageStats};
+pub use storage::bitcask::{BitcaskStorageEngine, DiagnosticSnapshot, StorageStats};
 pub use storage::engine::{
-    DeleteMarkerEntry, DeleteResult, ListVersionsResult, ObjectVersion, StorageEngine,
+    DeleteMarkerEntry, DeleteResult, ListVersionsResult, ObjectStream, ObjectVersion, ReadOptions,
+    StorageEngine, StreamingPutResult,
 };
 pub use storage::version_index::VersionList;
 pub use storage::versioning::{generate_version_id, is_null_version, NULL_VERSION_ID};
