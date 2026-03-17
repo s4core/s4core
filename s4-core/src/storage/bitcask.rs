@@ -623,7 +623,7 @@ impl BitcaskStorageEngine {
 
             // Register in dedup
             let content_hash = updated.content_hash;
-            let dedup_op = self.deduplicator.make_register_op(content_hash, volume_id, offset)?;
+            let dedup_op = self.deduplicator.make_register_op(content_hash, volume_id, offset);
 
             // Atomic batch: update record + register dedup
             let record_bytes = bincode::serialize(&updated)
@@ -761,7 +761,7 @@ impl BitcaskStorageEngine {
             return Ok(None);
         }
         // Create batch op to increment ref count (committed atomically with object write)
-        let dedup_op = dedup.make_register_op(content_hash, volume_id, offset)?;
+        let dedup_op = dedup.make_register_op(content_hash, volume_id, offset);
         let record = IndexRecord::new(
             volume_id,
             offset,
@@ -823,7 +823,7 @@ impl BitcaskStorageEngine {
             drop(writer);
 
             // Create batch op for dedup registration (committed atomically with object)
-            let dedup_op = self.deduplicator.make_register_op(content_hash, volume_id, offset)?;
+            let dedup_op = self.deduplicator.make_register_op(content_hash, volume_id, offset);
 
             let record = IndexRecord::new(
                 volume_id,
@@ -964,7 +964,7 @@ impl crate::storage::engine::StateMachine for BitcaskStorageEngine {
                         record.content_hash,
                         record.file_id,
                         record.offset,
-                    )?;
+                    );
                     self.index_db.batch_write(vec![dedup_op]).await?;
                 }
             }
@@ -983,11 +983,8 @@ impl crate::storage::engine::StateMachine for BitcaskStorageEngine {
                 if let Some(existing) = self.index_db.get(&full_key).await? {
                     // Unregister dedup before deleting
                     if !existing.is_delete_marker && existing.content_hash != [0u8; 32] {
-                        if let Ok(Some(op)) =
-                            self.deduplicator.make_unregister_op(&existing.content_hash)
-                        {
-                            self.index_db.batch_write(vec![op]).await?;
-                        }
+                        let op = self.deduplicator.make_unregister_op(&existing.content_hash);
+                        self.index_db.batch_write(vec![op]).await?;
                     }
 
                     self.index_db.delete(&full_key).await?;
@@ -1426,7 +1423,7 @@ impl BitcaskStorageEngine {
         let blob_ref_value = bincode::serialize(&updated_ref)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
-        let dedup_op = self.deduplicator.make_register_op(content_hash, final_vol, final_off)?;
+        let dedup_op = self.deduplicator.make_register_op(content_hash, final_vol, final_off);
 
         // Check if this part_number was already uploaded (overwrite case).
         // If so, we need to decrement the old part's staged ref.
@@ -1937,11 +1934,7 @@ impl StorageEngine for BitcaskStorageEngine {
                 let mut ref_ops = self.composite_delete_ref_ops(&record).await?;
                 ops.append(&mut ref_ops);
             } else if record.file_id != u32::MAX {
-                if let Some(dedup_op) =
-                    self.deduplicator.make_unregister_op(&record.content_hash)?
-                {
-                    ops.push(dedup_op);
-                }
+                ops.push(self.deduplicator.make_unregister_op(&record.content_hash));
             }
         }
 
@@ -2236,11 +2229,7 @@ impl StorageEngine for BitcaskStorageEngine {
                     let mut ref_ops = self.composite_delete_ref_ops(&record).await?;
                     ops.append(&mut ref_ops);
                 } else if record.file_id != u32::MAX && record.file_id != DELETE_MARKER_FILE_ID {
-                    if let Some(dedup_op) =
-                        self.deduplicator.make_unregister_op(&record.content_hash)?
-                    {
-                        ops.push(dedup_op);
-                    }
+                    ops.push(self.deduplicator.make_unregister_op(&record.content_hash));
                 }
 
                 // Recalculate current version and add ops
@@ -2356,11 +2345,7 @@ impl StorageEngine for BitcaskStorageEngine {
                     // Include dedup unregister in the batch
                     if old_record.file_id != u32::MAX && old_record.file_id != DELETE_MARKER_FILE_ID
                     {
-                        if let Some(dedup_op) =
-                            self.deduplicator.make_unregister_op(&old_record.content_hash)?
-                        {
-                            ops.push(dedup_op);
-                        }
+                        ops.push(self.deduplicator.make_unregister_op(&old_record.content_hash));
                     }
                     // Delete old null version record (will be in the batch)
                     ops.push(BatchOp {
@@ -2920,7 +2905,7 @@ impl StorageEngine for BitcaskStorageEngine {
             record.modified_at = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
 
             let dedup_op =
-                self.deduplicator.make_register_op(content_hash, existing_vol, existing_off)?;
+                self.deduplicator.make_register_op(content_hash, existing_vol, existing_off);
 
             // Atomic batch: object record + dedup ref increment + journal
             let record_bytes = bincode::serialize(&record)
@@ -2949,7 +2934,7 @@ impl StorageEngine for BitcaskStorageEngine {
             });
         } else {
             // New content — register in dedup with the location we just wrote
-            self.deduplicator.make_register_op(content_hash, volume_id, offset)?
+            self.deduplicator.make_register_op(content_hash, volume_id, offset)
         };
 
         let record = IndexRecord::new(

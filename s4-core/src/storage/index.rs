@@ -62,6 +62,7 @@
 //! synchronous library.
 
 use crate::error::StorageError;
+use crate::storage::dedup::DedupEntry;
 use crate::storage::engine::KeyspaceSnapshot;
 use crate::storage::VersionList;
 use crate::types::IndexRecord;
@@ -103,6 +104,32 @@ pub enum BatchAction {
     Put(Vec<u8>, Vec<u8>),
     /// Delete a key.
     Delete(Vec<u8>),
+    /// Atomically read-modify-write a dedup entry: increment ref_count or create
+    /// with ref_count=1. The read happens inside `batch_write` under `rmw_lock`.
+    IncrementDedupRef {
+        /// PG-scoped dedup key (4-byte PG prefix + 32-byte content hash).
+        key: Vec<u8>,
+        /// Volume file ID for a newly created entry.
+        volume_id: u32,
+        /// Byte offset within the volume for a newly created entry.
+        offset: u64,
+    },
+    /// Atomically read-modify-write a dedup entry: decrement ref_count, removing
+    /// the entry if it reaches zero. No-op if the entry does not exist.
+    DecrementDedupRef {
+        /// PG-scoped dedup key (4-byte PG prefix + 32-byte content hash).
+        key: Vec<u8>,
+    },
+    /// Atomically read-modify-write a dedup entry: update volume_id and offset,
+    /// preserving ref_count. Returns an error if the entry does not exist.
+    UpdateDedupLocation {
+        /// PG-scoped dedup key (4-byte PG prefix + 32-byte content hash).
+        key: Vec<u8>,
+        /// New volume file ID after relocation.
+        new_volume_id: u32,
+        /// New byte offset after relocation.
+        new_offset: u64,
+    },
 }
 
 /// A single operation in an atomic batch, targeting a specific keyspace.
@@ -158,6 +185,9 @@ pub struct IndexDb {
     multipart_parts: Keyspace,
     /// Generalized blob references: `BlobId` (32 bytes) → `BlobRefEntry`.
     blob_refs: Keyspace,
+    /// Serializes batch_write calls that contain read-modify-write operations,
+    /// preventing lost-update races on dedup ref_count.
+    rmw_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 // ============================================================================
@@ -260,6 +290,7 @@ impl IndexDb {
             multipart_sessions,
             multipart_parts,
             blob_refs,
+            rmw_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
         })
     }
 
@@ -532,8 +563,24 @@ impl IndexDb {
         let multipart_sessions = self.multipart_sessions.clone();
         let multipart_parts = self.multipart_parts.clone();
         let blob_refs = self.blob_refs.clone();
+        let rmw_lock = self.rmw_lock.clone();
 
         task::spawn_blocking(move || {
+            let has_rmw = operations.iter().any(|op| {
+                matches!(
+                    op.action,
+                    BatchAction::IncrementDedupRef { .. }
+                        | BatchAction::DecrementDedupRef { .. }
+                        | BatchAction::UpdateDedupLocation { .. }
+                )
+            });
+
+            let _rmw_guard = if has_rmw {
+                Some(rmw_lock.lock().unwrap_or_else(|e| e.into_inner()))
+            } else {
+                None
+            };
+
             let mut batch = db.batch();
 
             let ks_for = |id: KeyspaceId| -> &Keyspace {
@@ -558,6 +605,69 @@ impl IndexDb {
                     }
                     BatchAction::Delete(key) => {
                         batch.remove(ks, &key[..]);
+                    }
+                    BatchAction::IncrementDedupRef {
+                        key,
+                        volume_id,
+                        offset,
+                    } => {
+                        let current = dedup
+                            .get(&key[..])
+                            .map_err(|e| StorageError::Database(e.to_string()))?;
+                        let new_entry = match current {
+                            Some(bytes) => {
+                                let mut entry: DedupEntry = bincode::deserialize(&bytes)
+                                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                                entry.ref_count += 1;
+                                entry
+                            }
+                            None => DedupEntry {
+                                volume_id: *volume_id,
+                                offset: *offset,
+                                ref_count: 1,
+                            },
+                        };
+                        let value = bincode::serialize(&new_entry)
+                            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                        batch.insert(&dedup, &key[..], &value[..]);
+                    }
+                    BatchAction::DecrementDedupRef { key } => {
+                        if let Some(bytes) = dedup
+                            .get(&key[..])
+                            .map_err(|e| StorageError::Database(e.to_string()))?
+                        {
+                            let mut entry: DedupEntry = bincode::deserialize(&bytes)
+                                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                            if entry.ref_count <= 1 {
+                                batch.remove(&dedup, &key[..]);
+                            } else {
+                                entry.ref_count -= 1;
+                                let value = bincode::serialize(&entry)
+                                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                                batch.insert(&dedup, &key[..], &value[..]);
+                            }
+                        }
+                    }
+                    BatchAction::UpdateDedupLocation {
+                        key,
+                        new_volume_id,
+                        new_offset,
+                    } => {
+                        let bytes = dedup
+                            .get(&key[..])
+                            .map_err(|e| StorageError::Database(e.to_string()))?
+                            .ok_or_else(|| {
+                                StorageError::InvalidData(
+                                    "Cannot update location: dedup entry not found".to_string(),
+                                )
+                            })?;
+                        let mut entry: DedupEntry = bincode::deserialize(&bytes)
+                            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                        entry.volume_id = *new_volume_id;
+                        entry.offset = *new_offset;
+                        let value = bincode::serialize(&entry)
+                            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                        batch.insert(&dedup, &key[..], &value[..]);
                     }
                 }
             }
@@ -1390,5 +1500,359 @@ mod tests {
         // Scan volume 999 — should get 0 results
         let empty = index_db.scan_objects_by_volume(999).await.unwrap();
         assert!(empty.is_empty());
+    }
+
+    // ================================================================
+    // RMW batch action tests
+    // ================================================================
+
+    #[tokio::test]
+    async fn test_increment_dedup_ref_creates_new_entry() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let index_db = IndexDb::new(&db_path).unwrap();
+
+        let key = vec![0u8; 36]; // PG(4) + hash(32)
+        let ops = vec![BatchOp {
+            keyspace: KeyspaceId::Dedup,
+            action: BatchAction::IncrementDedupRef {
+                key: key.clone(),
+                volume_id: 1,
+                offset: 100,
+            },
+        }];
+        index_db.batch_write(ops).await.unwrap();
+
+        let raw = index_db.dedup_keyspace().get(&key).unwrap().unwrap();
+        let entry: DedupEntry = bincode::deserialize(&raw).unwrap();
+        assert_eq!(entry.ref_count, 1);
+        assert_eq!(entry.volume_id, 1);
+        assert_eq!(entry.offset, 100);
+    }
+
+    #[tokio::test]
+    async fn test_increment_dedup_ref_increments_existing() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let index_db = IndexDb::new(&db_path).unwrap();
+
+        let key = vec![0u8; 36];
+        // Create entry
+        let ops = vec![BatchOp {
+            keyspace: KeyspaceId::Dedup,
+            action: BatchAction::IncrementDedupRef {
+                key: key.clone(),
+                volume_id: 1,
+                offset: 100,
+            },
+        }];
+        index_db.batch_write(ops).await.unwrap();
+
+        // Increment again
+        let ops = vec![BatchOp {
+            keyspace: KeyspaceId::Dedup,
+            action: BatchAction::IncrementDedupRef {
+                key: key.clone(),
+                volume_id: 1,
+                offset: 100,
+            },
+        }];
+        index_db.batch_write(ops).await.unwrap();
+
+        let raw = index_db.dedup_keyspace().get(&key).unwrap().unwrap();
+        let entry: DedupEntry = bincode::deserialize(&raw).unwrap();
+        assert_eq!(entry.ref_count, 2);
+    }
+
+    #[tokio::test]
+    async fn test_decrement_dedup_ref_decrements() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let index_db = IndexDb::new(&db_path).unwrap();
+
+        let key = vec![0u8; 36];
+        // Create with ref_count=2 via two increments
+        for _ in 0..2 {
+            index_db
+                .batch_write(vec![BatchOp {
+                    keyspace: KeyspaceId::Dedup,
+                    action: BatchAction::IncrementDedupRef {
+                        key: key.clone(),
+                        volume_id: 1,
+                        offset: 100,
+                    },
+                }])
+                .await
+                .unwrap();
+        }
+
+        // Decrement once
+        index_db
+            .batch_write(vec![BatchOp {
+                keyspace: KeyspaceId::Dedup,
+                action: BatchAction::DecrementDedupRef { key: key.clone() },
+            }])
+            .await
+            .unwrap();
+
+        let raw = index_db.dedup_keyspace().get(&key).unwrap().unwrap();
+        let entry: DedupEntry = bincode::deserialize(&raw).unwrap();
+        assert_eq!(entry.ref_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_decrement_dedup_ref_removes_at_zero() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let index_db = IndexDb::new(&db_path).unwrap();
+
+        let key = vec![0u8; 36];
+        // Create with ref_count=1
+        index_db
+            .batch_write(vec![BatchOp {
+                keyspace: KeyspaceId::Dedup,
+                action: BatchAction::IncrementDedupRef {
+                    key: key.clone(),
+                    volume_id: 1,
+                    offset: 100,
+                },
+            }])
+            .await
+            .unwrap();
+
+        // Decrement to 0 — entry should be removed
+        index_db
+            .batch_write(vec![BatchOp {
+                keyspace: KeyspaceId::Dedup,
+                action: BatchAction::DecrementDedupRef { key: key.clone() },
+            }])
+            .await
+            .unwrap();
+
+        assert!(index_db.dedup_keyspace().get(&key).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_decrement_dedup_ref_noop_on_missing() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let index_db = IndexDb::new(&db_path).unwrap();
+
+        let key = vec![0u8; 36];
+        // Decrement non-existent entry — should be no-op, not error
+        index_db
+            .batch_write(vec![BatchOp {
+                keyspace: KeyspaceId::Dedup,
+                action: BatchAction::DecrementDedupRef { key },
+            }])
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_update_dedup_location() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let index_db = IndexDb::new(&db_path).unwrap();
+
+        let key = vec![0u8; 36];
+        // Create entry with ref_count=3
+        for _ in 0..3 {
+            index_db
+                .batch_write(vec![BatchOp {
+                    keyspace: KeyspaceId::Dedup,
+                    action: BatchAction::IncrementDedupRef {
+                        key: key.clone(),
+                        volume_id: 1,
+                        offset: 100,
+                    },
+                }])
+                .await
+                .unwrap();
+        }
+
+        // Update location
+        index_db
+            .batch_write(vec![BatchOp {
+                keyspace: KeyspaceId::Dedup,
+                action: BatchAction::UpdateDedupLocation {
+                    key: key.clone(),
+                    new_volume_id: 5,
+                    new_offset: 999,
+                },
+            }])
+            .await
+            .unwrap();
+
+        let raw = index_db.dedup_keyspace().get(&key).unwrap().unwrap();
+        let entry: DedupEntry = bincode::deserialize(&raw).unwrap();
+        assert_eq!(entry.volume_id, 5);
+        assert_eq!(entry.offset, 999);
+        assert_eq!(entry.ref_count, 3); // preserved
+    }
+
+    #[tokio::test]
+    async fn test_update_dedup_location_errors_on_missing() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let index_db = IndexDb::new(&db_path).unwrap();
+
+        let key = vec![0u8; 36];
+        let result = index_db
+            .batch_write(vec![BatchOp {
+                keyspace: KeyspaceId::Dedup,
+                action: BatchAction::UpdateDedupLocation {
+                    key,
+                    new_volume_id: 5,
+                    new_offset: 999,
+                },
+            }])
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_mixed_rmw_and_plain_ops_in_single_batch() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let index_db = IndexDb::new(&db_path).unwrap();
+
+        let dedup_key = vec![0u8; 36];
+        let record = crate::types::IndexRecord::new(
+            1,
+            100,
+            50,
+            [0u8; 32],
+            "etag".to_string(),
+            "text/plain".to_string(),
+        );
+        let record_bytes = bincode::serialize(&record).unwrap();
+
+        let ops = vec![
+            BatchOp {
+                keyspace: KeyspaceId::Objects,
+                action: BatchAction::Put(b"bucket/key".to_vec(), record_bytes),
+            },
+            BatchOp {
+                keyspace: KeyspaceId::Dedup,
+                action: BatchAction::IncrementDedupRef {
+                    key: dedup_key.clone(),
+                    volume_id: 1,
+                    offset: 100,
+                },
+            },
+        ];
+        index_db.batch_write(ops).await.unwrap();
+
+        // Both should succeed atomically
+        let obj = index_db.get("bucket/key").await.unwrap();
+        assert!(obj.is_some());
+
+        let raw = index_db.dedup_keyspace().get(&dedup_key).unwrap().unwrap();
+        let entry: DedupEntry = bincode::deserialize(&raw).unwrap();
+        assert_eq!(entry.ref_count, 1);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_increment_no_lost_updates() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let index_db = std::sync::Arc::new(IndexDb::new(&db_path).unwrap());
+
+        let key = vec![0u8; 36];
+        let num_tasks = 50;
+
+        let mut handles = Vec::new();
+        for _ in 0..num_tasks {
+            let db = index_db.clone();
+            let k = key.clone();
+            handles.push(tokio::spawn(async move {
+                db.batch_write(vec![BatchOp {
+                    keyspace: KeyspaceId::Dedup,
+                    action: BatchAction::IncrementDedupRef {
+                        key: k,
+                        volume_id: 1,
+                        offset: 100,
+                    },
+                }])
+                .await
+                .unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let raw = index_db.dedup_keyspace().get(&key).unwrap().unwrap();
+        let entry: DedupEntry = bincode::deserialize(&raw).unwrap();
+        assert_eq!(
+            entry.ref_count, num_tasks,
+            "Expected {} increments, got {} — lost update detected",
+            num_tasks, entry.ref_count
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_increment_and_decrement_consistency() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let index_db = std::sync::Arc::new(IndexDb::new(&db_path).unwrap());
+
+        let key = vec![0u8; 36];
+        let increments = 80u32;
+        let decrements = 30u32;
+        let expected = increments - decrements;
+
+        let mut handles = Vec::new();
+
+        for _ in 0..increments {
+            let db = index_db.clone();
+            let k = key.clone();
+            handles.push(tokio::spawn(async move {
+                db.batch_write(vec![BatchOp {
+                    keyspace: KeyspaceId::Dedup,
+                    action: BatchAction::IncrementDedupRef {
+                        key: k,
+                        volume_id: 1,
+                        offset: 100,
+                    },
+                }])
+                .await
+                .unwrap();
+            }));
+        }
+
+        // Wait for all increments first to ensure entry exists
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let mut dec_handles = Vec::new();
+        for _ in 0..decrements {
+            let db = index_db.clone();
+            let k = key.clone();
+            dec_handles.push(tokio::spawn(async move {
+                db.batch_write(vec![BatchOp {
+                    keyspace: KeyspaceId::Dedup,
+                    action: BatchAction::DecrementDedupRef { key: k },
+                }])
+                .await
+                .unwrap();
+            }));
+        }
+
+        for h in dec_handles {
+            h.await.unwrap();
+        }
+
+        let raw = index_db.dedup_keyspace().get(&key).unwrap().unwrap();
+        let entry: DedupEntry = bincode::deserialize(&raw).unwrap();
+        assert_eq!(
+            entry.ref_count, expected,
+            "Expected ref_count={}, got {} — lost update detected",
+            expected, entry.ref_count
+        );
     }
 }

@@ -400,7 +400,7 @@ impl VolumeCompactor {
                     content_hash,
                     *new_vol_id,
                     *new_offset,
-                )?;
+                );
                 ops.push(dedup_op);
 
                 // Find IndexRecords pointing to old location in this volume

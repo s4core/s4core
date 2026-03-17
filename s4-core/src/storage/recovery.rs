@@ -126,7 +126,7 @@ async fn recover_index_from_journal(
                         record.content_hash,
                         record.file_id,
                         record.offset,
-                    )?;
+                    );
                     index_db.batch_write(vec![dedup_op]).await?;
                 }
 
@@ -146,11 +146,8 @@ async fn recover_index_from_journal(
                 // Get existing record for dedup unregistration before deleting
                 if let Some(existing) = index_db.get(&full_key).await? {
                     if !existing.is_delete_marker && existing.content_hash != [0u8; 32] {
-                        if let Ok(Some(op)) =
-                            deduplicator.make_unregister_op(&existing.content_hash)
-                        {
-                            index_db.batch_write(vec![op]).await?;
-                        }
+                        let op = deduplicator.make_unregister_op(&existing.content_hash);
+                        index_db.batch_write(vec![op]).await?;
                     }
                 }
 
