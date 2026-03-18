@@ -23,6 +23,7 @@ use s4_core::error::StorageError;
 use s4_core::storage::{
     BatchAction, BatchOp, Deduplicator, IndexDb, KeyspaceId, VolumeReader, VolumeWriter,
 };
+use s4_core::types::{BlobId, BlobLocation, BlobRefEntry};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -164,6 +165,15 @@ impl VolumeCompactor {
             dedup_index.len()
         );
 
+        // Step 2b: Build blob_ref location index (volume_id, offset) -> Vec<BlobId>
+        // This tracks composite manifest blobs and segment blobs that may not
+        // have DedupEntry records (e.g., manifest blobs are only in BlobRefs).
+        let blob_ref_index = self.build_blob_ref_index()?;
+        info!(
+            "Compactor: built blob_ref index with {} entries",
+            blob_ref_index.len()
+        );
+
         // Step 3: Get current writer volume to skip it (it's being written to)
         let current_volume_id = {
             let writer = self.volume_writer.read().await;
@@ -180,7 +190,7 @@ impl VolumeCompactor {
 
             stats.volumes_scanned += 1;
 
-            match self.analyze_volume(vol_id, &dedup_index).await {
+            match self.analyze_volume(vol_id, &dedup_index, &blob_ref_index).await {
                 Ok(analysis) => {
                     if analysis.fragmentation >= self.config.fragmentation_threshold
                         && analysis.dead_bytes >= self.config.min_dead_bytes
@@ -196,7 +206,7 @@ impl VolumeCompactor {
                             );
                             stats.volumes_skipped += 1;
                         } else {
-                            match self.compact_volume(vol_id, &dedup_index).await {
+                            match self.compact_volume(vol_id, &dedup_index, &blob_ref_index).await {
                                 Ok(result) => {
                                     info!(
                                         "Compactor: compacted volume {} -> {}: \
@@ -280,11 +290,42 @@ impl VolumeCompactor {
         Ok(index)
     }
 
+    /// Builds an in-memory index of (volume_id, offset) -> Vec<BlobId>
+    /// from the BlobRefs keyspace. This captures blobs that may not have
+    /// DedupEntry records (e.g., composite manifest blobs).
+    fn build_blob_ref_index(&self) -> Result<HashMap<(u32, u64), Vec<BlobId>>, StorageError> {
+        let ks = self.index_db.blob_refs_keyspace();
+        let mut index: HashMap<(u32, u64), Vec<BlobId>> = HashMap::new();
+
+        for guard in ks.iter() {
+            let (key_bytes, value_bytes) =
+                guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
+
+            if key_bytes.len() != 32 {
+                continue;
+            }
+            let mut blob_id_bytes = [0u8; 32];
+            blob_id_bytes.copy_from_slice(&key_bytes);
+            let blob_id = BlobId::from_content_hash(blob_id_bytes);
+
+            let entry: BlobRefEntry = bincode::deserialize(&value_bytes)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+            if entry.is_live() {
+                let loc = (entry.location.volume_id, entry.location.offset);
+                index.entry(loc).or_default().push(blob_id);
+            }
+        }
+
+        Ok(index)
+    }
+
     /// Analyzes a single volume for fragmentation.
     async fn analyze_volume(
         &self,
         volume_id: u32,
         dedup_index: &HashMap<(u32, u64), [u8; 32]>,
+        blob_ref_index: &HashMap<(u32, u64), Vec<BlobId>>,
     ) -> Result<VolumeAnalysis, StorageError> {
         let reader = VolumeReader::new(&self.volumes_dir);
         let volume_path = self.volumes_dir.join(format!("volume_{:06}.dat", volume_id));
@@ -305,7 +346,8 @@ impl VolumeCompactor {
                         as u64;
                     let blob_total = header_size + header.key_len as u64 + header.blob_len;
 
-                    if dedup_index.contains_key(&(volume_id, offset)) {
+                    let loc = (volume_id, offset);
+                    if dedup_index.contains_key(&loc) || blob_ref_index.contains_key(&loc) {
                         live_bytes += blob_total;
                         live_count += 1;
                     } else {
@@ -338,11 +380,12 @@ impl VolumeCompactor {
     }
 
     /// Compacts a single volume: copies live blobs to a new volume,
-    /// updates index and dedup, then deletes the old volume.
+    /// updates index, dedup, and blob refs, then deletes the old volume.
     async fn compact_volume(
         &self,
         volume_id: u32,
         dedup_index: &HashMap<(u32, u64), [u8; 32]>,
+        blob_ref_index: &HashMap<(u32, u64), Vec<BlobId>>,
     ) -> Result<CompactionResult, StorageError> {
         let reader = VolumeReader::new(&self.volumes_dir);
         let volume_path = self.volumes_dir.join(format!("volume_{:06}.dat", volume_id));
@@ -353,8 +396,15 @@ impl VolumeCompactor {
         let mut bytes_reclaimed = 0u64;
         let mut target_volume_id = None;
 
-        // Collect relocations: (old_offset, content_hash, key, new_volume_id, new_offset)
-        let mut relocations: Vec<(u64, [u8; 32], String, u32, u64)> = Vec::new();
+        // Collect relocations: (old_offset, content_hash_opt, blob_ids, key, new_volume_id, new_offset)
+        struct Relocation {
+            old_offset: u64,
+            content_hash: Option<[u8; 32]>,
+            blob_ids: Vec<BlobId>,
+            new_vol_id: u32,
+            new_offset: u64,
+        }
+        let mut relocations: Vec<Relocation> = Vec::new();
 
         let mut offset = 0u64;
         while offset < file_size {
@@ -366,7 +416,11 @@ impl VolumeCompactor {
                         as u64;
                     let blob_total = header_size + header.key_len as u64 + header.blob_len;
 
-                    if let Some(&content_hash) = dedup_index.get(&(volume_id, offset)) {
+                    let loc = (volume_id, offset);
+                    let content_hash = dedup_index.get(&loc).copied();
+                    let blob_ids = blob_ref_index.get(&loc).cloned().unwrap_or_default();
+
+                    if content_hash.is_some() || !blob_ids.is_empty() {
                         // Live blob — copy to new volume via the shared writer
                         let (new_vol_id, new_offset) = {
                             let mut writer = self.volume_writer.write().await;
@@ -374,7 +428,13 @@ impl VolumeCompactor {
                         };
 
                         target_volume_id = Some(new_vol_id);
-                        relocations.push((offset, content_hash, key, new_vol_id, new_offset));
+                        relocations.push(Relocation {
+                            old_offset: offset,
+                            content_hash,
+                            blob_ids,
+                            new_vol_id,
+                            new_offset,
+                        });
                         live_blobs_copied += 1;
                     } else {
                         dead_blobs_skipped += 1;
@@ -387,28 +447,52 @@ impl VolumeCompactor {
             }
         }
 
-        // Atomically update all IndexRecords and DedupEntries in a single batch
+        // Atomically update all IndexRecords, DedupEntries, and BlobRefEntries
         if !relocations.is_empty() {
-            let mut ops = Vec::with_capacity(relocations.len() * 2);
+            let mut ops = Vec::with_capacity(relocations.len() * 3);
 
             // Pre-fetch all index records for this volume once (not per relocation)
             let volume_records = self.index_db.scan_objects_by_volume(volume_id).await?;
 
-            for (old_offset, content_hash, _key, new_vol_id, new_offset) in &relocations {
-                // Update DedupEntry location
-                let dedup_op = self.deduplicator.make_update_location_op(
-                    content_hash,
-                    *new_vol_id,
-                    *new_offset,
-                )?;
-                ops.push(dedup_op);
+            for reloc in &relocations {
+                // Update DedupEntry location (if this blob is tracked by dedup)
+                if let Some(ref content_hash) = reloc.content_hash {
+                    let dedup_op = self.deduplicator.make_update_location_op(
+                        content_hash,
+                        reloc.new_vol_id,
+                        reloc.new_offset,
+                    )?;
+                    ops.push(dedup_op);
+                }
+
+                // Update BlobRefEntry locations for all BlobIds pointing to old location
+                let ks = self.index_db.blob_refs_keyspace();
+                for blob_id in &reloc.blob_ids {
+                    if let Some(ref_bytes) = ks
+                        .get(blob_id.as_bytes())
+                        .map_err(|e| StorageError::Database(e.to_string()))?
+                    {
+                        let mut entry: BlobRefEntry = bincode::deserialize(&ref_bytes)
+                            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                        entry.location = BlobLocation {
+                            volume_id: reloc.new_vol_id,
+                            offset: reloc.new_offset,
+                        };
+                        let value = bincode::serialize(&entry)
+                            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                        ops.push(BatchOp {
+                            keyspace: KeyspaceId::BlobRefs,
+                            action: BatchAction::Put(blob_id.as_bytes().to_vec(), value),
+                        });
+                    }
+                }
 
                 // Find IndexRecords pointing to old location in this volume
                 for (rec_key, record) in &volume_records {
-                    if record.offset == *old_offset && record.file_id == volume_id {
+                    if record.offset == reloc.old_offset && record.file_id == volume_id {
                         let mut updated = record.clone();
-                        updated.file_id = *new_vol_id;
-                        updated.offset = *new_offset;
+                        updated.file_id = reloc.new_vol_id;
+                        updated.offset = reloc.new_offset;
                         let value = bincode::serialize(&updated)
                             .map_err(|e| StorageError::Serialization(e.to_string()))?;
                         ops.push(BatchOp {

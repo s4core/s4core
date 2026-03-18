@@ -242,3 +242,138 @@ async fn test_compaction_with_dedup() {
         );
     }
 }
+
+/// Test that composite (multipart-uploaded) objects survive compaction.
+///
+/// This verifies that:
+/// 1. Manifest blobs (only in BlobRefs, not in Dedup) are preserved
+/// 2. BlobRefEntry locations are updated when blobs move to new volumes
+/// 3. Composite objects can be read (GET) and deleted (DELETE) after compaction
+#[tokio::test]
+async fn test_compaction_with_composite_objects() {
+    let temp = TempDir::new().unwrap();
+    let engine = create_engine(&temp).await;
+    let bucket = "e2e-composite";
+    let metadata = HashMap::new();
+
+    // Create a multipart upload with 3 parts
+    let upload_id = "test-composite-upload-001";
+    engine
+        .create_multipart_session(
+            upload_id,
+            bucket,
+            "composite.bin",
+            "application/octet-stream",
+            &metadata,
+        )
+        .await
+        .unwrap();
+
+    // Upload 3 parts with unique content
+    let mut part_records = Vec::new();
+    let mut all_part_data = Vec::new();
+    for part_num in 1..=3u32 {
+        let part_data = format!(
+            "composite-part-{}-data-{}",
+            part_num,
+            "x".repeat(200 + part_num as usize * 50)
+        )
+        .into_bytes();
+        all_part_data.push(part_data.clone());
+
+        let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
+            Box::new(std::io::Cursor::new(part_data.clone()));
+        let result = engine
+            .upload_part_streaming(upload_id, part_num, reader, part_data.len() as u64)
+            .await
+            .unwrap();
+        part_records.push(result.record);
+    }
+
+    // Complete the multipart upload
+    let s3_etag = "\"abc123-3\"";
+    let _record = engine
+        .complete_multipart_native(
+            bucket,
+            "composite.bin",
+            upload_id,
+            &part_records,
+            s3_etag,
+            "application/octet-stream",
+            &metadata,
+        )
+        .await
+        .unwrap();
+    engine.sync().await.unwrap();
+
+    // Verify composite object is readable
+    let (data_before, _) = engine.get_object(bucket, "composite.bin").await.unwrap();
+    let expected_data: Vec<u8> = all_part_data.iter().flat_map(|d| d.iter().copied()).collect();
+    assert_eq!(
+        data_before, expected_data,
+        "Pre-compaction composite read failed"
+    );
+    let expected_hash = sha256(&expected_data);
+
+    // Write filler objects to create dead space in the same volumes
+    for i in 0..20 {
+        let key = format!("filler-{:04}", i);
+        let data = format!("filler-unique-content-{:04}-{}", i, "y".repeat(200)).into_bytes();
+        engine.put_object(bucket, &key, &data, "text/plain", &metadata).await.unwrap();
+    }
+    engine.sync().await.unwrap();
+
+    // Delete all fillers to create dead space
+    for i in 0..20 {
+        let key = format!("filler-{:04}", i);
+        engine.delete_object(bucket, &key).await.unwrap();
+    }
+    engine.sync().await.unwrap();
+
+    // Run compaction with aggressive threshold
+    let config = CompactionConfig {
+        fragmentation_threshold: 0.1,
+        min_dead_bytes: 0,
+        max_volumes_per_run: 100,
+        dry_run: false,
+        ..Default::default()
+    };
+
+    let compactor = VolumeCompactor::new(
+        engine.volumes_dir().to_path_buf(),
+        engine.index_db().clone(),
+        engine.deduplicator().clone(),
+        engine.volume_writer().clone(),
+        config,
+    );
+
+    let stats = compactor.run().await.unwrap();
+    assert_eq!(stats.errors, 0, "Compaction should have 0 errors");
+
+    // CRITICAL: Verify composite object is still readable after compaction (GET)
+    let (data_after, _) = engine
+        .get_object(bucket, "composite.bin")
+        .await
+        .expect("Composite object should be readable after compaction");
+    let actual_hash = sha256(&data_after);
+    assert_eq!(
+        actual_hash, expected_hash,
+        "Composite object SHA-256 mismatch after compaction"
+    );
+    assert_eq!(
+        data_after, expected_data,
+        "Composite object data mismatch after compaction"
+    );
+
+    // CRITICAL: Verify composite object can be deleted after compaction (DELETE)
+    engine
+        .delete_object(bucket, "composite.bin")
+        .await
+        .expect("Composite object should be deletable after compaction");
+
+    // Verify it's gone
+    assert!(
+        engine.get_object(bucket, "composite.bin").await.is_err(),
+        "Deleted composite object should not exist"
+    );
+}
