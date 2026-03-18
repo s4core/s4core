@@ -249,31 +249,15 @@ impl Deduplicator {
     ///
     /// This method does NOT write to the database directly. The returned
     /// `BatchOp` must be included in a call to `IndexDb::batch_write`.
-    pub fn make_register_op(
-        &self,
-        content_hash: [u8; 32],
-        volume_id: u32,
-        offset: u64,
-    ) -> Result<BatchOp, StorageError> {
-        let existing = self.get_entry(&content_hash)?;
-        let new_entry = match existing {
-            Some(mut entry) => {
-                entry.ref_count += 1;
-                entry
-            }
-            None => DedupEntry {
+    pub fn make_register_op(&self, content_hash: [u8; 32], volume_id: u32, offset: u64) -> BatchOp {
+        BatchOp {
+            keyspace: KeyspaceId::Dedup,
+            action: BatchAction::IncrementDedupRef {
+                key: self.make_key(&content_hash),
                 volume_id,
                 offset,
-                ref_count: 1,
             },
-        };
-        let pg_key = self.make_key(&content_hash);
-        let value = bincode::serialize(&new_entry)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        Ok(BatchOp {
-            keyspace: KeyspaceId::Dedup,
-            action: BatchAction::Put(pg_key, value),
-        })
+        }
     }
 
     /// Creates a [`BatchOp`] to unregister content (decrement or remove ref count).
@@ -287,31 +271,12 @@ impl Deduplicator {
     /// # Note
     ///
     /// This method does NOT write to the database directly.
-    pub fn make_unregister_op(
-        &self,
-        content_hash: &[u8; 32],
-    ) -> Result<Option<BatchOp>, StorageError> {
-        let pg_key = self.make_key(content_hash);
-        let existing = self.get_entry(content_hash)?;
-        match existing {
-            Some(entry) if entry.ref_count <= 1 => {
-                // Last reference — remove entry entirely
-                Ok(Some(BatchOp {
-                    keyspace: KeyspaceId::Dedup,
-                    action: BatchAction::Delete(pg_key),
-                }))
-            }
-            Some(mut entry) => {
-                // Decrement ref count
-                entry.ref_count -= 1;
-                let value = bincode::serialize(&entry)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                Ok(Some(BatchOp {
-                    keyspace: KeyspaceId::Dedup,
-                    action: BatchAction::Put(pg_key, value),
-                }))
-            }
-            None => Ok(None),
+    pub fn make_unregister_op(&self, content_hash: &[u8; 32]) -> BatchOp {
+        BatchOp {
+            keyspace: KeyspaceId::Dedup,
+            action: BatchAction::DecrementDedupRef {
+                key: self.make_key(content_hash),
+            },
         }
     }
 
@@ -329,8 +294,12 @@ impl Deduplicator {
     /// - During [`build_from_index`](Self::build_from_index) at startup.
     /// - For tests that need simple, non-batch writes.
     ///
-    /// For normal production writes, prefer [`make_register_op`](Self::make_register_op)
-    /// with `IndexDb::batch_write` to ensure atomic consistency.
+    /// # Safety
+    ///
+    /// This method performs a read-modify-write **without** holding `rmw_lock`.
+    /// It is only safe when called from a single-threaded context (e.g. startup
+    /// rebuild). For concurrent writes, use [`make_register_op`](Self::make_register_op)
+    /// with `IndexDb::batch_write`.
     pub fn register_content(
         &self,
         content_hash: [u8; 32],
@@ -362,7 +331,11 @@ impl Deduplicator {
     ///
     /// Decrements the ref count, removing the entry if it reaches zero.
     ///
-    /// For normal production writes, prefer [`make_unregister_op`](Self::make_unregister_op)
+    /// # Safety
+    ///
+    /// This method performs a read-modify-write **without** holding `rmw_lock`.
+    /// It is only safe when called from a single-threaded context.
+    /// For concurrent writes, use [`make_unregister_op`](Self::make_unregister_op)
     /// with `IndexDb::batch_write`.
     pub fn unregister_content(&self, content_hash: &[u8; 32]) -> Result<(), StorageError> {
         let pg_key = self.make_key(content_hash);
@@ -421,6 +394,13 @@ impl Deduplicator {
     ///
     /// Used by the compactor after copying a blob to a new volume.
     /// The content hash stays the same — only volume_id and offset change.
+    ///
+    /// # Safety
+    ///
+    /// This method performs a read-modify-write **without** holding `rmw_lock`.
+    /// It is only safe when called from a single-threaded context.
+    /// For concurrent writes, use [`make_update_location_op`](Self::make_update_location_op)
+    /// with `IndexDb::batch_write`.
     pub fn update_location(
         &self,
         content_hash: &[u8; 32],
@@ -453,22 +433,15 @@ impl Deduplicator {
         content_hash: &[u8; 32],
         new_volume_id: u32,
         new_offset: u64,
-    ) -> Result<BatchOp, StorageError> {
-        let pg_key = self.make_key(content_hash);
-        let existing = self.get_entry(content_hash)?.ok_or_else(|| {
-            StorageError::InvalidData("Cannot update location: dedup entry not found".to_string())
-        })?;
-        let updated = DedupEntry {
-            volume_id: new_volume_id,
-            offset: new_offset,
-            ref_count: existing.ref_count,
-        };
-        let value =
-            bincode::serialize(&updated).map_err(|e| StorageError::Serialization(e.to_string()))?;
-        Ok(BatchOp {
+    ) -> BatchOp {
+        BatchOp {
             keyspace: KeyspaceId::Dedup,
-            action: BatchAction::Put(pg_key, value),
-        })
+            action: BatchAction::UpdateDedupLocation {
+                key: self.make_key(content_hash),
+                new_volume_id,
+                new_offset,
+            },
+        }
     }
 
     // ========================================================================
@@ -729,94 +702,44 @@ mod tests {
     }
 
     #[test]
-    fn test_make_register_op_new_entry() {
+    fn test_make_register_op() {
         let (_temp, dedup) = create_test_dedup();
         let hash = Deduplicator::compute_hash(b"new content");
 
-        let op = dedup.make_register_op(hash, 1, 100).unwrap();
+        let op = dedup.make_register_op(hash, 1, 100);
         assert_eq!(op.keyspace, KeyspaceId::Dedup);
 
-        // Verify the batch op contains correct PG-scoped key (36 bytes)
         let expected_key = dedup.make_key(&hash);
         match &op.action {
-            BatchAction::Put(key, value) => {
+            BatchAction::IncrementDedupRef {
+                key,
+                volume_id,
+                offset,
+            } => {
                 assert_eq!(key, &expected_key);
-                assert_eq!(key.len(), 36); // 4 (PG) + 32 (hash)
-                let entry: DedupEntry = bincode::deserialize(value).unwrap();
-                assert_eq!(entry.volume_id, 1);
-                assert_eq!(entry.offset, 100);
-                assert_eq!(entry.ref_count, 1);
+                assert_eq!(key.len(), 36);
+                assert_eq!(*volume_id, 1);
+                assert_eq!(*offset, 100);
             }
-            BatchAction::Delete(_) => panic!("Expected Put, got Delete"),
+            _ => panic!("Expected IncrementDedupRef"),
         }
     }
 
     #[test]
-    fn test_make_register_op_existing_entry() {
+    fn test_make_unregister_op() {
         let (_temp, dedup) = create_test_dedup();
-        let hash = Deduplicator::compute_hash(b"existing content");
+        let hash = Deduplicator::compute_hash(b"some content");
 
-        // Pre-populate
-        dedup.register_content(hash, 1, 100).unwrap();
-
-        // Make register op should increment ref count
-        let op = dedup.make_register_op(hash, 1, 100).unwrap();
-        match &op.action {
-            BatchAction::Put(_, value) => {
-                let entry: DedupEntry = bincode::deserialize(value).unwrap();
-                assert_eq!(entry.ref_count, 2);
-            }
-            _ => panic!("Expected Put"),
-        }
-    }
-
-    #[test]
-    fn test_make_unregister_op_decrement() {
-        let (_temp, dedup) = create_test_dedup();
-        let hash = Deduplicator::compute_hash(b"multi ref");
-
-        // Register twice
-        dedup.register_content(hash, 1, 100).unwrap();
-        dedup.register_content(hash, 1, 100).unwrap();
-
-        // Unregister op should decrement (not delete)
-        let op = dedup.make_unregister_op(&hash).unwrap().unwrap();
-        match &op.action {
-            BatchAction::Put(_, value) => {
-                let entry: DedupEntry = bincode::deserialize(value).unwrap();
-                assert_eq!(entry.ref_count, 1);
-            }
-            _ => panic!("Expected Put with decremented ref count"),
-        }
-    }
-
-    #[test]
-    fn test_make_unregister_op_delete() {
-        let (_temp, dedup) = create_test_dedup();
-        let hash = Deduplicator::compute_hash(b"single ref");
-
-        // Register once
-        dedup.register_content(hash, 1, 100).unwrap();
-
-        // Unregister op should delete the entry with PG-scoped key
         let expected_key = dedup.make_key(&hash);
-        let op = dedup.make_unregister_op(&hash).unwrap().unwrap();
+        let op = dedup.make_unregister_op(&hash);
+        assert_eq!(op.keyspace, KeyspaceId::Dedup);
         match &op.action {
-            BatchAction::Delete(key) => {
+            BatchAction::DecrementDedupRef { key } => {
                 assert_eq!(key, &expected_key);
                 assert_eq!(key.len(), 36);
             }
-            _ => panic!("Expected Delete for last reference"),
+            _ => panic!("Expected DecrementDedupRef"),
         }
-    }
-
-    #[test]
-    fn test_make_unregister_op_nonexistent() {
-        let (_temp, dedup) = create_test_dedup();
-        let hash = Deduplicator::compute_hash(b"does not exist");
-
-        // Should return None (no-op)
-        assert!(dedup.make_unregister_op(&hash).unwrap().is_none());
     }
 
     #[test]
@@ -1051,21 +974,22 @@ mod tests {
         let (_temp, dedup) = create_test_dedup();
         let hash = Deduplicator::compute_hash(b"batch-move");
 
-        dedup.register_content(hash, 0, 100).unwrap();
-        dedup.register_content(hash, 0, 100).unwrap(); // ref_count = 2
-
-        let op = dedup.make_update_location_op(&hash, 3, 400).unwrap();
+        let expected_key = dedup.make_key(&hash);
+        let op = dedup.make_update_location_op(&hash, 3, 400);
         assert_eq!(op.keyspace, KeyspaceId::Dedup);
 
         match &op.action {
-            BatchAction::Put(key, value) => {
-                assert_eq!(key.len(), 36); // PG(4) + hash(32)
-                let entry: DedupEntry = bincode::deserialize(&value[..]).unwrap();
-                assert_eq!(entry.volume_id, 3);
-                assert_eq!(entry.offset, 400);
-                assert_eq!(entry.ref_count, 2); // preserved
+            BatchAction::UpdateDedupLocation {
+                key,
+                new_volume_id,
+                new_offset,
+            } => {
+                assert_eq!(key, &expected_key);
+                assert_eq!(key.len(), 36);
+                assert_eq!(*new_volume_id, 3);
+                assert_eq!(*new_offset, 400);
             }
-            BatchAction::Delete(_) => panic!("Expected Put, got Delete"),
+            _ => panic!("Expected UpdateDedupLocation"),
         }
     }
 }

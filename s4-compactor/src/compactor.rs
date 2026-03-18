@@ -461,7 +461,7 @@ impl VolumeCompactor {
                         content_hash,
                         reloc.new_vol_id,
                         reloc.new_offset,
-                    )?;
+                    );
                     ops.push(dedup_op);
                 }
 
