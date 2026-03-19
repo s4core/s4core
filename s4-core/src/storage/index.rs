@@ -653,21 +653,18 @@ impl IndexDb {
                         new_volume_id,
                         new_offset,
                     } => {
-                        let bytes = dedup
+                        if let Some(bytes) = dedup
                             .get(&key[..])
                             .map_err(|e| StorageError::Database(e.to_string()))?
-                            .ok_or_else(|| {
-                                StorageError::InvalidData(
-                                    "Cannot update location: dedup entry not found".to_string(),
-                                )
-                            })?;
-                        let mut entry: DedupEntry = bincode::deserialize(&bytes)
-                            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                        entry.volume_id = *new_volume_id;
-                        entry.offset = *new_offset;
-                        let value = bincode::serialize(&entry)
-                            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                        batch.insert(&dedup, &key[..], &value[..]);
+                        {
+                            let mut entry: DedupEntry = bincode::deserialize(&bytes)
+                                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                            entry.volume_id = *new_volume_id;
+                            entry.offset = *new_offset;
+                            let value = bincode::serialize(&entry)
+                                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                            batch.insert(&dedup, &key[..], &value[..]);
+                        }
                     }
                 }
             }
@@ -1737,7 +1734,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_dedup_location_errors_on_missing() {
+    async fn test_update_dedup_location_skips_missing() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db");
         let index_db = IndexDb::new(&db_path).unwrap();
@@ -1754,7 +1751,83 @@ mod tests {
             }])
             .await;
 
-        assert!(result.is_err());
+        assert!(result.is_ok());
+    }
+
+    /// Regression test: a missing dedup entry must NOT kill the entire batch.
+    ///
+    /// During compaction, a concurrent delete_object() can remove a dedup entry
+    /// between blob relocation and the atomic batch commit. The fix (PR #7)
+    /// gracefully skips the missing dedup entry so that all other operations
+    /// in the batch — especially IndexRecord relocations — still succeed.
+    ///
+    /// If someone reverts the `if let Some` back to `ok_or_else(|| Error)?`
+    /// in UpdateDedupLocation handling, this test will fail.
+    #[tokio::test]
+    async fn test_missing_dedup_entry_does_not_kill_batch() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let index_db = IndexDb::new(&db_path).unwrap();
+
+        // Pre-create an IndexRecord (simulates an object living in old volume 1)
+        let record = crate::types::IndexRecord::new(
+            1,   // old volume
+            100, // old offset
+            50,
+            [0u8; 32],
+            "etag".to_string(),
+            "text/plain".to_string(),
+        );
+        index_db.put("bucket/important-object", &record).await.unwrap();
+
+        // Build a batch that the compactor would create:
+        // 1. Update the IndexRecord to point to new volume (critical!)
+        // 2. Update a dedup entry location (for a different blob whose
+        //    dedup entry was concurrently deleted)
+        let mut updated_record = record.clone();
+        updated_record.file_id = 5; // new volume
+        updated_record.offset = 200; // new offset
+        let record_bytes = bincode::serialize(&updated_record).unwrap();
+
+        let missing_dedup_key = vec![99u8; 36]; // does not exist
+
+        let ops = vec![
+            // Op 1: Relocate IndexRecord to new volume (must succeed!)
+            BatchOp {
+                keyspace: KeyspaceId::Objects,
+                action: BatchAction::Put(b"bucket/important-object".to_vec(), record_bytes),
+            },
+            // Op 2: Update dedup location for a concurrently-deleted entry
+            BatchOp {
+                keyspace: KeyspaceId::Dedup,
+                action: BatchAction::UpdateDedupLocation {
+                    key: missing_dedup_key,
+                    new_volume_id: 5,
+                    new_offset: 300,
+                },
+            },
+        ];
+
+        let result = index_db.batch_write(ops).await;
+
+        // The batch must SUCCEED — missing dedup entry is gracefully skipped
+        assert!(
+            result.is_ok(),
+            "batch_write must not fail on missing dedup entry (would cause data loss)"
+        );
+
+        // CRITICAL: The IndexRecord MUST be updated to the new volume.
+        // If this fails, a revert of the fix has reintroduced the data loss bug:
+        // the old volume gets deleted and this object becomes inaccessible.
+        let obj = index_db.get("bucket/important-object").await.unwrap().unwrap();
+        assert_eq!(
+            obj.file_id, 5,
+            "IndexRecord must point to NEW volume after compaction batch"
+        );
+        assert_eq!(
+            obj.offset, 200,
+            "IndexRecord must have NEW offset after compaction batch"
+        );
     }
 
     #[tokio::test]

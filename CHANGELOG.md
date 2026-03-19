@@ -1,3 +1,27 @@
+# v0.0.4-alpha-fjall-fix-compaction-edge-cases
+
+fix: harden compaction against edge cases
+
+Two edge cases in compaction that could cause silent data loss or crash entire batches:
+
+    1. Blob read errors during volume scan — when read_blob() fails (corrupted header,
+    truncated file), the scan loop breaks silently with no log output. In compact_volume
+    this means live blobs past the corruption point aren't relocated, and the old volume
+    gets deleted. Now both analyze_volume and compact_volume log a warning with
+    volume_id and offset before breaking. The break itself stays — without a valid header
+    we can't compute the next blob offset. A future improvement would be adding magic
+    bytes or alignment markers to the volume format so the scanner can skip past corrupted
+    regions and recover the rest.
+
+    2. UpdateDedupLocation hard error on missing entry — if an object is deleted between
+    batch construction and commit, the dedup entry no longer exists and batch_write
+    returns a hard error, failing potentially thousands of unrelated operations in the
+    same batch. Since the entry was intentionally removed (ref_count hit 0), this is now
+    a no-op skip instead of an error.
+
+Co-authored-by: doc-johnson
+
+
 # v0.0.3-alpha-fjall-fix-compactor-delete-iam
  
 fix: compaction now preserves IAM records by scanning all keyspaces

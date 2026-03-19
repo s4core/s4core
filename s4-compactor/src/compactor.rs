@@ -357,7 +357,13 @@ impl VolumeCompactor {
 
                     offset += blob_total;
                 }
-                Err(_) => break, // End of readable data
+                Err(e) => {
+                    warn!(
+                        volume_id,
+                        offset, "Failed to read blob during analysis, stopping scan: {e}"
+                    );
+                    break;
+                }
             }
         }
 
@@ -443,7 +449,13 @@ impl VolumeCompactor {
 
                     offset += blob_total;
                 }
-                Err(_) => break,
+                Err(e) => {
+                    warn!(
+                        volume_id,
+                        offset, "Failed to read blob during compaction, stopping scan: {e}"
+                    );
+                    break;
+                }
             }
         }
 
