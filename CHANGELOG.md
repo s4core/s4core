@@ -1,3 +1,29 @@
+# v0.0.3-alpha-fjall-fix-compactor-delete-iam
+ 
+fix: compaction now preserves IAM records by scanning all keyspaces
+
+Volume compaction was silently destroying IAM user data. The root cause:
+scan_objects_by_volume() only scanned the `objects` keyspace, but IAM 
+IndexRecords (users, credentials, access keys) are stored in the `iam`
+keyspace via route_key(). When compaction relocated blobs to new volumes
+and deleted old ones, IAM IndexRecords still pointed to the deleted
+volume files, causing "Volume not found" errors and permanent data loss.
+
+The compactor also had a hardcoded `KeyspaceId::Objects` when writing
+back updated IndexRecords, so even if IAM records were found, they
+would be written to the wrong keyspace.
+
+Changes:
+ - scan_objects_by_volume() now scans both `objects` and `iam` keyspaces,
+   returning (KeyspaceId, key, IndexRecord) tuples
+ - Compactor writes relocated records back to their origin keyspace
+   instead of hardcoded Objects
+ - Added unit test verifying IAM records are found during volume scan
+ - Added integration test: IAM data survives compaction cycle
+ - Added reproduction script (scripts/15-iam-compaction-bug-test.sh)
+
+Reported-by: Alexander
+
 # v0.0.1-alpha-24
 
 Add S3 Select SQL engine, fix versioning/Object Lock/multipart, improve S3 compatibility

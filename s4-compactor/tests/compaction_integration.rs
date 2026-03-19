@@ -219,6 +219,110 @@ async fn test_compaction_skips_below_threshold() {
 }
 
 #[tokio::test]
+async fn test_compaction_preserves_iam_records() {
+    let temp = TempDir::new().unwrap();
+    let engine = create_test_engine(&temp).await;
+    let bucket = "test-iam-compact";
+
+    // 1. Write regular objects to fill volumes
+    let objects = write_objects(&engine, bucket, 20, "obj-").await;
+    engine.sync().await.unwrap();
+
+    // 2. Write IAM data into the __system__ bucket (same as IamStorage does).
+    //    These blobs land in the same partially-filled volume as the tail of
+    //    the regular objects above.
+    let iam_user_json = br#"{"id":"user1","username":"alice","role":"Writer"}"#;
+    let iam_key_json = br#"{"access_key":"AK123","user_id":"user1"}"#;
+    engine
+        .put_object(
+            "__system__",
+            "__s4_iam_user_user1",
+            iam_user_json,
+            "application/json",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+    engine
+        .put_object(
+            "__system__",
+            "__s4_iam_access_key_AK123",
+            iam_key_json,
+            "application/json",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+    engine.sync().await.unwrap();
+
+    // 3. Verify IAM data is readable before compaction
+    let (data, _) = engine.get_object("__system__", "__s4_iam_user_user1").await.unwrap();
+    assert_eq!(&data, iam_user_json);
+
+    let (data, _) = engine.get_object("__system__", "__s4_iam_access_key_AK123").await.unwrap();
+    assert_eq!(&data, iam_key_json);
+
+    // 4. Delete most regular objects to create >50% dead space in volumes
+    //    that also contain IAM blobs
+    for (key, _) in objects.iter().take(18) {
+        engine.delete_object(bucket, key).await.unwrap();
+    }
+    engine.sync().await.unwrap();
+
+    // 5. Run compaction
+    let config = CompactionConfig {
+        fragmentation_threshold: 0.1,
+        min_dead_bytes: 0,
+        max_volumes_per_run: 100,
+        dry_run: false,
+        ..Default::default()
+    };
+
+    let compactor = VolumeCompactor::new(
+        engine.volumes_dir().to_path_buf(),
+        engine.index_db().clone(),
+        engine.deduplicator().clone(),
+        engine.volume_writer().clone(),
+        config,
+    );
+
+    let stats = compactor.run().await.unwrap();
+    assert!(
+        stats.volumes_compacted > 0,
+        "Expected compacted volumes, stats: {:?}",
+        stats
+    );
+
+    // 6. CRITICAL: Verify IAM data is still readable after compaction.
+    //    Before the fix, this would fail with "Volume not found" because
+    //    scan_objects_by_volume() only scanned the objects keyspace and
+    //    missed IAM IndexRecords in the iam keyspace.
+    let (data, _) = engine
+        .get_object("__system__", "__s4_iam_user_user1")
+        .await
+        .expect("IAM user record must survive compaction");
+    assert_eq!(
+        &data, iam_user_json,
+        "IAM user data corrupted after compaction"
+    );
+
+    let (data, _) = engine
+        .get_object("__system__", "__s4_iam_access_key_AK123")
+        .await
+        .expect("IAM access key record must survive compaction");
+    assert_eq!(
+        &data, iam_key_json,
+        "IAM access key data corrupted after compaction"
+    );
+
+    // 7. Surviving regular objects should also still be readable
+    for (key, expected_data) in objects.iter().skip(18) {
+        let (data, _) = engine.get_object(bucket, key).await.unwrap();
+        assert_eq!(&data, expected_data);
+    }
+}
+
+#[tokio::test]
 async fn test_scrubber_detects_no_corruption() {
     let temp = TempDir::new().unwrap();
     let engine = create_test_engine(&temp).await;

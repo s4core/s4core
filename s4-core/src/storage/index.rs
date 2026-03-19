@@ -957,42 +957,60 @@ impl IndexDb {
 
     /// Scans the objects keyspace and returns all records stored in the given volume.
     ///
-    /// Returns `(object_key, IndexRecord)` pairs where `record.file_id == volume_id`.
+    /// Returns `(keyspace_id, stripped_key, IndexRecord)` tuples where
+    /// `record.file_id == volume_id`.
     /// Inline objects (`file_id == u32::MAX`) are always excluded.
+    ///
+    /// Scans **all** keyspaces that store [`IndexRecord`]s pointing to volume
+    /// blobs — currently `objects` and `iam`.  The returned [`KeyspaceId`]
+    /// tells the caller which keyspace the record belongs to so that updates
+    /// are written back to the correct keyspace.
     ///
     /// Used by the compactor to find which index records need updating after
     /// relocating blobs from one volume to another.
     ///
     /// # Performance
     ///
-    /// Full objects keyspace scan. Call from a blocking thread for large datasets.
+    /// Full keyspace scan over objects + iam. Call from a blocking thread for
+    /// large datasets.
     pub async fn scan_objects_by_volume(
         &self,
         volume_id: u32,
-    ) -> Result<Vec<(String, IndexRecord)>, StorageError> {
+    ) -> Result<Vec<(KeyspaceId, String, IndexRecord)>, StorageError> {
         let objects = self.objects.clone();
+        let iam = self.iam.clone();
 
         task::spawn_blocking(move || {
             let mut results = Vec::new();
 
-            for guard in objects.iter() {
-                let (key_bytes, value_bytes) =
-                    guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
+            // Helper: scan a single keyspace, tagging each result with its KeyspaceId.
+            let scan_ks = |ks: &Keyspace,
+                           ks_id: KeyspaceId,
+                           results: &mut Vec<(KeyspaceId, String, IndexRecord)>|
+             -> Result<(), StorageError> {
+                for guard in ks.iter() {
+                    let (key_bytes, value_bytes) =
+                        guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
 
-                let record: IndexRecord = bincode::deserialize(&value_bytes)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                    let record: IndexRecord = bincode::deserialize(&value_bytes)
+                        .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
-                // Skip inline objects and objects in other volumes
-                if record.file_id == u32::MAX || record.file_id != volume_id {
-                    continue;
+                    // Skip inline objects and objects in other volumes
+                    if record.file_id == u32::MAX || record.file_id != volume_id {
+                        continue;
+                    }
+
+                    let key_str = std::str::from_utf8(&key_bytes)
+                        .map_err(|e| StorageError::Database(e.to_string()))?
+                        .to_string();
+
+                    results.push((ks_id, key_str, record));
                 }
+                Ok(())
+            };
 
-                let key_str = std::str::from_utf8(&key_bytes)
-                    .map_err(|e| StorageError::Database(e.to_string()))?
-                    .to_string();
-
-                results.push((key_str, record));
-            }
+            scan_ks(&objects, KeyspaceId::Objects, &mut results)?;
+            scan_ks(&iam, KeyspaceId::Iam, &mut results)?;
 
             Ok(results)
         })
@@ -1495,7 +1513,34 @@ mod tests {
         // Scan volume 1 — should get 1 result
         let vol1_results = index_db.scan_objects_by_volume(1).await.unwrap();
         assert_eq!(vol1_results.len(), 1);
-        assert_eq!(vol1_results[0].0, "bucket/obj3");
+        assert_eq!(vol1_results[0].0, KeyspaceId::Objects);
+        assert_eq!(vol1_results[0].1, "bucket/obj3");
+
+        // IAM record in volume 1 — should also be found
+        let iam_rec = crate::types::IndexRecord::new(
+            1,
+            500,
+            200,
+            [5u8; 32],
+            "etag5".to_string(),
+            "application/json".to_string(),
+        );
+        // route_key routes __system__/__s4_iam_* to the iam keyspace
+        index_db.put("__system__/__s4_iam_user_abc123", &iam_rec).await.unwrap();
+
+        // Scan volume 1 — should now get 2 results (1 object + 1 iam)
+        let vol1_results = index_db.scan_objects_by_volume(1).await.unwrap();
+        assert_eq!(vol1_results.len(), 2);
+
+        // Verify both keyspaces are represented
+        let has_objects = vol1_results.iter().any(|(ks, _, _)| *ks == KeyspaceId::Objects);
+        let has_iam = vol1_results.iter().any(|(ks, _, _)| *ks == KeyspaceId::Iam);
+        assert!(has_objects, "should find object record in volume 1");
+        assert!(has_iam, "should find IAM record in volume 1");
+
+        // IAM key should be stripped (no __system__/__s4_iam_ prefix)
+        let iam_entry = vol1_results.iter().find(|(ks, _, _)| *ks == KeyspaceId::Iam).unwrap();
+        assert_eq!(iam_entry.1, "user_abc123");
 
         // Scan volume 999 — should get 0 results
         let empty = index_db.scan_objects_by_volume(999).await.unwrap();

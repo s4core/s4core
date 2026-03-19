@@ -488,7 +488,7 @@ impl VolumeCompactor {
                 }
 
                 // Find IndexRecords pointing to old location in this volume
-                for (rec_key, record) in &volume_records {
+                for (ks_id, rec_key, record) in &volume_records {
                     if record.offset == reloc.old_offset && record.file_id == volume_id {
                         let mut updated = record.clone();
                         updated.file_id = reloc.new_vol_id;
@@ -496,7 +496,7 @@ impl VolumeCompactor {
                         let value = bincode::serialize(&updated)
                             .map_err(|e| StorageError::Serialization(e.to_string()))?;
                         ops.push(BatchOp {
-                            keyspace: KeyspaceId::Objects,
+                            keyspace: *ks_id,
                             action: BatchAction::Put(rec_key.clone().into_bytes(), value),
                         });
                     }
