@@ -653,21 +653,18 @@ impl IndexDb {
                         new_volume_id,
                         new_offset,
                     } => {
-                        let bytes = dedup
+                        if let Some(bytes) = dedup
                             .get(&key[..])
                             .map_err(|e| StorageError::Database(e.to_string()))?
-                            .ok_or_else(|| {
-                                StorageError::InvalidData(
-                                    "Cannot update location: dedup entry not found".to_string(),
-                                )
-                            })?;
-                        let mut entry: DedupEntry = bincode::deserialize(&bytes)
-                            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                        entry.volume_id = *new_volume_id;
-                        entry.offset = *new_offset;
-                        let value = bincode::serialize(&entry)
-                            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                        batch.insert(&dedup, &key[..], &value[..]);
+                        {
+                            let mut entry: DedupEntry = bincode::deserialize(&bytes)
+                                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                            entry.volume_id = *new_volume_id;
+                            entry.offset = *new_offset;
+                            let value = bincode::serialize(&entry)
+                                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                            batch.insert(&dedup, &key[..], &value[..]);
+                        }
                     }
                 }
             }
@@ -1692,7 +1689,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_dedup_location_errors_on_missing() {
+    async fn test_update_dedup_location_skips_missing() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test_db");
         let index_db = IndexDb::new(&db_path).unwrap();
@@ -1709,7 +1706,7 @@ mod tests {
             }])
             .await;
 
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
