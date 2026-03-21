@@ -1439,12 +1439,13 @@ impl BitcaskStorageEngine {
             dedup_op,
         ];
 
-        // Handle part overwrite: decrement old part's staged ref
+        // Handle part overwrite: decrement old part's staged ref and dedup
         if let Some(old_part) = self.get_multipart_part(upload_id, part_number)? {
             if old_part.blob_id != blob_id {
                 if let Some(old_ref_op) = self.decrement_staged_ref_op(&old_part.blob_id)? {
                     ops.push(old_ref_op);
                 }
+                ops.push(self.deduplicator.make_unregister_op(&old_part.physical_hash));
             }
         }
 
@@ -1577,6 +1578,9 @@ impl BitcaskStorageEngine {
                 if let Some(op) = self.decrement_committed_ref_op(&seg.blob_id)? {
                     ops.push(op);
                 }
+                // Also unregister segment from dedup keyspace so compactor
+                // sees dead blobs correctly (fixes orphaned dedup entries).
+                ops.push(self.deduplicator.make_unregister_op(&seg.physical_hash));
             }
             // Also decrement the manifest blob itself
             if let Some(op) = self.decrement_committed_ref_op(&manifest_blob_id)? {
@@ -1752,12 +1756,14 @@ impl BitcaskStorageEngine {
                 action: BatchAction::Delete(part_key.as_bytes().to_vec()),
             });
 
-            // 7. Decrement staged refs for unselected parts
+            // 7. Decrement staged refs and unregister dedup for unselected parts
             let is_selected = selected_parts.iter().any(|sp| sp.part_number == part.part_number);
             if !is_selected {
                 if let Some(dec_op) = self.decrement_staged_ref_op(&part.blob_id)? {
                     ops.push(dec_op);
                 }
+                // Unregister from dedup keyspace so compactor sees dead blobs.
+                ops.push(self.deduplicator.make_unregister_op(&part.physical_hash));
             }
         }
 
@@ -1780,7 +1786,7 @@ impl BitcaskStorageEngine {
             },
         ];
 
-        // Delete part records and decrement staged refs
+        // Delete part records, decrement staged refs, and unregister dedup
         for part in &parts {
             let part_key = format!("{}_{:05}", upload_id, part.part_number);
             ops.push(BatchOp {
@@ -1790,6 +1796,8 @@ impl BitcaskStorageEngine {
             if let Some(dec_op) = self.decrement_staged_ref_op(&part.blob_id)? {
                 ops.push(dec_op);
             }
+            // Unregister from dedup keyspace so compactor sees dead blobs.
+            ops.push(self.deduplicator.make_unregister_op(&part.physical_hash));
         }
 
         self.index_db.batch_write(ops).await

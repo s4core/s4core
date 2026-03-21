@@ -377,3 +377,104 @@ async fn test_compaction_with_composite_objects() {
         "Deleted composite object should not exist"
     );
 }
+
+/// Regression test: deleted composite objects must have their segment blobs
+/// reclaimed by compaction, not copied to new volumes.
+///
+/// Before the fix, `composite_delete_ref_ops` decremented BlobRefEntry
+/// ref counts but did NOT unregister segments from the dedup keyspace.
+/// This left orphaned DedupEntries with ref_count >= 1, causing the
+/// compactor to treat dead segment blobs as live and copy them forever.
+#[tokio::test]
+async fn test_compaction_reclaims_deleted_composite_segments() {
+    let temp = TempDir::new().unwrap();
+    let engine = create_engine(&temp).await;
+    let bucket = "reclaim-composite";
+    let metadata = HashMap::new();
+
+    // Step 1: Create and complete a multipart upload
+    let upload_id = "reclaim-test-001";
+    engine
+        .create_multipart_session(
+            upload_id,
+            bucket,
+            "big-file.bin",
+            "application/octet-stream",
+            &metadata,
+        )
+        .await
+        .unwrap();
+
+    let mut part_records = Vec::new();
+    for part_num in 1..=3u32 {
+        let part_data = format!(
+            "segment-data-part-{}-{}",
+            part_num,
+            "Z".repeat(300 + part_num as usize * 100)
+        )
+        .into_bytes();
+        let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
+            Box::new(std::io::Cursor::new(part_data.clone()));
+        let result = engine
+            .upload_part_streaming(upload_id, part_num, reader, part_data.len() as u64)
+            .await
+            .unwrap();
+        part_records.push(result.record);
+    }
+
+    engine
+        .complete_multipart_native(
+            bucket,
+            "big-file.bin",
+            upload_id,
+            &part_records,
+            "\"etag-3\"",
+            "application/octet-stream",
+            &metadata,
+        )
+        .await
+        .unwrap();
+    engine.sync().await.unwrap();
+
+    // Step 2: Delete the composite object
+    engine.delete_object(bucket, "big-file.bin").await.unwrap();
+    engine.sync().await.unwrap();
+
+    // Step 3: Verify dedup entries are cleaned up (the root cause check)
+    let dedup = engine.deduplicator().clone();
+    let dedup_entries = dedup.iter_entries().unwrap();
+    assert!(
+        dedup_entries.is_empty(),
+        "Dedup entries should be empty after deleting all objects, \
+         but found {} orphaned entries",
+        dedup_entries.len()
+    );
+
+    // Step 4: Run compaction
+    let config = CompactionConfig {
+        fragmentation_threshold: 0.0, // compact everything
+        min_dead_bytes: 0,
+        max_volumes_per_run: 100,
+        dry_run: false,
+        ..Default::default()
+    };
+
+    let compactor = VolumeCompactor::new(
+        engine.volumes_dir().to_path_buf(),
+        engine.index_db().clone(),
+        engine.deduplicator().clone(),
+        engine.volume_writer().clone(),
+        config,
+    );
+
+    let stats = compactor.run().await.unwrap();
+    assert_eq!(stats.errors, 0, "Compaction should have 0 errors");
+    // The key assertion: no orphaned dedup entries should cause live blob copies.
+    // If the bug is present, the compactor would copy dead segment blobs thinking
+    // they're live (because orphaned DedupEntries would still exist).
+    assert_eq!(
+        stats.total_live_blobs, 0,
+        "No live blobs should exist — all data was deleted. \
+         If live_blobs > 0, orphaned dedup/blob_ref entries are keeping dead data alive."
+    );
+}

@@ -1,3 +1,30 @@
+# v0.0.4-alpha-fjall-fix-unregister-dedup
+
+fix: unregister dedup entries when deleting composite (multipart) objects
+
+  When composite objects were deleted, composite_delete_ref_ops() decremented
+  BlobRefEntry.ref_count_committed for segment blobs but never called
+  make_unregister_op() to decrement the corresponding DedupEntry.ref_count.
+  This left orphaned DedupEntries with ref_count >= 1, causing the compactor
+  to treat dead segment blobs as live and copy them to new volumes forever.
+
+  Customer reported ~11GB of dead data remaining after compaction with all
+  buckets empty. After multiple compaction cycles, ~3.7GB (one ISO worth of
+  unique segment data) persisted indefinitely — matching exactly the size of
+  orphaned dedup entries.
+
+  Fixed in 4 places in bitcask.rs:
+  - composite_delete_ref_ops: unregister dedup for each segment on delete
+  - abort_multipart_native: unregister dedup for each part on abort
+  - complete_multipart_native: unregister dedup for unselected parts
+  - upload_part_streaming: unregister dedup for old content on part overwrite
+
+  Also added live_blobs/dead_blobs/volumes_skipped fields to the compaction
+  API response for better diagnostics.
+
+  Added regression test: test_compaction_reclaims_deleted_composite_segments
+
+
 # v0.0.4-alpha-fjall-fix-compaction-edge-cases
 
 fix: harden compaction against edge cases
@@ -19,7 +46,7 @@ Two edge cases in compaction that could cause silent data loss or crash entire b
     same batch. Since the entry was intentionally removed (ref_count hit 0), this is now
     a no-op skip instead of an error.
 
-Co-authored-by: doc-johnson
+Co-authored-by: doc-johnson <hustler@mail.ru>
 
 
 # v0.0.3-alpha-fjall-fix-compactor-delete-iam

@@ -491,6 +491,9 @@ pub async fn run_compaction(
     Ok(Json(json!({
         "volumes_scanned": stats.volumes_scanned,
         "volumes_compacted": stats.volumes_compacted,
+        "volumes_skipped": stats.volumes_skipped,
+        "live_blobs": stats.total_live_blobs,
+        "dead_blobs": stats.total_dead_blobs,
         "bytes_reclaimed": stats.total_bytes_reclaimed,
         "errors": stats.errors,
         "dry_run": params.dry_run.unwrap_or(false),
