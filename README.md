@@ -1,5 +1,7 @@
 # 💫 S4 - Modern S3-Compatible Object Storage
 
+[![gitcgr](https://gitcgr.com/badge/s4core/s4core.svg)](https://gitcgr.com/s4core/s4core)
+
 S4 is a high-performance, S3-compatible object storage server written in Rust. It solves the inode exhaustion problem common with traditional file-based storage systems and provides advanced features like atomic directory operations and content-addressable deduplication.
 
 ![Demo](assets/screenshot.png)
