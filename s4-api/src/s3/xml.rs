@@ -76,13 +76,17 @@ pub fn list_buckets_response(buckets: &[String]) -> String {
 /// # Returns
 ///
 /// XML string conforming to S3 ListBucketResult schema.
+#[allow(clippy::too_many_arguments)]
 pub fn list_objects_response(
     bucket: &str,
     prefix: &str,
     delimiter: Option<&str>,
+    marker: Option<&str>,
+    next_marker: Option<&str>,
     max_keys: usize,
     is_truncated: bool,
     objects: &[(String, IndexRecord)],
+    common_prefixes: &[String],
 ) -> String {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -98,8 +102,18 @@ pub fn list_objects_response(
         is_truncated
     );
 
+    if let Some(m) = marker {
+        xml.push_str(&format!("  <Marker>{}</Marker>\n", escape_xml(m)));
+    }
+
     if let Some(delim) = delimiter {
         xml.push_str(&format!("  <Delimiter>{}</Delimiter>\n", escape_xml(delim)));
+    }
+
+    if is_truncated {
+        if let Some(nm) = next_marker {
+            xml.push_str(&format!("  <NextMarker>{}</NextMarker>\n", escape_xml(nm)));
+        }
     }
 
     for (key, record) in objects {
@@ -117,6 +131,16 @@ pub fn list_objects_response(
             last_modified,
             escape_xml(&record.etag),
             record.size
+        ));
+    }
+
+    for cp in common_prefixes {
+        xml.push_str(&format!(
+            r#"  <CommonPrefixes>
+    <Prefix>{}</Prefix>
+  </CommonPrefixes>
+"#,
+            escape_xml(cp)
         ));
     }
 
@@ -140,6 +164,7 @@ pub fn list_objects_response(
 /// # Returns
 ///
 /// XML string conforming to S3 ListBucketResultV2 schema.
+#[allow(clippy::too_many_arguments)]
 pub fn list_objects_v2_response(
     bucket: &str,
     prefix: &str,
@@ -148,6 +173,8 @@ pub fn list_objects_v2_response(
     is_truncated: bool,
     objects: &[(String, IndexRecord)],
     continuation_token: Option<&str>,
+    next_continuation_token: Option<&str>,
+    common_prefixes: &[String],
 ) -> String {
     let mut xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -174,18 +201,18 @@ pub fn list_objects_v2_response(
         ));
     }
 
-    if is_truncated && !objects.is_empty() {
-        // Use the last object's key as NextContinuationToken
-        if let Some((last_key, _)) = objects.last() {
+    if is_truncated {
+        if let Some(token) = next_continuation_token {
             xml.push_str(&format!(
                 "  <NextContinuationToken>{}</NextContinuationToken>\n",
-                escape_xml(last_key)
+                escape_xml(token)
             ));
         }
     }
 
+    // KeyCount includes both Contents and CommonPrefixes per S3 spec
     xml.push_str("  <KeyCount>");
-    xml.push_str(&objects.len().to_string());
+    xml.push_str(&(objects.len() + common_prefixes.len()).to_string());
     xml.push_str("</KeyCount>\n");
 
     for (key, record) in objects {
@@ -203,6 +230,16 @@ pub fn list_objects_v2_response(
             last_modified,
             escape_xml(&record.etag),
             record.size
+        ));
+    }
+
+    for cp in common_prefixes {
+        xml.push_str(&format!(
+            r#"  <CommonPrefixes>
+    <Prefix>{}</Prefix>
+  </CommonPrefixes>
+"#,
+            escape_xml(cp)
         ));
     }
 
@@ -478,7 +515,17 @@ mod tests {
             ),
         )];
 
-        let xml = list_objects_response("my-bucket", "prefix/", None, 1000, false, &objects);
+        let xml = list_objects_response(
+            "my-bucket",
+            "prefix/",
+            None,
+            None,
+            None,
+            1000,
+            false,
+            &objects,
+            &[],
+        );
 
         assert!(xml.contains("<Name>my-bucket</Name>"));
         assert!(xml.contains("<Key>test-key</Key>"));

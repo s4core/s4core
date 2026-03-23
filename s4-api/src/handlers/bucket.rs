@@ -410,58 +410,174 @@ pub async fn list_objects(
         params.marker.as_deref()
     };
 
-    // Fetch max_keys + 1 to determine if there are more results (proper truncation detection)
-    let fetch_limit = max_keys + 1;
-    let mut objects = if let Some(start_after_key) = start_after {
-        match storage.list_objects_after(&bucket, &prefix, start_after_key, fetch_limit).await {
-            Ok(list) => list,
-            Err(e) => {
-                error!("Failed to list objects: {:?}", e);
-                return S3Error::InternalError("Failed to list objects".to_string())
-                    .into_response();
+    // Filter out empty delimiter — empty string matches at every position via str::find("")
+    let delimiter = params.delimiter.as_deref().filter(|d| !d.is_empty());
+
+    let objects: Vec<(String, s4_core::IndexRecord)>;
+    let mut common_prefixes: Vec<String> = Vec::new();
+    let is_truncated: bool;
+    let next_marker: Option<String>;
+
+    if let Some(delim) = delimiter {
+        // When delimiter is present, we must scan enough objects to collect max_keys
+        // unique entries (CommonPrefixes + Contents). Many objects may collapse into
+        // a single CommonPrefix, so we fetch in batches.
+        let mut cp_set = std::collections::BTreeSet::new();
+        let mut contents: Vec<(String, s4_core::IndexRecord)> = Vec::new();
+        // Use raw storage key as cursor to avoid infinite loop:
+        // stripped keys (without version IDs) sort before their raw counterparts,
+        // so list_objects_after with a stripped key would re-fetch the same objects.
+        let mut cursor: Option<String> = start_after.map(|s| s.to_string());
+        let batch_size = 1000usize;
+        let max_scan = 100_000usize; // DoS protection: cap total objects scanned
+        let mut total_scanned = 0usize;
+        let mut found_truncated = false;
+
+        loop {
+            let batch = if let Some(ref after_key) = cursor {
+                match storage.list_objects_after(&bucket, &prefix, after_key, batch_size).await {
+                    Ok(list) => list,
+                    Err(e) => {
+                        error!("Failed to list objects: {:?}", e);
+                        return S3Error::InternalError("Failed to list objects".to_string())
+                            .into_response();
+                    }
+                }
+            } else {
+                match storage.list_objects(&bucket, &prefix, batch_size).await {
+                    Ok(list) => list,
+                    Err(e) => {
+                        error!("Failed to list objects: {:?}", e);
+                        return S3Error::InternalError("Failed to list objects".to_string())
+                            .into_response();
+                    }
+                }
+            };
+
+            let batch_len = batch.len();
+
+            // Update cursor with last raw key (before version stripping) for correct pagination
+            if let Some((raw_key, _)) = batch.last() {
+                cursor = Some(raw_key.clone());
+            }
+
+            let batch = strip_version_ids_from_keys(batch);
+            total_scanned += batch_len;
+
+            for (key, record) in batch {
+                // Safe prefix check: skip keys that don't start with prefix
+                // (avoids panic from direct slice indexing)
+                if !key.starts_with(&prefix) {
+                    continue;
+                }
+                let after_prefix = &key[prefix.len()..];
+                if let Some(pos) = after_prefix.find(delim) {
+                    let cp = format!("{}{}", prefix, &after_prefix[..pos + delim.len()]);
+                    cp_set.insert(cp);
+                } else {
+                    contents.push((key, record));
+                }
+
+                let total = cp_set.len() + contents.len();
+                if total > max_keys {
+                    found_truncated = true;
+                    // Trim contents if we overshot (CommonPrefixes can't be trimmed)
+                    while cp_set.len() + contents.len() > max_keys {
+                        if contents.pop().is_none() {
+                            break; // cp_set alone exceeds max_keys; S3 allows this
+                        }
+                    }
+                    break;
+                }
+            }
+
+            if found_truncated {
+                break;
+            }
+
+            // No more objects in storage
+            if batch_len < batch_size {
+                break;
+            }
+
+            // DoS protection: stop scanning after max_scan objects
+            if total_scanned >= max_scan {
+                found_truncated = true;
+                break;
             }
         }
+
+        is_truncated = found_truncated;
+        objects = contents;
+        common_prefixes = cp_set.into_iter().collect();
+        // Use last content key or last common prefix as pagination marker
+        next_marker = if is_truncated {
+            objects
+                .last()
+                .map(|(k, _)| k.clone())
+                .or_else(|| common_prefixes.last().cloned())
+        } else {
+            None
+        };
     } else {
-        match storage.list_objects(&bucket, &prefix, fetch_limit).await {
-            Ok(list) => list,
-            Err(e) => {
-                error!("Failed to list objects: {:?}", e);
-                return S3Error::InternalError("Failed to list objects".to_string())
-                    .into_response();
+        // No delimiter — simple flat listing
+        let fetch_limit = max_keys + 1;
+        let raw = if let Some(start_after_key) = start_after {
+            match storage.list_objects_after(&bucket, &prefix, start_after_key, fetch_limit).await {
+                Ok(list) => list,
+                Err(e) => {
+                    error!("Failed to list objects: {:?}", e);
+                    return S3Error::InternalError("Failed to list objects".to_string())
+                        .into_response();
+                }
             }
+        } else {
+            match storage.list_objects(&bucket, &prefix, fetch_limit).await {
+                Ok(list) => list,
+                Err(e) => {
+                    error!("Failed to list objects: {:?}", e);
+                    return S3Error::InternalError("Failed to list objects".to_string())
+                        .into_response();
+                }
+            }
+        };
+
+        is_truncated = raw.len() > max_keys;
+        let mut raw = raw;
+        if raw.len() > max_keys {
+            raw.truncate(max_keys);
         }
-    };
-
-    // Determine if results are truncated (more items exist beyond max_keys)
-    let is_truncated = objects.len() > max_keys;
-
-    // Trim to max_keys if we fetched extra for truncation detection
-    if objects.len() > max_keys {
-        objects.truncate(max_keys);
+        objects = strip_version_ids_from_keys(raw);
+        next_marker = if is_truncated {
+            objects.last().map(|(k, _)| k.clone())
+        } else {
+            None
+        };
     }
-
-    // Strip version IDs from keys (S4 internal format: "key#version_id")
-    // ListObjects should return only the latest version of each object, with clean keys
-    let objects = strip_version_ids_from_keys(objects);
 
     let xml_response = if is_v2 {
         xml::list_objects_v2_response(
             &bucket,
             &prefix,
-            params.delimiter.as_deref(),
+            delimiter,
             max_keys,
             is_truncated,
             &objects,
             params.continuation_token.as_deref(),
+            next_marker.as_deref(),
+            &common_prefixes,
         )
     } else {
         xml::list_objects_response(
             &bucket,
             &prefix,
-            params.delimiter.as_deref(),
+            delimiter,
+            params.marker.as_deref(),
+            next_marker.as_deref(),
             max_keys,
             is_truncated,
             &objects,
+            &common_prefixes,
         )
     };
 

@@ -1,3 +1,17 @@
+# v0.0.5-alpha-fix-delimiter-list-objects
+
+fix: implement delimiter/CommonPrefixes support for ListObjects/ListObjectsV2
+
+S3-compatible directory-like listing was broken — aws s3 ls s3://bucket/ showed all objects in a flat list instead of grouping them into virtual directories
+via CommonPrefixes.
+
+Changes:
+- Implement delimiter filtering with iterative batch scanning (objects collapsing into CommonPrefixes require scanning beyond the first batch)
+- Add Marker/NextMarker to V1 responses and pass NextContinuationToken from handler in V2 for correct pagination with delimiter
+- Fix KeyCount in V2 to include both Contents and CommonPrefixes per S3 spec
+- Guard against panic on prefix slicing, infinite loop with versioned keys, and unbounded scans (100k object cap)
+
+
 # v0.0.4-alpha-fjall-fix-unregister-dedup
 
 fix: unregister dedup entries when deleting composite (multipart) objects
