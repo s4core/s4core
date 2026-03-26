@@ -1,3 +1,15 @@
+# v0.0.6-alpha-fix-compaction-dead-volumes
+
+fix: compactor safely handles unreadable volumes, purges orphaned dead volumes and multipart sessions
+
+  - Add fast-path to purge all non-active volumes when both dedup and blob_ref indices are empty
+  - Treat unreadable volumes (0 readable blobs, file_size > 0) as dead only if no live index entries reference them
+  - Protect against bit-rot: skip corrupted volumes that still have live references
+  - Use on_demand() config for Admin API compaction (min_dead_bytes=0, unlimited volumes per run)
+  - Add integration test for full-delete + compaction purge scenario
+  - Add /health endpoint
+
+
 # v0.0.5-alpha-fix-delimiter-list-objects
 
 fix: implement delimiter/CommonPrefixes support for ListObjects/ListObjectsV2

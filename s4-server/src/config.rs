@@ -234,6 +234,12 @@ pub struct CompactionConfig {
     /// Dry-run mode — analyze without compacting.
     /// Can be set via S4_COMPACTION_DRY_RUN environment variable.
     pub dry_run: bool,
+    /// TTL (hours) for multipart sessions the compactor considers expired.
+    /// Defaults to the same value as `S4_MULTIPART_UPLOAD_TTL_HOURS` (24).
+    pub multipart_session_ttl_hours: u64,
+    /// Optional override in seconds — takes priority over `multipart_session_ttl_hours`.
+    /// Intended for testing only (`S4_COMPACTION_MULTIPART_TTL_SECS`).
+    pub multipart_session_ttl_secs_override: Option<u64>,
 }
 
 /// Multipart upload cleanup worker configuration.
@@ -282,6 +288,13 @@ impl Default for CompactionConfig {
             dry_run: std::env::var("S4_COMPACTION_DRY_RUN")
                 .map(|s| s.to_lowercase() == "true" || s == "1")
                 .unwrap_or(false),
+            multipart_session_ttl_hours: std::env::var("S4_MULTIPART_UPLOAD_TTL_HOURS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(24),
+            multipart_session_ttl_secs_override: std::env::var("S4_COMPACTION_MULTIPART_TTL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok()),
         }
     }
 }

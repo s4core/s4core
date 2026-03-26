@@ -38,7 +38,7 @@ All dashboard data is sourced from the `/api/stats` and `/api/admin/bucket-stats
 - View all buckets sorted alphabetically
 - See object count and storage size for each bucket
 - **Create Bucket** — enter a bucket name in a modal dialog
-- **Delete Bucket** — with confirmation dialog (bucket must be empty)
+- **Delete Bucket** — with confirmation dialog; supports force-delete for non-empty buckets
 
 ### Object Browser
 

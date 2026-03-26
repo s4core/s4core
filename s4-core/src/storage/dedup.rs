@@ -361,6 +361,27 @@ impl Deduplicator {
     // Compaction support
     // ========================================================================
 
+    /// Unconditionally removes a dedup entry by content hash.
+    ///
+    /// Used by the compactor's orphan-purge phase to delete dedup entries
+    /// that are not referenced by any live object in the index.
+    ///
+    /// Unlike [`unregister_content`](Self::unregister_content), this does not
+    /// read-modify-write the ref_count — the entry is simply deleted.
+    ///
+    /// # Safety
+    ///
+    /// Only safe when called from a single-threaded context (e.g., the
+    /// compactor's orphan-purge step, which runs before concurrent blob
+    /// relocation).
+    pub fn remove_entry(&self, content_hash: &[u8; 32]) -> Result<(), StorageError> {
+        let pg_key = self.make_key(content_hash);
+        self.partition
+            .remove(&pg_key[..])
+            .map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(())
+    }
+
     /// Iterates all dedup entries in this placement group.
     ///
     /// Returns a vector of `(content_hash, DedupEntry)` pairs.

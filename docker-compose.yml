@@ -38,14 +38,11 @@ services:
     restart: unless-stopped
     healthcheck:
       test:
-        [
-          "CMD-SHELL",
-          "wget --server-response --spider http://0.0.0.0:9000/ 2>&1 | grep -q -E 'HTTP/1.1 (200|403)' || exit 1",
-        ]
+        ["CMD-SHELL", "wget --spider -q http://0.0.0.0:9000/health || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 5s
+      start_period: 10s
 
   # ============================================
   # S4 Web Console (Admin UI)

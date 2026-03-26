@@ -16,15 +16,15 @@
 //!
 //! The compactor scans volume files, identifies dead blobs (those with no
 //! matching DedupEntry), copies live blobs to new volumes, atomically updates
-//! IndexRecords and DedupEntries via fjall batch writes, then safely deletes
+//! IndexRecords and  DedupEntries via fjall batch writes, then safely deletes
 //! old volumes.
 
 use s4_core::error::StorageError;
 use s4_core::storage::{
     BatchAction, BatchOp, Deduplicator, IndexDb, KeyspaceId, VolumeReader, VolumeWriter,
 };
-use s4_core::types::{BlobId, BlobLocation, BlobRefEntry};
-use std::collections::HashMap;
+use s4_core::types::{BlobId, BlobLocation, BlobRefEntry, CompositeManifest};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -39,8 +39,14 @@ pub struct CompactionConfig {
     /// Minimum dead bytes in a volume to consider it for compaction.
     /// Default: 10MB. Prevents compacting nearly-empty volumes.
     pub min_dead_bytes: u64,
+    /// Maximum age (seconds) for multipart upload sessions before the
+    /// compactor considers them expired and purges their metadata.
+    /// Default: 86400 (24 hours).  Must match or exceed the server's
+    /// `S4_MULTIPART_UPLOAD_TTL_HOURS` setting.
+    pub multipart_session_ttl_secs: u64,
     /// Maximum number of volumes to compact in a single run.
     /// Default: 10. Prevents long-running compaction.
+    /// Set to 0 for unlimited.
     pub max_volumes_per_run: usize,
     /// Maximum volume size (bytes) for new compacted volumes.
     pub max_volume_size: u64,
@@ -52,10 +58,43 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             fragmentation_threshold: 0.3,
-            min_dead_bytes: 10 * 1024 * 1024, // 10MB
+            min_dead_bytes: 10 * 1024 * 1024,      // 10MB
+            multipart_session_ttl_secs: 24 * 3600, // 24 hours
             max_volumes_per_run: 10,
             max_volume_size: 1024 * 1024 * 1024, // 1GB
             dry_run: false,
+        }
+    }
+}
+
+impl CompactionConfig {
+    /// Resolves multipart session TTL from environment variables.
+    ///
+    /// Priority: `S4_COMPACTION_MULTIPART_TTL_SECS` (seconds, for testing)
+    /// → `S4_MULTIPART_UPLOAD_TTL_HOURS` (hours) → default 24 hours.
+    pub fn multipart_ttl_from_env() -> u64 {
+        std::env::var("S4_COMPACTION_MULTIPART_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                std::env::var("S4_MULTIPART_UPLOAD_TTL_HOURS")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(24)
+                    * 3600
+            })
+    }
+
+    /// Returns a config suitable for on-demand compaction via admin API.
+    /// No volume limit, no minimum dead bytes, low threshold.
+    pub fn on_demand(threshold: f64, dry_run: bool, multipart_session_ttl_secs: u64) -> Self {
+        Self {
+            fragmentation_threshold: threshold,
+            min_dead_bytes: 0,
+            max_volumes_per_run: 0, // unlimited
+            multipart_session_ttl_secs,
+            dry_run,
+            ..Default::default()
         }
     }
 }
@@ -149,6 +188,9 @@ impl VolumeCompactor {
     /// 2. Analyzes fragmentation for each
     /// 3. Compacts volumes above the threshold
     ///
+    /// Fast-path: if both dedup and blob_ref indices are empty (no live data
+    /// exists anywhere), non-active volumes are deleted outright.
+    ///
     /// Returns aggregate statistics.
     pub async fn run(&self) -> Result<CompactionStats, StorageError> {
         let mut stats = CompactionStats::default();
@@ -156,6 +198,24 @@ impl VolumeCompactor {
         // Step 1: Discover volume files
         let volume_ids = self.discover_volumes().await?;
         info!("Compactor: discovered {} volume files", volume_ids.len());
+
+        // Step 1b: Purge orphaned dedup/blob_ref entries before building indices.
+        // This handles the case where objects were deleted but ref_count-based
+        // cleanup left stale entries (e.g., due to bugs or incomplete deletes).
+        // Running this first ensures the indices reflect only truly live data.
+        match self.purge_orphaned_refs().await {
+            Ok((dedup_purged, blob_ref_purged)) => {
+                if dedup_purged > 0 || blob_ref_purged > 0 {
+                    info!(
+                        "Compactor: orphan purge complete — {} dedup + {} blob_ref entries removed",
+                        dedup_purged, blob_ref_purged
+                    );
+                }
+            }
+            Err(e) => {
+                warn!("Compactor: orphan purge failed (non-fatal): {}", e);
+            }
+        }
 
         // Step 2: Build dedup location index (volume_id, offset) -> content_hash
         // This avoids O(n) dedup scan per blob
@@ -180,8 +240,15 @@ impl VolumeCompactor {
             writer.current_volume_id()
         };
 
+        // Fast-path: if BOTH indices are empty, no live data exists anywhere.
+        // All non-active volumes can be deleted outright without blob-level analysis.
+        if dedup_index.is_empty() && blob_ref_index.is_empty() {
+            return self.purge_all_dead_volumes(&volume_ids, current_volume_id, &mut stats).await;
+        }
+
         // Step 4: Analyze and compact
         let mut compacted = 0usize;
+        let max_per_run = self.config.max_volumes_per_run;
         for &vol_id in &volume_ids {
             if vol_id == current_volume_id {
                 debug!("Compactor: skipping active volume {}", vol_id);
@@ -192,9 +259,51 @@ impl VolumeCompactor {
 
             match self.analyze_volume(vol_id, &dedup_index, &blob_ref_index).await {
                 Ok(analysis) => {
-                    if analysis.fragmentation >= self.config.fragmentation_threshold
-                        && analysis.dead_bytes >= self.config.min_dead_bytes
+                    // A volume with non-zero file size but 0 total_bytes means
+                    // read_blob failed at offset 0.  Only safe to delete if NO
+                    // live index entry references this volume — otherwise bit-rot
+                    // or corruption could cause us to destroy live data.
+                    let should_compact = if analysis.total_bytes == 0
+                        && analysis.live_count == 0
+                        && analysis.dead_count == 0
                     {
+                        let volume_path =
+                            self.volumes_dir.join(format!("volume_{:06}.dat", vol_id));
+                        let file_size =
+                            tokio::fs::metadata(&volume_path).await.map(|m| m.len()).unwrap_or(0);
+
+                        if file_size == 0 {
+                            false
+                        } else {
+                            // Check if ANY live index entry points to this volume.
+                            // If so, the volume has live data that we can't read
+                            // (bit-rot / corruption) — we must NOT delete it.
+                            let has_live_refs = dedup_index.keys().any(|(vid, _)| *vid == vol_id)
+                                || blob_ref_index.keys().any(|(vid, _)| *vid == vol_id);
+
+                            if has_live_refs {
+                                warn!(
+                                    "Compactor: volume {} has {} bytes on disk, 0 readable blobs, \
+                                     but live index entries reference it — NOT deleting \
+                                     (possible bit-rot / corruption, needs manual inspection)",
+                                    vol_id, file_size
+                                );
+                                false
+                            } else {
+                                warn!(
+                                    "Compactor: volume {} has {} bytes on disk but 0 readable blobs \
+                                     and no live index references — treating as dead",
+                                    vol_id, file_size
+                                );
+                                true
+                            }
+                        }
+                    } else {
+                        analysis.fragmentation >= self.config.fragmentation_threshold
+                            && analysis.dead_bytes >= self.config.min_dead_bytes
+                    };
+
+                    if should_compact {
                         if self.config.dry_run {
                             info!(
                                 "Compactor [DRY-RUN]: would compact volume {} \
@@ -205,6 +314,46 @@ impl VolumeCompactor {
                                 analysis.live_count,
                             );
                             stats.volumes_skipped += 1;
+                        } else if analysis.total_bytes == 0
+                            && analysis.live_count == 0
+                            && analysis.dead_count == 0
+                        {
+                            // Unreadable orphan volume: no live index refs, no readable
+                            // blobs.  Delete directly — compact_volume() would also fail
+                            // to read any blobs and skip the deletion guard.
+                            let volume_path =
+                                self.volumes_dir.join(format!("volume_{:06}.dat", vol_id));
+                            let file_size = tokio::fs::metadata(&volume_path)
+                                .await
+                                .map(|m| m.len())
+                                .unwrap_or(0);
+                            let compacted_path = volume_path.with_extension("dat.compacted");
+                            match tokio::fs::rename(&volume_path, &compacted_path).await {
+                                Ok(()) => {
+                                    if let Err(e) = tokio::fs::remove_file(&compacted_path).await {
+                                        warn!(
+                                            "Compactor: failed to remove unreadable volume {}: {}",
+                                            vol_id, e
+                                        );
+                                        stats.errors += 1;
+                                    } else {
+                                        info!(
+                                            "Compactor: purged unreadable orphan volume {} ({} bytes)",
+                                            vol_id, file_size
+                                        );
+                                        stats.total_bytes_reclaimed += file_size;
+                                        stats.volumes_compacted += 1;
+                                        compacted += 1;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Compactor: failed to rename unreadable volume {} for purge: {}",
+                                        vol_id, e
+                                    );
+                                    stats.errors += 1;
+                                }
+                            }
                         } else {
                             match self.compact_volume(vol_id, &dedup_index, &blob_ref_index).await {
                                 Ok(result) => {
@@ -232,10 +381,11 @@ impl VolumeCompactor {
                         }
                     } else {
                         debug!(
-                            "Compactor: skipping volume {} (frag: {:.1}%, dead: {} bytes)",
+                            "Compactor: skipping volume {} (frag: {:.1}%, dead: {} bytes, live: {} blobs)",
                             vol_id,
                             analysis.fragmentation * 100.0,
                             analysis.dead_bytes,
+                            analysis.live_count,
                         );
                         stats.volumes_skipped += 1;
                     }
@@ -246,16 +396,320 @@ impl VolumeCompactor {
                 }
             }
 
-            if compacted >= self.config.max_volumes_per_run {
-                info!(
-                    "Compactor: reached max volumes per run ({})",
-                    self.config.max_volumes_per_run
-                );
+            if max_per_run > 0 && compacted >= max_per_run {
+                info!("Compactor: reached max volumes per run ({})", max_per_run);
                 break;
             }
         }
 
         Ok(stats)
+    }
+
+    /// Fast-path: delete ALL non-active volumes when both dedup and blob_ref
+    /// indices are empty (no live data exists anywhere in the system).
+    async fn purge_all_dead_volumes(
+        &self,
+        volume_ids: &[u32],
+        current_volume_id: u32,
+        stats: &mut CompactionStats,
+    ) -> Result<CompactionStats, StorageError> {
+        info!(
+            "Compactor: dedup and blob_ref indices are both empty — \
+             purging all non-active volumes"
+        );
+
+        for &vol_id in volume_ids {
+            if vol_id == current_volume_id {
+                debug!("Compactor: skipping active volume {}", vol_id);
+                continue;
+            }
+
+            stats.volumes_scanned += 1;
+
+            let volume_path = self.volumes_dir.join(format!("volume_{:06}.dat", vol_id));
+            let file_size = tokio::fs::metadata(&volume_path).await.map(|m| m.len()).unwrap_or(0);
+
+            if file_size == 0 {
+                stats.volumes_skipped += 1;
+                continue;
+            }
+
+            if self.config.dry_run {
+                info!(
+                    "Compactor [DRY-RUN]: would purge dead volume {} ({} bytes)",
+                    vol_id, file_size
+                );
+                stats.volumes_skipped += 1;
+                continue;
+            }
+
+            // Safe to delete — no live references exist
+            let compacted_path = volume_path.with_extension("dat.compacted");
+            match tokio::fs::rename(&volume_path, &compacted_path).await {
+                Ok(()) => {
+                    if let Err(e) = tokio::fs::remove_file(&compacted_path).await {
+                        warn!(
+                            "Compactor: failed to remove compacted volume {}: {}",
+                            vol_id, e
+                        );
+                        stats.errors += 1;
+                        continue;
+                    }
+                    info!(
+                        "Compactor: purged dead volume {} ({} bytes)",
+                        vol_id, file_size
+                    );
+                    stats.total_bytes_reclaimed += file_size;
+                    stats.volumes_compacted += 1;
+                }
+                Err(e) => {
+                    warn!(
+                        "Compactor: failed to rename volume {} for purge: {}",
+                        vol_id, e
+                    );
+                    stats.errors += 1;
+                }
+            }
+        }
+
+        Ok(stats.clone())
+    }
+
+    /// Purges orphaned dedup and blob_ref entries that are not referenced
+    /// by any live object in the index.
+    ///
+    /// This handles the case where objects were deleted but their dedup/blob_ref
+    /// entries survived (e.g., due to ref_count bugs or incomplete deletes).
+    /// Without this cleanup, orphaned entries make the compactor treat dead
+    /// blobs as live, preventing volume reclamation.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Scan all objects + IAM records to collect live content hashes and
+    ///    manifest blob IDs.
+    /// 2. For each live composite manifest, read its segment blob IDs from
+    ///    the volume to build the complete set of live blob IDs.
+    /// 3. Delete dedup entries whose content hash is not in the live set.
+    /// 4. Scan multipart parts to find blob IDs of active in-progress uploads.
+    /// 5. Delete blob_ref entries whose blob ID is not referenced by any
+    ///    committed object or active multipart part.
+    async fn purge_orphaned_refs(&self) -> Result<(usize, usize), StorageError> {
+        // Step 1: Collect all live content hashes and manifest blob IDs
+        // from the objects + IAM keyspaces.
+        let (live_content_hashes, live_manifest_ids) =
+            self.index_db.scan_all_content_refs().await?;
+
+        info!(
+            "Compactor: live refs scan: {} content hashes, {} composite manifests",
+            live_content_hashes.len(),
+            live_manifest_ids.len()
+        );
+
+        // Step 2: Resolve composite manifests to find all live blob IDs
+        // (manifest blob itself + each segment blob).
+        let mut live_blob_ids: HashSet<BlobId> = live_manifest_ids.clone();
+
+        let reader = VolumeReader::new(&self.volumes_dir);
+        let blob_refs_ks = self.index_db.blob_refs_keyspace();
+
+        for manifest_id in &live_manifest_ids {
+            // Look up the manifest's physical location from blob_refs
+            match blob_refs_ks.get(manifest_id.as_bytes()) {
+                Ok(Some(value)) => {
+                    let entry: BlobRefEntry = bincode::deserialize(&value)
+                        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+                    // Read the manifest blob from the volume
+                    match reader.read_blob(entry.location.volume_id, entry.location.offset).await {
+                        Ok((_header, _key, data)) => {
+                            match bincode::deserialize::<CompositeManifest>(&data) {
+                                Ok(manifest) => {
+                                    for seg in &manifest.segments {
+                                        live_blob_ids.insert(seg.blob_id);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Compactor: failed to deserialize manifest {}: {}",
+                                        manifest_id, e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Compactor: failed to read manifest blob {}: {}",
+                                manifest_id, e
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {
+                    warn!(
+                        "Compactor: manifest blob {} not found in blob_refs",
+                        manifest_id
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Compactor: failed to look up manifest blob {}: {}",
+                        manifest_id, e
+                    );
+                }
+            }
+        }
+
+        // Step 3: Purge orphaned dedup entries
+        let dedup_entries = self.deduplicator.iter_entries()?;
+        let mut dedup_purged = 0usize;
+
+        for (content_hash, _entry) in &dedup_entries {
+            if !live_content_hashes.contains(content_hash) {
+                self.deduplicator.remove_entry(content_hash)?;
+                dedup_purged += 1;
+            }
+        }
+
+        if dedup_purged > 0 {
+            info!(
+                "Compactor: purged {} orphaned dedup entries (of {} total)",
+                dedup_purged,
+                dedup_entries.len()
+            );
+        }
+
+        // Step 4: Collect blob IDs referenced by active multipart parts
+        // that have a corresponding live session.  Parts whose session has
+        // been cleaned up (or never existed) are themselves orphans.
+        let multipart_sessions_ks = self.index_db.multipart_sessions_keyspace();
+        let multipart_parts_ks = self.index_db.multipart_parts_keyspace();
+
+        // 4a. Collect live session IDs, expiring sessions older than TTL.
+        let now_nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as u64;
+        let ttl_nanos = self.config.multipart_session_ttl_secs * 1_000_000_000;
+
+        let mut live_session_ids: HashSet<String> = HashSet::new();
+        let mut expired_session_keys: Vec<Vec<u8>> = Vec::new();
+
+        for guard in multipart_sessions_ks.iter() {
+            let (key_bytes, value_bytes) =
+                guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
+
+            if let Ok(session) =
+                bincode::deserialize::<s4_core::types::MultipartUploadSession>(&value_bytes)
+            {
+                // Use the most recent timestamp: a session in `Completing`
+                // state has `updated_at` refreshed by mark_session_completing,
+                // so we won't expire a session that is actively being completed.
+                let last_activity = session.updated_at.max(session.created_at);
+                let age_nanos = now_nanos.saturating_sub(last_activity);
+                if age_nanos > ttl_nanos {
+                    // Session expired — no activity for longer than TTL.
+                    expired_session_keys.push(key_bytes.to_vec());
+                } else if let Ok(session_id) = std::str::from_utf8(&key_bytes) {
+                    live_session_ids.insert(session_id.to_string());
+                }
+            } else if let Ok(session_id) = std::str::from_utf8(&key_bytes) {
+                // Can't deserialize — treat as live to be safe.
+                live_session_ids.insert(session_id.to_string());
+            }
+        }
+
+        // Delete expired session records from fjall.
+        if !expired_session_keys.is_empty() {
+            let count = expired_session_keys.len();
+            for key in &expired_session_keys {
+                multipart_sessions_ks
+                    .remove(&key[..])
+                    .map_err(|e| StorageError::Database(e.to_string()))?;
+            }
+            info!(
+                "Compactor: purged {} expired multipart sessions (TTL: {}s)",
+                count, self.config.multipart_session_ttl_secs
+            );
+        }
+
+        // 4b. Collect blob IDs from parts that belong to a live session.
+        let mut active_staged_blob_ids: HashSet<BlobId> = HashSet::new();
+        let mut orphaned_part_keys: Vec<Vec<u8>> = Vec::new();
+
+        for guard in multipart_parts_ks.iter() {
+            let (key_bytes, value_bytes) =
+                guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
+
+            if let Ok(part) =
+                bincode::deserialize::<s4_core::types::MultipartPartRecord>(&value_bytes)
+            {
+                if live_session_ids.contains(&part.upload_id) {
+                    active_staged_blob_ids.insert(part.blob_id);
+                } else {
+                    // Part's session is gone — this is an orphaned part.
+                    orphaned_part_keys.push(key_bytes.to_vec());
+                }
+            }
+        }
+
+        // 4c. Delete orphaned multipart part records.
+        if !orphaned_part_keys.is_empty() {
+            let count = orphaned_part_keys.len();
+            for key in &orphaned_part_keys {
+                multipart_parts_ks
+                    .remove(&key[..])
+                    .map_err(|e| StorageError::Database(e.to_string()))?;
+            }
+            info!(
+                "Compactor: purged {} orphaned multipart part records (no live session)",
+                count
+            );
+        }
+
+        info!(
+            "Compactor: {} live sessions, {} blob IDs in active multipart parts",
+            live_session_ids.len(),
+            active_staged_blob_ids.len()
+        );
+
+        // Step 5: Purge orphaned blob_ref entries.
+        // A blob_ref is orphaned if:
+        //   - NOT referenced by any committed object (not in live_blob_ids), AND
+        //   - NOT referenced by any active multipart part (not in active_staged_blob_ids)
+        let mut blob_ref_purged = 0usize;
+        let mut blob_ref_keys_to_delete: Vec<Vec<u8>> = Vec::new();
+
+        for guard in blob_refs_ks.iter() {
+            let (key_bytes, _value_bytes) =
+                guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
+
+            if key_bytes.len() != 32 {
+                continue;
+            }
+            let mut blob_id_bytes = [0u8; 32];
+            blob_id_bytes.copy_from_slice(&key_bytes);
+            let blob_id = BlobId::from_content_hash(blob_id_bytes);
+
+            if !live_blob_ids.contains(&blob_id) && !active_staged_blob_ids.contains(&blob_id) {
+                blob_ref_keys_to_delete.push(key_bytes.to_vec());
+            }
+        }
+
+        for key in &blob_ref_keys_to_delete {
+            blob_refs_ks
+                .remove(&key[..])
+                .map_err(|e| StorageError::Database(e.to_string()))?;
+            blob_ref_purged += 1;
+        }
+
+        if blob_ref_purged > 0 {
+            info!(
+                "Compactor: purged {} orphaned blob_ref entries",
+                blob_ref_purged
+            );
+        }
+
+        Ok((dedup_purged, blob_ref_purged))
     }
 
     /// Discovers all volume files in the volumes directory.

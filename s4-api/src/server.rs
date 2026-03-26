@@ -1078,6 +1078,8 @@ pub fn create_router(state: AppState) -> Router {
         // Observability endpoints (no auth required)
         .route("/metrics", get(handlers::stats::prometheus_metrics))
         .route("/api/stats", get(handlers::stats::api_stats))
+        // Health check endpoint (no auth required) — for Docker/Kubernetes probes
+        .route("/health", get(|| async { StatusCode::OK }))
         // MinIO-compatible health check endpoints (no auth required)
         .route("/minio/health/live", get(|| async { StatusCode::OK }))
         .route("/minio/health/ready", get(|| async { StatusCode::OK }))

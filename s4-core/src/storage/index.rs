@@ -65,8 +65,9 @@ use crate::error::StorageError;
 use crate::storage::dedup::DedupEntry;
 use crate::storage::engine::KeyspaceSnapshot;
 use crate::storage::VersionList;
-use crate::types::IndexRecord;
+use crate::types::{BlobId, IndexRecord};
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
+use std::collections::HashSet;
 use std::path::Path;
 use tokio::task;
 
@@ -951,6 +952,61 @@ impl IndexDb {
     // ========================================================================
     // Compaction support
     // ========================================================================
+
+    /// Collects all live content references from the objects and IAM keyspaces.
+    ///
+    /// Returns:
+    /// - `content_hashes`: SHA-256 hashes of all non-composite, non-inline,
+    ///   non-delete-marker records. These correspond to dedup entries.
+    /// - `manifest_blob_ids`: [`BlobId`]s of all composite (multipart) manifests.
+    ///   These correspond to blob_ref entries (segments are resolved later).
+    ///
+    /// Used by the compactor to cross-reference against dedup/blob_ref keyspaces
+    /// and purge orphaned entries.
+    pub async fn scan_all_content_refs(
+        &self,
+    ) -> Result<(HashSet<[u8; 32]>, HashSet<BlobId>), StorageError> {
+        let objects = self.objects.clone();
+        let iam = self.iam.clone();
+
+        task::spawn_blocking(move || {
+            let mut content_hashes = HashSet::new();
+            let mut manifest_blob_ids = HashSet::new();
+
+            let scan_ks = |ks: &Keyspace,
+                           content_hashes: &mut HashSet<[u8; 32]>,
+                           manifest_blob_ids: &mut HashSet<BlobId>|
+             -> Result<(), StorageError> {
+                for guard in ks.iter() {
+                    let (_key_bytes, value_bytes) =
+                        guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
+
+                    let record: IndexRecord = bincode::deserialize(&value_bytes)
+                        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+                    if record.is_delete_marker {
+                        continue;
+                    }
+
+                    if record.is_composite() {
+                        if let Some(blob_id) = record.composite_manifest_blob_id() {
+                            manifest_blob_ids.insert(blob_id);
+                        }
+                    } else if record.file_id != u32::MAX && record.content_hash != [0u8; 32] {
+                        content_hashes.insert(record.content_hash);
+                    }
+                }
+                Ok(())
+            };
+
+            scan_ks(&objects, &mut content_hashes, &mut manifest_blob_ids)?;
+            scan_ks(&iam, &mut content_hashes, &mut manifest_blob_ids)?;
+
+            Ok((content_hashes, manifest_blob_ids))
+        })
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+    }
 
     /// Scans the objects keyspace and returns all records stored in the given volume.
     ///

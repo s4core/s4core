@@ -142,6 +142,73 @@ curl -s -k -X DELETE https://localhost:9000/api/admin/users/<user-id>/credential
 
 **Response:** `204 No Content`
 
+### Create Bucket
+
+**PUT** `/api/admin/buckets/{name}`
+
+```bash
+curl -s -k -X PUT https://localhost:9000/api/admin/buckets/my-bucket \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Response:**
+
+```json
+{ "name": "my-bucket" }
+```
+
+### Delete Bucket
+
+**DELETE** `/api/admin/buckets/{name}`
+
+Deletes a bucket. By default the bucket must be empty (returns `400` otherwise).
+
+```bash
+curl -s -k -X DELETE https://localhost:9000/api/admin/buckets/my-bucket \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Force delete** — recursively deletes all objects in the bucket first:
+
+```bash
+curl -s -k -X DELETE "https://localhost:9000/api/admin/buckets/my-bucket?force=true" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Response:** `204 No Content`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `force` | bool | `false` | When `true`, all objects are deleted before removing the bucket |
+
+### List Bucket Objects
+
+**GET** `/api/admin/buckets/{name}/objects`
+
+```bash
+curl -s -k "https://localhost:9000/api/admin/buckets/my-bucket/objects?max-keys=100" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+**Query parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `prefix` | string | Filter objects by key prefix |
+| `max-keys` | integer | Maximum number of keys to return |
+| `continuation-token` | string | Pagination token from previous response |
+
+### Bucket Stats
+
+**GET** `/api/admin/bucket-stats`
+
+Returns storage statistics for all buckets.
+
+```bash
+curl -s -k https://localhost:9000/api/admin/bucket-stats \
+  -H "Authorization: Bearer $TOKEN"
+```
+
 ## Error Responses
 
 | Status Code | Meaning |

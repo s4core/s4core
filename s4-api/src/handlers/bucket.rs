@@ -510,15 +510,10 @@ pub async fn list_objects(
         is_truncated = found_truncated;
         objects = contents;
         common_prefixes = cp_set.into_iter().collect();
-        // Use last content key or last common prefix as pagination marker
-        next_marker = if is_truncated {
-            objects
-                .last()
-                .map(|(k, _)| k.clone())
-                .or_else(|| common_prefixes.last().cloned())
-        } else {
-            None
-        };
+        // Use the raw cursor (last storage key scanned) as pagination marker.
+        // Using a CommonPrefix like "D/" would cause infinite loops because
+        // list_objects_after("D/") returns "D/subkey" which collapses back into "D/".
+        next_marker = if is_truncated { cursor } else { None };
     } else {
         // No delimiter — simple flat listing
         let fetch_limit = max_keys + 1;

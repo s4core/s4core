@@ -28,6 +28,7 @@ use s4_features::iam::{
 
 use s4_core::storage::StorageEngine;
 use serde::Deserialize;
+use tracing::error;
 
 use crate::AppState;
 
@@ -305,15 +306,27 @@ pub async fn create_bucket(
     Ok(Json(json!({ "name": bucket_name })))
 }
 
+/// Query parameters for delete bucket.
+#[derive(Debug, Deserialize)]
+pub struct DeleteBucketQuery {
+    /// When true, recursively delete all objects before removing the bucket.
+    #[serde(default)]
+    pub force: bool,
+}
+
 /// Delete a bucket via admin API.
 ///
-/// DELETE /api/admin/buckets/:name
+/// DELETE /api/admin/buckets/:name?force=true
 /// Headers: `Authorization: Bearer <token>`
 /// Returns: 204 No Content
+///
+/// Without `force`, the bucket must be empty (returns 400 otherwise).
+/// With `force=true`, all objects are deleted first, then the bucket itself.
 pub async fn delete_bucket(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
     Path(bucket_name): Path<String>,
+    Query(query): Query<DeleteBucketQuery>,
 ) -> Result<StatusCode, AdminError> {
     if !claims.role.can_admin() {
         return Err(AdminError::Forbidden);
@@ -327,12 +340,50 @@ pub async fn delete_bucket(
         return Err(AdminError::UserNotFound); // reusing as "not found"
     }
 
-    // Check empty
-    let objects = storage.list_objects(&bucket_name, "", 1).await.unwrap_or_default();
-    if !objects.is_empty() {
-        return Err(AdminError::InvalidData);
+    if query.force {
+        // Recursively delete all objects in batches
+        let batch_size = 1000;
+        loop {
+            let objects =
+                storage.list_objects(&bucket_name, "", batch_size).await.unwrap_or_default();
+            if objects.is_empty() {
+                break;
+            }
+            for (key, _) in &objects {
+                if let Err(e) = storage.delete_object(&bucket_name, key).await {
+                    error!(
+                        "Failed to delete object {} during force delete: {:?}",
+                        key, e
+                    );
+                    return Err(AdminError::Storage(format!(
+                        "Failed to delete object {}: {}",
+                        key, e
+                    )));
+                }
+            }
+        }
+    } else {
+        // Check empty
+        let objects = storage.list_objects(&bucket_name, "", 1).await.unwrap_or_default();
+        if !objects.is_empty() {
+            return Err(AdminError::InvalidData);
+        }
     }
 
+    // Delete bucket configurations
+    let config_keys = [
+        format!("__s4_bucket_cors_{}", bucket_name),
+        format!("__s4_bucket_versioning_{}", bucket_name),
+        format!("__s4_bucket_lifecycle_{}", bucket_name),
+        format!("__s4_bucket_policy_{}", bucket_name),
+        format!("__s4_bucket_object_lock_{}", bucket_name),
+        format!("__s4_bucket_encryption_{}", bucket_name),
+    ];
+    for key in &config_keys {
+        let _ = storage.delete_object("__system__", key).await;
+    }
+
+    // Delete bucket marker
     storage
         .delete_object("__system__", &marker_key)
         .await
@@ -469,11 +520,11 @@ pub async fn run_compaction(
 
     let storage = state.storage.read().await;
 
-    let config = s4_compactor::CompactionConfig {
-        fragmentation_threshold: params.threshold.unwrap_or(0.0),
-        dry_run: params.dry_run.unwrap_or(false),
-        ..Default::default()
-    };
+    let config = s4_compactor::CompactionConfig::on_demand(
+        params.threshold.unwrap_or(0.0),
+        params.dry_run.unwrap_or(false),
+        s4_compactor::CompactionConfig::multipart_ttl_from_env(),
+    );
 
     let compactor = s4_compactor::VolumeCompactor::new(
         storage.volumes_dir().to_path_buf(),

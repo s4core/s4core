@@ -79,3 +79,11 @@ S4_ACCESS_KEY_ID=mykey S4_SECRET_ACCESS_KEY=mysecret cargo run --bin s4-server
 ```
 
 The server listens on `http://127.0.0.1:9000` by default.
+
+## Testing Environment Variables
+
+These variables are intended for development and CI testing only. They are **not** for production use.
+
+| Variable | Description |
+|---|---|
+| `S4_COMPACTION_MULTIPART_TTL_SECS` | Overrides the compactor's multipart session TTL in seconds. When set, takes priority over `S4_MULTIPART_UPLOAD_TTL_HOURS` for the compactor only. Useful for testing abandoned multipart upload cleanup without waiting 24 hours. Example: `S4_COMPACTION_MULTIPART_TTL_SECS=1` expires sessions after 1 second. |

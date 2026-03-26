@@ -76,6 +76,8 @@ impl CompactionWorker {
             let compaction_config = s4_compactor::CompactionConfig {
                 fragmentation_threshold: self.config.fragmentation_threshold,
                 dry_run: self.config.dry_run,
+                multipart_session_ttl_secs: s4_compactor::CompactionConfig::multipart_ttl_from_env(
+                ),
                 ..Default::default()
             };
 

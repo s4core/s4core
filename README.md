@@ -168,6 +168,8 @@ S4 is configured through environment variables:
 | `S4_COMPACTION_INTERVAL_HOURS` | Compaction check interval (hours) | `6` | `1`, `6`, `12`, `24` |
 | `S4_COMPACTION_THRESHOLD` | Min fragmentation ratio to compact | `0.3` | `0.1`–`0.9` |
 | `S4_COMPACTION_DRY_RUN` | Analyze without compacting | `false` | `true`, `false`, `1`, `0` |
+| `S4_MULTIPART_UPLOAD_TTL_HOURS` | TTL for abandoned multipart uploads (hours) | `24` | `1`, `48` |
+| `S4_COMPACTION_MULTIPART_TTL_SECS` | *Dev/testing only.* Overrides multipart TTL for compactor in seconds | None | `1`, `60` |
 | `S4_METRICS_ENABLED` | Prometheus metrics | true) | false |
 | `S4_SELECT_ENABLED` | Enable/disable S3 Select SQL engine | `true` | `false` |
 | `S4_SELECT_MAX_MEMORY` | Per-query memory limit for SQL engine | `256MB` | `512MB`, `1GB` |
