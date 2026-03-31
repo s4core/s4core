@@ -1,3 +1,14 @@
+# v0.0.7-alpha-fix-journal-compaction
+
+fix: implement metadata journal compaction and optimize startup
+
+- Add `compact_journal_all` to clear the metadata journal keyspace and prevent unbounded growth.
+- Add `persist()` to flush the fjall write-ahead log to disk and trigger LSM compaction after bulk deletes.
+- Integrate journal compaction and WAL flushing into `VolumeCompactor` via the `compact_journal` config flag.
+- Optimize `count_inline_objects` to use O(1) memory iteration, preventing multi-minute startup hangs on large keyspaces.
+- Skip deduplicator rebuilding on normal startup if the dedup data is already persistent.
+- Add unit tests for `IndexDb` operations and architectural documentation for S4-Federation and Erasure Coding.
+
 # v0.0.6-alpha-fix-compaction-dead-volumes
 
 fix: compactor safely handles unreadable volumes, purges orphaned dead volumes and multipart sessions

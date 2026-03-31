@@ -234,6 +234,60 @@ impl IndexDb {
     pub fn is_objects_empty(&self) -> Result<bool, StorageError> {
         self.objects.is_empty().map_err(|e| StorageError::Database(e.to_string()))
     }
+
+    /// Flushes the fjall write-ahead log to disk and triggers memtable rotation.
+    ///
+    /// Call this after bulk deletes (e.g. compactor purging sessions, parts,
+    /// blob_refs) to ensure deleted entries are persisted and the WAL does not
+    /// grow unbounded. This also allows fjall's internal LSM compaction to
+    /// reclaim tombstone space sooner.
+    pub fn persist(&self) -> Result<(), StorageError> {
+        self.db
+            .persist(PersistMode::SyncAll)
+            .map_err(|e| StorageError::Database(e.to_string()))
+    }
+
+    /// Counts objects with `file_id == u32::MAX` (inline objects) by iterating
+    /// the objects keyspace without collecting into a Vec.
+    ///
+    /// Uses O(1) memory vs O(n) for `list_objects("", usize::MAX)` which
+    /// allocates a Vec of all records. CPU cost (deserialization) is the same,
+    /// but memory pressure drops dramatically on large keyspaces, avoiding
+    /// the multi-minute startup hangs observed with 100k+ stale entries.
+    pub async fn count_inline_objects(&self) -> Result<u64, StorageError> {
+        let objects = self.objects.clone();
+        task::spawn_blocking(move || {
+            let mut count = 0u64;
+            for guard in objects.iter() {
+                let (_key_bytes, value_bytes) =
+                    guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
+                let record: IndexRecord = bincode::deserialize(&value_bytes)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                if record.file_id == u32::MAX {
+                    count += 1;
+                }
+            }
+            Ok(count)
+        })
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+    }
+
+    /// Removes all entries from the metadata journal keyspace.
+    ///
+    /// In single-node mode, the journal is only needed for crash recovery
+    /// replay. Once the materialized index is consistent, all journal entries
+    /// are safe to discard. This prevents the journal from growing without
+    /// bound and bloating the metadata database.
+    ///
+    /// In federation/replication mode, journal compaction must respect the
+    /// minimum confirmed sequence across replicas — use
+    /// [`MetadataJournal::compact`](super::MetadataJournal::compact) with an explicit sequence instead.
+    pub fn compact_journal_all(&self) -> Result<u64, StorageError> {
+        let approx_count = self.journal.approximate_len() as u64;
+        self.journal.clear().map_err(|e| StorageError::Database(e.to_string()))?;
+        Ok(approx_count)
+    }
 }
 
 impl IndexDb {
@@ -2028,5 +2082,91 @@ mod tests {
             "Expected ref_count={}, got {} — lost update detected",
             expected, entry.ref_count
         );
+    }
+
+    #[tokio::test]
+    async fn test_count_inline_objects() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let index_db = IndexDb::new(&db_path).unwrap();
+
+        // No objects — count should be 0.
+        assert_eq!(index_db.count_inline_objects().await.unwrap(), 0);
+
+        // Insert a regular (volume-backed) object.
+        let regular = crate::types::IndexRecord::new(
+            1,
+            100,
+            50,
+            [0u8; 32],
+            "etag".to_string(),
+            "text/plain".to_string(),
+        );
+        index_db.put("bucket/regular", &regular).await.unwrap();
+        assert_eq!(index_db.count_inline_objects().await.unwrap(), 0);
+
+        // Insert an inline object (file_id == u32::MAX).
+        let inline = crate::types::IndexRecord::new(
+            u32::MAX,
+            0,
+            10,
+            [1u8; 32],
+            "etag2".to_string(),
+            "text/plain".to_string(),
+        );
+        index_db.put("bucket/inline1", &inline).await.unwrap();
+        assert_eq!(index_db.count_inline_objects().await.unwrap(), 1);
+
+        // Insert another inline object.
+        let inline2 = crate::types::IndexRecord::new(
+            u32::MAX,
+            0,
+            20,
+            [2u8; 32],
+            "etag3".to_string(),
+            "text/plain".to_string(),
+        );
+        index_db.put("bucket/inline2", &inline2).await.unwrap();
+        assert_eq!(index_db.count_inline_objects().await.unwrap(), 2);
+    }
+
+    #[test]
+    fn test_compact_journal_all_empty() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let index_db = IndexDb::new(&db_path).unwrap();
+
+        // Compact empty journal — should return 0.
+        let removed = index_db.compact_journal_all().unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_compact_journal_all_clears_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let index_db = IndexDb::new(&db_path).unwrap();
+
+        // Insert entries directly into the journal keyspace.
+        let journal_ks = index_db.journal_keyspace();
+        for i in 0u64..5 {
+            journal_ks.insert(i.to_be_bytes(), b"test_entry").unwrap();
+        }
+        assert!(!journal_ks.is_empty().unwrap());
+
+        // Compact — should clear all entries.
+        let removed = index_db.compact_journal_all().unwrap();
+        assert!(removed > 0);
+        assert!(journal_ks.is_empty().unwrap());
+    }
+
+    #[test]
+    fn test_persist_does_not_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test_db");
+        let index_db = IndexDb::new(&db_path).unwrap();
+
+        // persist() should succeed even with no pending data.
+        index_db.persist().unwrap();
     }
 }

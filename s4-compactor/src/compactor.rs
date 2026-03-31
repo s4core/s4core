@@ -48,6 +48,10 @@ pub struct CompactionConfig {
     /// Default: 10. Prevents long-running compaction.
     /// Set to 0 for unlimited.
     pub max_volumes_per_run: usize,
+    /// Whether to compact (clear) the metadata journal after each run.
+    /// Default: true (safe for single-node). Set to false in federation
+    /// mode where journal compaction is managed by the replication layer.
+    pub compact_journal: bool,
     /// Maximum volume size (bytes) for new compacted volumes.
     pub max_volume_size: u64,
     /// Whether to perform a dry run (report only, don't compact).
@@ -61,6 +65,7 @@ impl Default for CompactionConfig {
             min_dead_bytes: 10 * 1024 * 1024,      // 10MB
             multipart_session_ttl_secs: 24 * 3600, // 24 hours
             max_volumes_per_run: 10,
+            compact_journal: true,
             max_volume_size: 1024 * 1024 * 1024, // 1GB
             dry_run: false,
         }
@@ -400,6 +405,33 @@ impl VolumeCompactor {
                 info!("Compactor: reached max volumes per run ({})", max_per_run);
                 break;
             }
+        }
+
+        // Step 5: Compact metadata journal (single-node only).
+        // In federation mode, the replication layer manages journal compaction
+        // with replica-aware sequence tracking.
+        if self.config.compact_journal {
+            match self.index_db.compact_journal_all() {
+                Ok(removed) => {
+                    if removed > 0 {
+                        info!(
+                            "Compactor: compacted metadata journal — {} entries removed",
+                            removed
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("Compactor: journal compaction failed (non-fatal): {}", e);
+                }
+            }
+        }
+
+        // Step 6: Flush fjall WAL to disk after all bulk deletes.
+        // This ensures deleted entries (sessions, parts, blob_refs, journal)
+        // are persisted and the WAL does not grow unbounded. Also triggers
+        // fjall's internal LSM compaction to reclaim tombstone space.
+        if let Err(e) = self.index_db.persist() {
+            warn!("Compactor: WAL flush failed (non-fatal): {}", e);
         }
 
         Ok(stats)

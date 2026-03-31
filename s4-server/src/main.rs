@@ -18,14 +18,24 @@ use anyhow::Result;
 use s4_server::{App, Config};
 use tracing::info;
 
+/// Server version, embedded at compile time from Cargo.toml workspace version.
+/// CI overrides this via `sed` before building.
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Handle --version flag before initializing anything
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("s4-server {VERSION}");
+        return Ok(());
+    }
+
     // Initialize tracing with debug level for signature debugging
     let filter =
         std::env::var("RUST_LOG").unwrap_or_else(|_| "s4_api=debug,s4_server=info".to_string());
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    info!("S4 Server starting...");
+    info!("S4 Server v{VERSION} starting...");
 
     // Load configuration
     let config = Config::load()?;

@@ -278,23 +278,41 @@ impl BitcaskStorageEngine {
 
         let dedup_start = Instant::now();
 
-        // Count inline objects from objects keyspace
-        let all_records = index_db.list_objects("", usize::MAX).await?;
-        let mut inline_count = 0u64;
-        for (_, record) in &all_records {
-            if record.file_id == u32::MAX {
-                inline_count += 1;
-            }
-        }
-
         // Rebuild dedup from index only if the dedup keyspace is empty
         // (first startup after Phase 4 migration or after data loss).
         // On subsequent startups, dedup data is already persistent — no rebuild.
-        if deduplicator.is_empty()? {
+        let needs_dedup_rebuild = deduplicator.is_empty()?;
+        let inline_count = if needs_dedup_rebuild {
+            // Full load required: collect all records to feed the dedup builder.
+            let all_records = index_db.list_objects("", usize::MAX).await?;
+            let mut count = 0u64;
+            for (_, record) in &all_records {
+                if record.file_id == u32::MAX {
+                    count += 1;
+                }
+            }
             deduplicator.build_from_index(all_records.into_iter())?;
-        }
+            count
+        } else {
+            // Normal startup: lightweight iteration, no Vec allocation.
+            index_db.count_inline_objects().await?
+        };
 
         let dedup_rebuild_ms = dedup_start.elapsed().as_millis() as u64;
+
+        if needs_dedup_rebuild {
+            tracing::info!(
+                "Dedup index rebuilt from objects keyspace in {}ms ({} inline objects)",
+                dedup_rebuild_ms,
+                inline_count
+            );
+        } else {
+            tracing::info!(
+                "Index scan completed in {}ms ({} inline objects, dedup already populated)",
+                dedup_rebuild_ms,
+                inline_count
+            );
+        }
 
         // Initialize diagnostic counters
         let diagnostic_counters = Arc::new(DiagnosticCounters::new());

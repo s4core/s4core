@@ -2274,7 +2274,7 @@ checksum = "a50f4cf475b65d88e057964e0e9bb1f0aa9bbb2036dc65c64596b42932536984"
 
 [[package]]
 name = "s4-api"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2313,7 +2313,7 @@ dependencies = [
 
 [[package]]
 name = "s4-compactor"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "bincode",
@@ -2330,7 +2330,7 @@ dependencies = [
 
 [[package]]
 name = "s4-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2357,7 +2357,7 @@ dependencies = [
 
 [[package]]
 name = "s4-features"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2379,7 +2379,7 @@ dependencies = [
 
 [[package]]
 name = "s4-select"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "arrow",
  "bytes",
@@ -2400,7 +2400,7 @@ dependencies = [
 
 [[package]]
 name = "s4-server"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum",

@@ -27,6 +27,18 @@ jobs:
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
 
+      - name: Set version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            BRANCH="$(echo "${GITHUB_REF_NAME}" | tr '/' '-')"
+            SHORT_SHA="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+            VERSION="0.0.0-${BRANCH}.${SHORT_SHA}"
+          fi
+          echo "Setting version to ${VERSION}"
+          sed -i "s|^version = \"0.0.1\"|version = \"${VERSION}\"|" Cargo.toml
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -111,6 +123,8 @@ jobs:
         with:
           context: .
           push: true
+          build-args: |
+            S4_VERSION=${{ steps.meta.outputs.version }}
           tags: |
             ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
             ghcr.io/${{ github.repository }}:latest

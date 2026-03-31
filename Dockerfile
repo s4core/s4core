@@ -20,6 +20,14 @@ COPY s4-compactor ./s4-compactor
 COPY s4-select ./s4-select
 COPY s4-server ./s4-server
 
+# Set version if provided (e.g. from CI tag build)
+ARG S4_VERSION=""
+RUN if [ -n "${S4_VERSION}" ]; then \
+      VERSION="${S4_VERSION#v}"; \
+      echo "Setting version to ${VERSION}"; \
+      sed -i "s|^version = \"0.0.1\"|version = \"${VERSION}\"|" Cargo.toml; \
+    fi
+
 # Build release binary with static linking
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 RUN cargo build --release --bin s4-server
@@ -54,8 +62,8 @@ ENV RUST_LOG=s4_api=info,s4_server=info
 EXPOSE 9000
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD wget --server-response --spider http://0.0.0.0:9000/ 2>&1 | grep -q -E 'HTTP/1.1 (200|403)' || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD wget --server-response --spider -q http://0.0.0.0:9000/health || exit 1
 
 # Run the server
 CMD ["/app/s4-server"]
