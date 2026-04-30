@@ -63,6 +63,13 @@ pub enum StorageError {
         key: String,
     },
 
+    /// Blob reference not found in BlobRefs keyspace.
+    #[error("Blob ref not found: {blob_id}")]
+    BlobRefNotFound {
+        /// The blob ID that was not found.
+        blob_id: String,
+    },
+
     /// Specific object version not found.
     #[error("Version not found: {key} (version: {version_id})")]
     VersionNotFound {

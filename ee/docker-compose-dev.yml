@@ -1,0 +1,212 @@
+# S4Core Enterprise Edition — Multi-Pool Cluster Example
+#
+# This compose file demonstrates EE capabilities: 2 pools, 6 nodes.
+# CE is limited to 1 pool / 3 nodes — this configuration requires a valid license.
+#
+# Usage:
+#   S4_LICENSE_KEY=<your-key> docker compose -f ee/docker-compose-dev.yml up
+#
+# Without S4_LICENSE_KEY, nodes will start in CE mode and reject the topology
+# (too many pools/nodes for Community Edition).
+#
+#
+# -**Multi-pool cluster** (EE only — requires license):
+#
+# ```bash
+# S4_LICENSE_KEY=<your-key> docker compose -f ee/docker-compose-dev.yml up
+# ```
+# This file is a 2-pool / 6-node example that demonstrates EE scaling beyond CE limits.
+
+services:
+  haproxy:
+    image: haproxy:3.1-alpine
+    volumes:
+      - ./haproxy-ee.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "9000:9000"
+      - "8404:8404"
+    depends_on:
+      s4-p1-node1:
+        condition: service_healthy
+      s4-p1-node2:
+        condition: service_healthy
+      s4-p1-node3:
+        condition: service_healthy
+      s4-p2-node1:
+        condition: service_healthy
+      s4-p2-node2:
+        condition: service_healthy
+      s4-p2-node3:
+        condition: service_healthy
+
+  # ── Pool 1 ──────────────────────────────────────────────
+  s4-p1-node1:
+    image: s4core/s4core:ee
+    environment:
+      S4_MODE: cluster
+      S4_BIND: "0.0.0.0:9000"
+      S4_CLUSTER_NAME: enterprise
+      S4_NODE_ID: p1-node-1
+      S4_NODE_GRPC_ADDR: s4-p1-node1:9100
+      S4_NODE_HTTP_ADDR: s4-p1-node1:9000
+      S4_SEEDS: s4-p1-node1:9100,s4-p1-node2:9100,s4-p1-node3:9100,s4-p2-node1:9100,s4-p2-node2:9100,s4-p2-node3:9100
+      S4_POOL_NAME: pool-1
+      S4_POOL_NODES: "p1-node-1:s4-p1-node1:9100,p1-node-2:s4-p1-node2:9100,p1-node-3:s4-p1-node3:9100"
+      S4_DATA_DIR: /data
+      S4_LICENSE_KEY: ${S4_LICENSE_KEY:-}
+      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
+      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
+      S4_MAX_UPLOAD_SIZE: ${S4_MAX_UPLOAD_SIZE:-10GB}
+      RUST_LOG: ${RUST_LOG:-s4_api=info,s4_server=info,s4_cluster=info}
+    volumes:
+      - s4-p1-data-1:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+  s4-p1-node2:
+    image: s4core/s4core:ee
+    environment:
+      S4_MODE: cluster
+      S4_BIND: "0.0.0.0:9000"
+      S4_CLUSTER_NAME: enterprise
+      S4_NODE_ID: p1-node-2
+      S4_NODE_GRPC_ADDR: s4-p1-node2:9100
+      S4_NODE_HTTP_ADDR: s4-p1-node2:9000
+      S4_SEEDS: s4-p1-node1:9100,s4-p1-node2:9100,s4-p1-node3:9100,s4-p2-node1:9100,s4-p2-node2:9100,s4-p2-node3:9100
+      S4_POOL_NAME: pool-1
+      S4_POOL_NODES: "p1-node-1:s4-p1-node1:9100,p1-node-2:s4-p1-node2:9100,p1-node-3:s4-p1-node3:9100"
+      S4_DATA_DIR: /data
+      S4_LICENSE_KEY: ${S4_LICENSE_KEY:-}
+      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
+      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
+      S4_MAX_UPLOAD_SIZE: ${S4_MAX_UPLOAD_SIZE:-10GB}
+      RUST_LOG: ${RUST_LOG:-s4_api=info,s4_server=info,s4_cluster=info}
+    volumes:
+      - s4-p1-data-2:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+  s4-p1-node3:
+    image: s4core/s4core:ee
+    environment:
+      S4_MODE: cluster
+      S4_BIND: "0.0.0.0:9000"
+      S4_CLUSTER_NAME: enterprise
+      S4_NODE_ID: p1-node-3
+      S4_NODE_GRPC_ADDR: s4-p1-node3:9100
+      S4_NODE_HTTP_ADDR: s4-p1-node3:9000
+      S4_SEEDS: s4-p1-node1:9100,s4-p1-node2:9100,s4-p1-node3:9100,s4-p2-node1:9100,s4-p2-node2:9100,s4-p2-node3:9100
+      S4_POOL_NAME: pool-1
+      S4_POOL_NODES: "p1-node-1:s4-p1-node1:9100,p1-node-2:s4-p1-node2:9100,p1-node-3:s4-p1-node3:9100"
+      S4_DATA_DIR: /data
+      S4_LICENSE_KEY: ${S4_LICENSE_KEY:-}
+      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
+      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
+      S4_MAX_UPLOAD_SIZE: ${S4_MAX_UPLOAD_SIZE:-10GB}
+      RUST_LOG: ${RUST_LOG:-s4_api=info,s4_server=info,s4_cluster=info}
+    volumes:
+      - s4-p1-data-3:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+  # ── Pool 2 ──────────────────────────────────────────────
+  s4-p2-node1:
+    image: s4core/s4core:ee
+    environment:
+      S4_MODE: cluster
+      S4_BIND: "0.0.0.0:9000"
+      S4_CLUSTER_NAME: enterprise
+      S4_NODE_ID: p2-node-1
+      S4_NODE_GRPC_ADDR: s4-p2-node1:9100
+      S4_NODE_HTTP_ADDR: s4-p2-node1:9000
+      S4_SEEDS: s4-p1-node1:9100,s4-p1-node2:9100,s4-p1-node3:9100,s4-p2-node1:9100,s4-p2-node2:9100,s4-p2-node3:9100
+      S4_POOL_NAME: pool-2
+      S4_POOL_NODES: "p2-node-1:s4-p2-node1:9100,p2-node-2:s4-p2-node2:9100,p2-node-3:s4-p2-node3:9100"
+      S4_DATA_DIR: /data
+      S4_LICENSE_KEY: ${S4_LICENSE_KEY:-}
+      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
+      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
+      S4_MAX_UPLOAD_SIZE: ${S4_MAX_UPLOAD_SIZE:-10GB}
+      RUST_LOG: ${RUST_LOG:-s4_api=info,s4_server=info,s4_cluster=info}
+    volumes:
+      - s4-p2-data-1:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+  s4-p2-node2:
+    image: s4core/s4core:ee
+    environment:
+      S4_MODE: cluster
+      S4_BIND: "0.0.0.0:9000"
+      S4_CLUSTER_NAME: enterprise
+      S4_NODE_ID: p2-node-2
+      S4_NODE_GRPC_ADDR: s4-p2-node2:9100
+      S4_NODE_HTTP_ADDR: s4-p2-node2:9000
+      S4_SEEDS: s4-p1-node1:9100,s4-p1-node2:9100,s4-p1-node3:9100,s4-p2-node1:9100,s4-p2-node2:9100,s4-p2-node3:9100
+      S4_POOL_NAME: pool-2
+      S4_POOL_NODES: "p2-node-1:s4-p2-node1:9100,p2-node-2:s4-p2-node2:9100,p2-node-3:s4-p2-node3:9100"
+      S4_DATA_DIR: /data
+      S4_LICENSE_KEY: ${S4_LICENSE_KEY:-}
+      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
+      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
+      S4_MAX_UPLOAD_SIZE: ${S4_MAX_UPLOAD_SIZE:-10GB}
+      RUST_LOG: ${RUST_LOG:-s4_api=info,s4_server=info,s4_cluster=info}
+    volumes:
+      - s4-p2-data-2:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+  s4-p2-node3:
+    image: s4core/s4core:ee
+    environment:
+      S4_MODE: cluster
+      S4_BIND: "0.0.0.0:9000"
+      S4_CLUSTER_NAME: enterprise
+      S4_NODE_ID: p2-node-3
+      S4_NODE_GRPC_ADDR: s4-p2-node3:9100
+      S4_NODE_HTTP_ADDR: s4-p2-node3:9000
+      S4_SEEDS: s4-p1-node1:9100,s4-p1-node2:9100,s4-p1-node3:9100,s4-p2-node1:9100,s4-p2-node2:9100,s4-p2-node3:9100
+      S4_POOL_NAME: pool-2
+      S4_POOL_NODES: "p2-node-1:s4-p2-node1:9100,p2-node-2:s4-p2-node2:9100,p2-node-3:s4-p2-node3:9100"
+      S4_DATA_DIR: /data
+      S4_LICENSE_KEY: ${S4_LICENSE_KEY:-}
+      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
+      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
+      S4_MAX_UPLOAD_SIZE: ${S4_MAX_UPLOAD_SIZE:-10GB}
+      RUST_LOG: ${RUST_LOG:-s4_api=info,s4_server=info,s4_cluster=info}
+    volumes:
+      - s4-p2-data-3:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  s4-p1-data-1:
+  s4-p1-data-2:
+  s4-p1-data-3:
+  s4-p2-data-1:
+  s4-p2-data-2:
+  s4-p2-data-3:

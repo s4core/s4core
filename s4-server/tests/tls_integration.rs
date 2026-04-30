@@ -69,6 +69,9 @@ fn generate_test_certs(dir: &std::path::Path) -> (PathBuf, PathBuf) {
 async fn test_tls_config_loads_valid_certs() {
     use axum_server::tls_rustls::RustlsConfig;
 
+    // rustls 0.23+ requires an explicit CryptoProvider
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     // Create temporary directory for certificates
     let temp_dir = TempDir::new().expect("Failed to create temp directory");
 

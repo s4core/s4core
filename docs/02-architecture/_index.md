@@ -1,3 +1,3 @@
 # Architecture
 
-S4 is a single-node, high-performance object storage server. This section explains its internal design and how data flows through the system.
+S4 is a high-performance object storage server that runs in single-node mode or as a distributed cluster. This section explains its internal design and how data flows through the system.

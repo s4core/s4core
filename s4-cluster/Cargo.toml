@@ -1,0 +1,73 @@
+[package]
+name = "s4-cluster"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Cluster membership, gossip, and node identity for S4 distributed storage"
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+dashmap = { workspace = true }
+chrono = { workspace = true }
+
+# gRPC inter-node communication
+tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+# Gossip protocol (SWIM)
+foca = { version = "1.0", features = ["postcard-codec", "tracing"] }
+
+# Serialization for gossip broadcasts
+postcard = { version = "1.0", features = ["alloc"] }
+
+# Random number generation (must match foca's rand version)
+rand = "0.9"
+
+# Binary buffer manipulation (used by foca::Codec)
+bytes = "1"
+
+# Fast cryptographic hashing for consistent hash ring
+blake3 = { workspace = true }
+
+# SHA-256 for content hashing
+sha2 = { workspace = true }
+md5 = "0.7"
+
+# CRC32 for data integrity verification (scrubber)
+crc32fast = { workspace = true }
+
+# Prometheus-compatible metrics facade
+metrics = { workspace = true }
+
+# LRU cache for idempotency hot path
+lru = { workspace = true }
+
+# TLS certificate loading
+rustls-pemfile = { workspace = true }
+
+# Async trait support (for StorageEngine trait impl in tests)
+async-trait = "0.1"
+
+# Storage engine (for replica write handler)
+s4-core = { path = "../s4-core" }
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["test-util", "macros"] }
+
+[lints]
+workspace = true

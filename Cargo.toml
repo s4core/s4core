@@ -6,6 +6,9 @@ members = [
     "s4-compactor",
     "s4-server",
     "s4-select",
+    "s4-cluster",
+    "ee/s4-ee-license",
+    "ee/s4-ee",
 ]
 resolver = "2"
 
@@ -68,6 +71,21 @@ fjall = "3"
 anyhow = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# gRPC (inter-node communication)
+tonic = { version = "0.12", features = ["tls"] }
+prost = "0.13"
+prost-types = "0.13"
+
+# Concurrent collections
+dashmap = "6"
+
+# LRU cache
+lru = "0.12"
+
+# Crypto (license validation)
+ed25519-dalek = { version = "2", features = ["serde"] }
+base64 = "0.22"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

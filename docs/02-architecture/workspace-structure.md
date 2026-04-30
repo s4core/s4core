@@ -1,6 +1,6 @@
 # Workspace Structure
 
-S4 is organized as a Cargo workspace with five crates, each with a clear responsibility.
+S4 is organized as a Cargo workspace with six crates, each with a clear responsibility.
 
 ## Crate Overview
 
@@ -9,8 +9,11 @@ s4core/
 +-- s4-core/       # Storage engine (volumes, metadata, dedup, crash recovery)
 +-- s4-api/        # HTTP API and S3 compatibility (handlers, auth, middleware)
 +-- s4-features/   # Advanced features (lifecycle, object lock, IAM)
++-- s4-cluster/    # Distributed mode (gossip, gRPC, quorum, placement)
 +-- s4-compactor/  # Background garbage collection and volume compaction
++-- s4-select/     # SQL query engine for stored objects (DataFusion)
 +-- s4-server/     # Main binary, configuration, startup
++-- ee/            # Enterprise Edition features (Elastic License 2.0)
 ```
 
 ## Dependency Graph
@@ -21,7 +24,11 @@ s4-server
   |     +-- s4-core
   |     +-- s4-features
   |           +-- s4-core
+  +-- s4-cluster
+  |     +-- s4-core
   +-- s4-compactor
+  |     +-- s4-core
+  +-- s4-select
         +-- s4-core
 ```
 
@@ -67,6 +74,25 @@ Business logic for advanced features that build on top of s4-core.
 - `lifecycle/` — Lifecycle policy types, XML parsing, rule evaluation
 - `object_lock/` — Object Lock types and XML handling
 - `iam/` — User management, JWT authentication, RBAC
+
+### s4-cluster
+
+The distributed mode layer. Provides everything needed to run S4 as a multi-node cluster with leaderless quorum replication.
+
+**Key modules:**
+- `identity.rs` — Persistent node identity (UUID) and node metadata types
+- `config.rs` — Declarative cluster and pool configuration with quorum validation
+- `gossip.rs` — SWIM gossip via `foca` for membership and failure detection
+- `rpc/` — gRPC server and client for inter-node communication (protobuf)
+- `placement/` — Data placement: bucket-to-pool mapping, hash ring, full replication
+- `coordinator/` — Quorum write, quorum read, and distributed LIST coordination
+- `replica/` — Local write/read handlers for incoming replica requests
+- `repair/` — Async read repair for stale replicas
+- `hints/` — Hinted handoff for temporarily offline nodes
+- `hlc.rs` — Hybrid Logical Clock for causal ordering
+- `idempotency.rs` — Operation deduplication via LRU cache + journal
+- `capability.rs` — CE/EE feature limits (pools, nodes per pool)
+- `traits.rs` — Extension traits for EE features (audit, deep scrub, rolling upgrades)
 
 ### s4-compactor
 

@@ -31,8 +31,13 @@
 //! ```
 
 use crate::s3::errors::S3Error;
-use axum::http::HeaderMap;
+use axum::{body::Bytes, http::HeaderMap};
+use std::{fmt, io};
+use tokio_stream::{wrappers::ReceiverStream, Stream, StreamExt};
 use tracing::{debug, warn};
+
+const MAX_AWS_CHUNK_HEADER_LEN: usize = 16 * 1024;
+const STREAM_EMIT_CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Checks if the request uses AWS chunked encoding.
 ///
@@ -162,23 +167,267 @@ pub fn decode_aws_chunked(data: &[u8]) -> Result<Vec<u8>, S3Error> {
     Ok(result)
 }
 
+/// Returns the expected decoded payload length from `x-amz-decoded-content-length`.
+pub fn decoded_content_length(headers: &HeaderMap) -> Result<Option<u64>, S3Error> {
+    let Some(expected) = headers.get("x-amz-decoded-content-length") else {
+        return Ok(None);
+    };
+
+    let expected = expected.to_str().map_err(|_| {
+        S3Error::InvalidRequest("Invalid x-amz-decoded-content-length header".to_string())
+    })?;
+    expected.parse::<u64>().map(Some).map_err(|_| {
+        S3Error::InvalidRequest("Invalid x-amz-decoded-content-length header".to_string())
+    })
+}
+
+/// Decodes AWS chunked data as a stream without buffering the whole payload.
+///
+/// The returned stream yields decoded data chunks and reports malformed chunk
+/// framing as `io::ErrorKind::InvalidData`. Callers that must know the exact
+/// target size should pass the decoded length from
+/// `x-amz-decoded-content-length`.
+pub fn decode_aws_chunked_stream<S, E>(
+    stream: S,
+    expected_len: Option<u64>,
+) -> ReceiverStream<Result<Bytes, io::Error>>
+where
+    S: Stream<Item = Result<Bytes, E>> + Send + 'static,
+    E: fmt::Display + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+
+    tokio::spawn(async move {
+        let mut decoder = AwsChunkedStreamDecoder::new(expected_len);
+        tokio::pin!(stream);
+
+        while let Some(item) = stream.next().await {
+            let bytes = match item {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(io::Error::other(format!(
+                            "error reading aws-chunked body: {e}"
+                        ))))
+                        .await;
+                    return;
+                }
+            };
+
+            match decoder.push(bytes, &tx).await {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(e) => {
+                    let _ = tx.send(Err(e)).await;
+                    return;
+                }
+            }
+        }
+
+        if let Err(e) = decoder.finish() {
+            let _ = tx.send(Err(e)).await;
+        }
+    });
+
+    ReceiverStream::new(rx)
+}
+
 /// Validates that the decoded body length matches the `x-amz-decoded-content-length` header.
 ///
 /// Returns `Ok(())` if the header is absent or the lengths match.
 /// Returns `Err(S3Error::InvalidRequest)` if the lengths mismatch.
 pub fn validate_decoded_content_length(headers: &HeaderMap, decoded: &[u8]) -> Result<(), S3Error> {
-    if let Some(expected) = headers.get("x-amz-decoded-content-length") {
-        if let Ok(expected_len) = expected.to_str().unwrap_or("0").parse::<usize>() {
-            if decoded.len() != expected_len {
-                return Err(S3Error::InvalidRequest(format!(
-                    "Decoded length {} != expected {}",
-                    decoded.len(),
-                    expected_len
-                )));
-            }
+    if let Some(expected_len) = decoded_content_length(headers)? {
+        if decoded.len() as u64 != expected_len {
+            return Err(S3Error::InvalidRequest(format!(
+                "Decoded length {} != expected {}",
+                decoded.len(),
+                expected_len
+            )));
         }
     }
     Ok(())
+}
+
+#[derive(Debug)]
+enum DecodeState {
+    ReadingSize,
+    ReadingData { remaining: u64 },
+    ReadingDataLineEnding,
+    Done,
+}
+
+struct AwsChunkedStreamDecoder {
+    state: DecodeState,
+    pending: Vec<u8>,
+    decoded_len: u64,
+    expected_len: Option<u64>,
+}
+
+impl AwsChunkedStreamDecoder {
+    fn new(expected_len: Option<u64>) -> Self {
+        Self {
+            state: DecodeState::ReadingSize,
+            pending: Vec::new(),
+            decoded_len: 0,
+            expected_len,
+        }
+    }
+
+    async fn push(
+        &mut self,
+        bytes: Bytes,
+        tx: &tokio::sync::mpsc::Sender<Result<Bytes, io::Error>>,
+    ) -> io::Result<bool> {
+        if matches!(self.state, DecodeState::Done) {
+            return Ok(true);
+        }
+
+        self.pending.extend_from_slice(&bytes);
+        self.process_pending(tx).await
+    }
+
+    async fn process_pending(
+        &mut self,
+        tx: &tokio::sync::mpsc::Sender<Result<Bytes, io::Error>>,
+    ) -> io::Result<bool> {
+        loop {
+            match self.state {
+                DecodeState::ReadingSize => {
+                    let Some((line_end, crlf_len)) = find_line_end(&self.pending, 0) else {
+                        if self.pending.len() > MAX_AWS_CHUNK_HEADER_LEN {
+                            return Err(invalid_data(
+                                "Invalid aws-chunked encoding: chunk header too large",
+                            ));
+                        }
+                        return Ok(true);
+                    };
+
+                    let chunk_size = parse_chunk_size(&self.pending[..line_end])?;
+                    self.pending.drain(..line_end + crlf_len);
+
+                    if chunk_size == 0 {
+                        self.validate_final_length()?;
+                        self.pending.clear();
+                        self.state = DecodeState::Done;
+                        return Ok(true);
+                    }
+
+                    self.state = DecodeState::ReadingData {
+                        remaining: chunk_size,
+                    };
+                }
+                DecodeState::ReadingData { remaining } => {
+                    if remaining == 0 {
+                        self.state = DecodeState::ReadingDataLineEnding;
+                        continue;
+                    }
+                    if self.pending.is_empty() {
+                        return Ok(true);
+                    }
+
+                    let take_u64 =
+                        remaining.min(self.pending.len() as u64).min(STREAM_EMIT_CHUNK_SIZE as u64);
+                    let take = take_u64 as usize;
+                    let next_len = self.decoded_len + take_u64;
+                    if let Some(expected) = self.expected_len {
+                        if next_len > expected {
+                            return Err(invalid_data(format!(
+                                "Decoded length exceeds expected {expected}"
+                            )));
+                        }
+                    }
+
+                    let out = Bytes::copy_from_slice(&self.pending[..take]);
+                    self.pending.drain(..take);
+                    self.decoded_len = next_len;
+                    self.state = DecodeState::ReadingData {
+                        remaining: remaining - take_u64,
+                    };
+
+                    if tx.send(Ok(out)).await.is_err() {
+                        return Ok(false);
+                    }
+                }
+                DecodeState::ReadingDataLineEnding => {
+                    if self.pending.is_empty() {
+                        return Ok(true);
+                    }
+                    if self.pending[0] == b'\n' {
+                        self.pending.drain(..1);
+                        self.state = DecodeState::ReadingSize;
+                        continue;
+                    }
+                    if self.pending[0] == b'\r' {
+                        if self.pending.len() == 1 {
+                            return Ok(true);
+                        }
+                        if self.pending[1] == b'\n' {
+                            self.pending.drain(..2);
+                            self.state = DecodeState::ReadingSize;
+                            continue;
+                        }
+                    }
+                    return Err(invalid_data(
+                        "Invalid aws-chunked encoding: missing chunk data line ending",
+                    ));
+                }
+                DecodeState::Done => return Ok(true),
+            }
+        }
+    }
+
+    fn finish(&self) -> io::Result<()> {
+        match self.state {
+            DecodeState::Done => Ok(()),
+            DecodeState::ReadingSize if self.pending.is_empty() => Err(invalid_data(
+                "Invalid aws-chunked encoding: missing final chunk",
+            )),
+            DecodeState::ReadingSize => Err(invalid_data(
+                "Invalid aws-chunked encoding: truncated chunk header",
+            )),
+            DecodeState::ReadingData { .. } => Err(invalid_data(
+                "Invalid aws-chunked encoding: truncated chunk data",
+            )),
+            DecodeState::ReadingDataLineEnding => Err(invalid_data(
+                "Invalid aws-chunked encoding: missing chunk data line ending",
+            )),
+        }
+    }
+
+    fn validate_final_length(&self) -> io::Result<()> {
+        if let Some(expected) = self.expected_len {
+            if self.decoded_len != expected {
+                return Err(invalid_data(format!(
+                    "Decoded length {} != expected {}",
+                    self.decoded_len, expected
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parse_chunk_size(line: &[u8]) -> io::Result<u64> {
+    let size_line = std::str::from_utf8(line)
+        .map_err(|_| invalid_data("Invalid aws-chunked encoding: chunk size is not UTF-8"))?;
+    let size_part = size_line.split(';').next().unwrap_or(size_line).trim();
+
+    if size_part.is_empty() {
+        return Err(invalid_data(
+            "Invalid aws-chunked encoding: missing chunk size",
+        ));
+    }
+
+    u64::from_str_radix(size_part, 16).map_err(|_| {
+        invalid_data(format!(
+            "Invalid aws-chunked encoding: invalid chunk size '{size_part}'"
+        ))
+    })
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
 /// Finds the end of a line (before \r\n or \n).
@@ -199,6 +448,7 @@ fn find_line_end(data: &[u8], start: usize) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_stream::StreamExt;
 
     #[test]
     fn test_decode_single_chunk() {
@@ -321,5 +571,56 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
         assert!(!is_aws_chunked(&headers));
+    }
+
+    async fn collect_streamed_decode(
+        chunks: Vec<&'static [u8]>,
+        expected_len: Option<u64>,
+    ) -> Result<Vec<u8>, io::Error> {
+        let stream = tokio_stream::iter(
+            chunks
+                .into_iter()
+                .map(|chunk| Ok::<Bytes, io::Error>(Bytes::from_static(chunk))),
+        );
+        let mut decoded = decode_aws_chunked_stream(stream, expected_len);
+        let mut out = Vec::new();
+        while let Some(item) = decoded.next().await {
+            out.extend_from_slice(&item?);
+        }
+        Ok(out)
+    }
+
+    #[tokio::test]
+    async fn test_stream_decode_split_boundaries() {
+        let decoded = collect_streamed_decode(
+            vec![
+                b"5\r",
+                b"\nhe",
+                b"llo\r\n6;chunk-signature=abc123\r\n wo",
+                b"rld\r\n0\r\nx-amz-checksum-crc32:sOO8/Q==\r\n\r\n",
+            ],
+            Some(11),
+        )
+        .await
+        .unwrap();
+        assert_eq!(decoded, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_stream_decode_expected_length_mismatch() {
+        let err = collect_streamed_decode(vec![b"5\r\nhello\r\n0\r\n\r\n"], Some(6))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Decoded length 5 != expected 6"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_decode_invalid_line_ending() {
+        let err = collect_streamed_decode(vec![b"5\r\nhelloX0\r\n\r\n"], Some(5))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("missing chunk data line ending"));
     }
 }

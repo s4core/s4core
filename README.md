@@ -21,7 +21,8 @@ S4 is a high-performance, S3-compatible object storage server written in Rust. I
 - **IAM & Admin API**: Role-based access control (Reader, Writer, SuperUser) with JWT authentication
 - **S3 Select SQL**: Query CSV/JSON/Parquet objects with full SQL (powered by Apache DataFusion)
 - **Multi-Object SQL**: Extended S3 Select with glob patterns for querying across multiple objects
-- **High Performance**: Optimized for single-node performance
+- **Federation**: Leaderless quorum replication for high availability (N=3, W=2, R=2)
+- **High Performance**: Optimized for single-node and distributed deployments
 
 ## Architecture
 
@@ -59,12 +60,23 @@ cargo build --release
 
 ### Docker
 
-S4 provides official Docker images for easy deployment.
+S4 provides official Docker images for easy deployment in two editions:
+
+| Image Tag | Edition | Description |
+|-----------|---------|-------------|
+| `s4core/s4core:latest` | CE | Community Edition (recommended default) |
+| `s4core/s4core:v0.0.8` | CE | CE with version tag |
+| `s4core/s4core:ce` | CE | Explicit CE alias (same as `latest`) |
+| `s4core/s4core:ce-v0.0.8` | CE | CE with version (explicit) |
+| `s4core/s4core:ee` | EE | Enterprise Edition (requires license key) |
+| `s4core/s4core:ee-v0.0.8` | EE | EE with version |
+
+**CE** is fully functional: single node or up to 3-node cluster with quorum replication. **EE** unlocks unlimited pools/nodes and operational features — see [ee/README.md](ee/README.md).
 
 #### Using `docker run`
 
 ```bash
-# Run S4 server (basic)
+# Run S4 server (basic — Community Edition)
 docker run -d \
   --name s4core \
   -p 9000:9000 \
@@ -91,8 +103,18 @@ docker run -d \
   -e S4_ROOT_PASSWORD=password12345 \
   s4core/s4core:latest
 
+# Run Enterprise Edition (with license key)
+docker run -d \
+  --name s4core \
+  -p 9000:9000 \
+  -v s4-data:/data \
+  -e S4_BIND=0.0.0.0:9000 \
+  -e S4_LICENSE_KEY=your-license-key-here \
+  s4core/s4core:ee
+
 # Build the image locally
-docker build -t s4-server .
+docker build -t s4-server .                              # CE
+docker build --build-arg EDITION=ee -t s4-server-ee .    # EE
 ```
 
 #### Using Docker Compose
@@ -165,15 +187,33 @@ S4 is configured through environment variables:
 | `S4_LIFECYCLE_INTERVAL_HOURS` | Lifecycle evaluation interval (hours) | `24` | `1`, `6`, `24`, `168` |
 | `S4_LIFECYCLE_DRY_RUN` | Dry-run mode (log without deleting) | `false` | `true`, `false`, `1`, `0` |
 | `S4_COMPACTION_ENABLED` | Enable volume compaction worker | `true` | `true`, `false`, `1`, `0` |
-| `S4_COMPACTION_INTERVAL_HOURS` | Compaction check interval (hours) | `6` | `1`, `6`, `12`, `24` |
+| `S4_COMPACTION_INTERVAL_HOURS` | Compaction check interval (hours) | `1` | `1`, `6`, `12`, `24` |
 | `S4_COMPACTION_THRESHOLD` | Min fragmentation ratio to compact | `0.3` | `0.1`–`0.9` |
 | `S4_COMPACTION_DRY_RUN` | Analyze without compacting | `false` | `true`, `false`, `1`, `0` |
+| `S4_COMPACTION_FULL_TIME` | Daily full compaction time (HH:MM, local time) | `02:00` | `03:30`, `""` (disable) |
 | `S4_MULTIPART_UPLOAD_TTL_HOURS` | TTL for abandoned multipart uploads (hours) | `24` | `1`, `48` |
 | `S4_COMPACTION_MULTIPART_TTL_SECS` | *Dev/testing only.* Overrides multipart TTL for compactor in seconds | None | `1`, `60` |
 | `S4_METRICS_ENABLED` | Prometheus metrics | true) | false |
 | `S4_SELECT_ENABLED` | Enable/disable S3 Select SQL engine | `true` | `false` |
 | `S4_SELECT_MAX_MEMORY` | Per-query memory limit for SQL engine | `256MB` | `512MB`, `1GB` |
 | `S4_SELECT_TIMEOUT` | SQL query timeout (seconds) | `60` | `120` |
+| **Federation** | | | |
+| `S4_MODE` | Operating mode: `single`, `cluster`, `gateway` | `single` | `cluster` |
+| `S4_CLUSTER_NAME` | Cluster name for network isolation | `default` | `production` |
+| `S4_NODE_ID` | Human-readable node name | Auto | `node-1` |
+| `S4_NODE_GRPC_ADDR` | gRPC address for inter-node communication | — | `10.0.1.1:9100` |
+| `S4_NODE_HTTP_ADDR` | HTTP address advertised to cluster | — | `10.0.1.1:9000` |
+| `S4_SEEDS` | Comma-separated seed gRPC addresses | — | `10.0.1.1:9100,10.0.1.2:9100` |
+| `S4_POOL_NAME` | Pool this node belongs to | — | `pool-1` |
+| `S4_POOL_NODES` | Pool members (`id:addr,...`) | — | `node-1:10.0.1.1:9100,...` |
+| `S4_REPLICATION_FACTOR` | Replication factor (N) | `3` | `3` |
+| `S4_WRITE_QUORUM` | Write quorum (W) | `2` | `2` |
+| `S4_READ_QUORUM` | Read quorum (R) | `2` | `2` |
+| `S4_GC_GRACE_DAYS` | Tombstone GC grace period (days) | `7` | `7` |
+| `S4_MAX_REJOIN_DOWNTIME_DAYS` | Max offline before full bootstrap | `3` | `3` |
+| `S4_ANTI_ENTROPY_INTERVAL_SECS` | Merkle tree exchange interval (s) | `600` | `600` |
+| `S4_SCRUBBER_FULL_SCAN_DAYS` | CRC32 scrub cycle (days) | `30` | `30` |
+| `S4_HINT_TTL_HOURS` | Hinted handoff TTL (hours) | `3` | `3` |
 
 **Size format**: Supports `GB`/`G`, `MB`/`M`, `KB`/`K`, or bytes (no suffix).
 
@@ -451,6 +491,41 @@ curl -X POST "http://localhost:9000/mybucket?sql" \
 
 Full SQL support includes `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`, `JOIN`, window functions, CTEs, and aggregate functions.
 
+### Federation (Distributed Mode)
+
+S4 supports leaderless quorum replication for high availability. A cluster is composed of **server pools** — immutable groups of nodes that replicate data among themselves.
+
+**Key properties:**
+- Any node can serve any S3 request (no single leader)
+- Default quorum: N=3, W=2, R=2 — tolerates 1 node failure
+- SWIM gossip for failure detection, gRPC for data replication
+- Buckets are pinned to pools; horizontal scaling = adding new pools
+- HLC + LWW conflict resolution (deterministic, no coordination)
+- Anti-entropy via Merkle trees (background repair every 10 min)
+- Distributed tombstone GC with zombie resurrection protection
+- Bit rot detection and auto-healing from replicas
+- Rolling upgrades, graceful shutdown, admin API for cluster ops
+
+**Quick start (3-node cluster):**
+
+```bash
+# Node 1
+S4_MODE=cluster \
+S4_NODE_ID=node-1 \
+S4_NODE_GRPC_ADDR=10.0.1.1:9100 \
+S4_NODE_HTTP_ADDR=10.0.1.1:9000 \
+S4_SEEDS=10.0.1.1:9100,10.0.1.2:9100,10.0.1.3:9100 \
+S4_POOL_NAME=pool-1 \
+S4_POOL_NODES=node-1:10.0.1.1:9100,node-2:10.0.1.2:9100,node-3:10.0.1.3:9100 \
+S4_ACCESS_KEY_ID=myaccesskey \
+S4_SECRET_ACCESS_KEY=mysecretkey \
+./s4-server
+
+# Node 2 and 3: same config, different S4_NODE_ID and S4_NODE_*_ADDR
+```
+
+For detailed architecture, Docker Compose examples, and configuration reference, see [docs/04-features/federation.md](docs/04-features/federation.md).
+
 ### CORS Configuration
 
 S4 supports S3-compatible CORS (Cross-Origin Resource Sharing) for browser-based access.
@@ -541,12 +616,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
 ## License
 
-Licensed under either of:
+- **Community Edition (CE)**: Apache License 2.0 — all code outside `ee/` directory
+- **Enterprise Edition (EE)**: Elastic License 2.0 — code inside `ee/` directory
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
-
-at your option.
+EE source code is available for audit. Using EE features in production requires a valid license key. See [ee/README.md](ee/README.md) for details.
 
 ## Status
 

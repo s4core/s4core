@@ -30,9 +30,10 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::Engine;
+use s4_cluster::ClusterError;
 use s4_core::StorageEngine;
 use serde::Deserialize;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::handlers::get_bucket_versioning_status;
 use crate::handlers::object_lock::is_bypass_governance;
@@ -164,84 +165,160 @@ pub async fn create_bucket(
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    // Create bucket marker (this tracks bucket existence)
-    let storage = state.storage.read().await;
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
+    let empty_meta = std::collections::HashMap::new();
 
-    // Check if marker exists
-    if storage.head_object("__system__", &bucket_marker_key).await.is_ok() {
-        return S3Error::BucketAlreadyExists.into_response();
-    }
-    drop(storage);
-
-    // Create the bucket marker
-    let storage = state.storage.read().await;
-    if let Err(e) = storage
-        .put_object(
-            "__system__",
-            &bucket_marker_key,
-            b"1",
-            "application/octet-stream",
-            &std::collections::HashMap::new(),
-        )
-        .await
-    {
-        error!("Failed to create bucket marker: {:?}", e);
-        return S3Error::InternalError("Failed to create bucket".to_string()).into_response();
-    }
-
-    // If Object Lock requested, enable versioning and Object Lock atomically
-    if object_lock_enabled {
-        info!(
-            "Enabling Object Lock (with versioning) on bucket: {}",
-            bucket
-        );
-
-        // Enable versioning (required for Object Lock)
-        let versioning_key = format!("__s4_bucket_versioning_{}", bucket);
-        if let Err(e) = storage
-            .put_object(
-                "__system__",
-                &versioning_key,
-                b"Enabled",
-                "text/plain",
-                &std::collections::HashMap::new(),
-            )
-            .await
-        {
-            error!("Failed to enable versioning for Object Lock: {:?}", e);
-            return S3Error::InternalError(
-                "Failed to enable versioning for Object Lock".to_string(),
-            )
-            .into_response();
+    // ── Cluster mode: replicate bucket metadata via quorum write ──
+    if let Some(ref write_coord) = state.write_coordinator {
+        // Check existence via quorum read for cluster-wide consistency
+        if let Some(ref read_coord) = state.read_coordinator {
+            match read_coord.head("__system__", &bucket_marker_key).await {
+                Ok(_) => return S3Error::BucketAlreadyExists.into_response(),
+                Err(s4_cluster::ClusterError::ObjectNotFound { .. }) => { /* proceed */ }
+                Err(e) => {
+                    error!("Cluster head check for bucket marker failed: {:?}", e);
+                    return super::cluster_error_to_response(&e);
+                }
+            }
         }
 
-        // Enable Object Lock
-        let lock_config = ObjectLockConfiguration {
-            object_lock_enabled: true,
-            default_retention: None,
-        };
-        let lock_key = format!("__s4_bucket_object_lock_{}", bucket);
-        let lock_xml = object_lock_to_xml(&lock_config);
-        if let Err(e) = storage
-            .put_object(
+        // Write bucket marker to W replicas
+        if let Err(e) = write_coord
+            .write(
                 "__system__",
-                &lock_key,
-                lock_xml.as_bytes(),
-                "application/xml",
-                &std::collections::HashMap::new(),
+                &bucket_marker_key,
+                b"1",
+                "application/octet-stream",
+                &empty_meta,
             )
             .await
         {
-            error!("Failed to enable Object Lock: {:?}", e);
-            return S3Error::InternalError("Failed to enable Object Lock".to_string())
+            error!("Failed to replicate bucket marker: {:?}", e);
+            return super::cluster_error_to_response(&e);
+        }
+
+        // If Object Lock requested, replicate versioning + lock config.
+        // NOTE: These writes are not atomic with the marker write above.
+        // If a config write fails, the bucket marker already exists on replicas.
+        // This mirrors S3's eventual consistency for bucket configuration and is
+        // acceptable: the client receives an error and can retry the configuration.
+        if object_lock_enabled {
+            info!(
+                "Enabling Object Lock (with versioning) on bucket: {}",
+                bucket
+            );
+
+            let versioning_key = format!("__s4_bucket_versioning_{}", bucket);
+            if let Err(e) = write_coord
+                .write(
+                    "__system__",
+                    &versioning_key,
+                    b"Enabled",
+                    "text/plain",
+                    &empty_meta,
+                )
+                .await
+            {
+                error!("Failed to replicate versioning config: {:?}", e);
+                return super::cluster_error_to_response(&e);
+            }
+
+            let lock_config = ObjectLockConfiguration {
+                object_lock_enabled: true,
+                default_retention: None,
+            };
+            let lock_key = format!("__s4_bucket_object_lock_{}", bucket);
+            let lock_xml = object_lock_to_xml(&lock_config);
+            if let Err(e) = write_coord
+                .write(
+                    "__system__",
+                    &lock_key,
+                    lock_xml.as_bytes(),
+                    "application/xml",
+                    &empty_meta,
+                )
+                .await
+            {
+                error!("Failed to replicate Object Lock config: {:?}", e);
+                return super::cluster_error_to_response(&e);
+            }
+
+            info!("Object Lock enabled on bucket: {}", bucket);
+        }
+
+        info!("Bucket created (cluster): {}", bucket);
+    } else {
+        // ── Standalone mode: local storage ──
+        let storage = state.storage.read().await;
+
+        if storage.head_object("__system__", &bucket_marker_key).await.is_ok() {
+            return S3Error::BucketAlreadyExists.into_response();
+        }
+
+        if let Err(e) = storage
+            .put_object(
+                "__system__",
+                &bucket_marker_key,
+                b"1",
+                "application/octet-stream",
+                &empty_meta,
+            )
+            .await
+        {
+            error!("Failed to create bucket marker: {:?}", e);
+            return S3Error::InternalError("Failed to create bucket".to_string()).into_response();
+        }
+
+        if object_lock_enabled {
+            info!(
+                "Enabling Object Lock (with versioning) on bucket: {}",
+                bucket
+            );
+
+            let versioning_key = format!("__s4_bucket_versioning_{}", bucket);
+            if let Err(e) = storage
+                .put_object(
+                    "__system__",
+                    &versioning_key,
+                    b"Enabled",
+                    "text/plain",
+                    &empty_meta,
+                )
+                .await
+            {
+                error!("Failed to enable versioning for Object Lock: {:?}", e);
+                return S3Error::InternalError(
+                    "Failed to enable versioning for Object Lock".to_string(),
+                )
                 .into_response();
+            }
+
+            let lock_config = ObjectLockConfiguration {
+                object_lock_enabled: true,
+                default_retention: None,
+            };
+            let lock_key = format!("__s4_bucket_object_lock_{}", bucket);
+            let lock_xml = object_lock_to_xml(&lock_config);
+            if let Err(e) = storage
+                .put_object(
+                    "__system__",
+                    &lock_key,
+                    lock_xml.as_bytes(),
+                    "application/xml",
+                    &empty_meta,
+                )
+                .await
+            {
+                error!("Failed to enable Object Lock: {:?}", e);
+                return S3Error::InternalError("Failed to enable Object Lock".to_string())
+                    .into_response();
+            }
+
+            info!("Object Lock enabled on bucket: {}", bucket);
         }
 
-        info!("Object Lock enabled on bucket: {}", bucket);
+        info!("Bucket created: {}", bucket);
     }
-
-    info!("Bucket created: {}", bucket);
 
     // S3 CreateBucket returns empty body with Location header
     Response::builder()
@@ -266,41 +343,83 @@ pub async fn delete_bucket(
 ) -> impl IntoResponse {
     info!("DeleteBucket: {}", bucket);
 
-    let storage = state.storage.read().await;
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
 
-    // Check if bucket exists
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
-    }
-
-    // Check if bucket is empty (must have no objects, versions, or delete markers)
-    // Per S3 spec: all object versions AND delete markers must be removed before deletion
-    let objects = storage.list_objects(&bucket, "", 1).await;
-    if let Ok(list) = objects {
-        if !list.is_empty() {
-            return S3Error::BucketNotEmpty.into_response();
-        }
-    }
-
-    // Delete bucket marker
-    if let Err(e) = storage.delete_object("__system__", &bucket_marker_key).await {
-        error!("Failed to delete bucket marker: {:?}", e);
-        return S3Error::InternalError("Failed to delete bucket".to_string()).into_response();
-    }
-
-    // Clean up bucket configurations
     let config_keys = [
         format!("__s4_bucket_cors_{}", bucket),
         format!("__s4_bucket_versioning_{}", bucket),
         format!("__s4_bucket_lifecycle_{}", bucket),
         format!("__s4_bucket_policy_{}", bucket),
     ];
-    for key in &config_keys {
-        let _ = storage.delete_object("__system__", key).await;
+
+    // ── Cluster mode: quorum-replicated bucket deletion ──
+    if let Some(ref write_coord) = state.write_coordinator {
+        // Existence check via quorum read
+        if let Some(ref read_coord) = state.read_coordinator {
+            match read_coord.head("__system__", &bucket_marker_key).await {
+                Ok(_) => { /* bucket exists, proceed */ }
+                Err(ClusterError::ObjectNotFound { .. }) => {
+                    return S3Error::NoSuchBucket.into_response();
+                }
+                Err(e) => return super::cluster_error_to_response(&e),
+            }
+        }
+
+        // Emptiness check via distributed list
+        if let Some(ref list_coord) = state.list_coordinator {
+            match list_coord.list(&bucket, "", 1, None).await {
+                Ok(result) if !result.entries.is_empty() => {
+                    return S3Error::BucketNotEmpty.into_response();
+                }
+                Ok(_) => { /* empty, proceed */ }
+                Err(e) => {
+                    error!("Failed to check bucket emptiness: {:?}", e);
+                    return super::cluster_error_to_response(&e);
+                }
+            }
+        }
+
+        // Delete bucket marker via quorum
+        if let Err(e) = write_coord.delete("__system__", &bucket_marker_key).await {
+            error!("Failed to replicate bucket marker deletion: {:?}", e);
+            return super::cluster_error_to_response(&e);
+        }
+
+        // Clean up config keys (non-fatal — orphaned keys are harmless)
+        for key in &config_keys {
+            if let Err(e) = write_coord.delete("__system__", key).await {
+                debug!("Non-fatal: failed to delete config key {}: {:?}", key, e);
+            }
+        }
+
+        info!("Bucket deleted (cluster): {}", bucket);
+    } else {
+        // ── Standalone mode: local storage ──
+        let storage = state.storage.read().await;
+
+        if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
+            return S3Error::NoSuchBucket.into_response();
+        }
+
+        let objects = storage.list_objects(&bucket, "", 1).await;
+        if let Ok(list) = objects {
+            if !list.is_empty() {
+                return S3Error::BucketNotEmpty.into_response();
+            }
+        }
+
+        if let Err(e) = storage.delete_object("__system__", &bucket_marker_key).await {
+            error!("Failed to delete bucket marker: {:?}", e);
+            return S3Error::InternalError("Failed to delete bucket".to_string()).into_response();
+        }
+
+        for key in &config_keys {
+            let _ = storage.delete_object("__system__", key).await;
+        }
+
+        info!("Bucket deleted: {}", bucket);
     }
 
-    info!("Bucket deleted: {}", bucket);
     StatusCode::NO_CONTENT.into_response()
 }
 
@@ -314,19 +433,40 @@ pub async fn delete_bucket(
 pub async fn list_buckets(State(state): State<AppState>) -> impl IntoResponse {
     debug!("ListBuckets");
 
-    let storage = state.storage.read().await;
-
-    // List all bucket markers
-    let markers = storage.list_objects("__system__", "__s4_bucket_marker_", 1000).await;
-
-    let buckets: Vec<String> = match markers {
-        Ok(list) => list
-            .into_iter()
-            .filter_map(|(key, _)| key.strip_prefix("__s4_bucket_marker_").map(|s| s.to_string()))
-            .collect(),
-        Err(e) => {
-            error!("Failed to list buckets: {:?}", e);
-            Vec::new()
+    let buckets: Vec<String> = if let Some(ref list_coord) = state.list_coordinator {
+        // Cluster mode: distributed list of bucket markers across all nodes
+        match list_coord.list("__system__", "__s4_bucket_marker_", 1000, None).await {
+            Ok(result) => {
+                let mut names: Vec<String> = result
+                    .entries
+                    .iter()
+                    .filter_map(|e| e.key.strip_prefix("__s4_bucket_marker_").map(String::from))
+                    .collect();
+                // Deduplicate — scatter-gather may return the same marker from multiple nodes
+                names.sort();
+                names.dedup();
+                names
+            }
+            Err(e) => {
+                error!("Failed to list buckets (cluster): {:?}", e);
+                return super::cluster_error_to_response(&e);
+            }
+        }
+    } else {
+        // Standalone mode: local storage
+        let storage = state.storage.read().await;
+        let markers = storage.list_objects("__system__", "__s4_bucket_marker_", 1000).await;
+        match markers {
+            Ok(list) => list
+                .into_iter()
+                .filter_map(|(key, _)| {
+                    key.strip_prefix("__s4_bucket_marker_").map(|s| s.to_string())
+                })
+                .collect(),
+            Err(e) => {
+                error!("Failed to list buckets: {:?}", e);
+                Vec::new()
+            }
         }
     };
 
@@ -353,9 +493,19 @@ pub async fn head_bucket(
 ) -> impl IntoResponse {
     debug!("HeadBucket: {}", bucket);
 
-    let storage = state.storage.read().await;
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
 
+    // Cluster mode: quorum-consistent existence check
+    if let Some(ref read_coord) = state.read_coordinator {
+        return match read_coord.head("__system__", &bucket_marker_key).await {
+            Ok(_) => StatusCode::OK.into_response(),
+            Err(ClusterError::ObjectNotFound { .. }) => S3Error::NoSuchBucket.into_response(),
+            Err(e) => super::cluster_error_to_response(&e),
+        };
+    }
+
+    // Standalone mode: local check
+    let storage = state.storage.read().await;
     if storage.head_object("__system__", &bucket_marker_key).await.is_ok() {
         StatusCode::OK.into_response()
     } else {
@@ -377,15 +527,7 @@ pub async fn list_objects(
 ) -> impl IntoResponse {
     debug!("ListObjects: bucket={}, params={:?}", bucket, params);
 
-    let storage = state.storage.read().await;
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-
-    // Check if bucket exists
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
-    }
-
-    let prefix = params.prefix.unwrap_or_default();
+    let prefix = params.prefix.clone().unwrap_or_default();
     let max_keys = match &params.max_keys {
         Some(s) => match s.parse::<isize>() {
             Ok(n) if n >= 0 => (n as usize).min(1000),
@@ -399,16 +541,110 @@ pub async fn list_objects(
         None => 1000,
     };
 
-    // Determine start_after for pagination:
-    // - ListObjectsV2: use continuation-token (which is the last key from previous page)
-    //   or start-after parameter
-    // - ListObjects v1: use marker
     let is_v2 = params.list_type.as_deref() == Some("2");
     let start_after = if is_v2 {
         params.continuation_token.as_deref().or(params.start_after.as_deref())
     } else {
         params.marker.as_deref()
     };
+
+    // Cluster mode: use distributed list coordinator
+    if let Some(ref list_coord) = state.list_coordinator {
+        match list_coord.list(&bucket, &prefix, max_keys, start_after).await {
+            Ok(result) => {
+                // Convert DistributedListResult entries to (key, IndexRecord) for XML rendering
+                let objects: Vec<(String, s4_core::types::metadata::IndexRecord)> = result
+                    .entries
+                    .iter()
+                    .map(|entry| {
+                        let record = s4_core::types::metadata::IndexRecord {
+                            file_id: 0,
+                            offset: 0,
+                            size: entry.size,
+                            etag: entry.etag.clone(),
+                            content_type: entry.content_type.clone(),
+                            metadata: std::collections::HashMap::new(),
+                            content_hash: [0u8; 32],
+                            created_at: entry.hlc.wall_time * 1_000_000, // millis → nanos
+                            modified_at: entry.hlc.wall_time * 1_000_000, // millis → nanos
+                            version_id: entry.version_id.clone(),
+                            is_delete_marker: false,
+                            retention_mode: None,
+                            retain_until_timestamp: None,
+                            legal_hold: false,
+                            layout: None,
+                            pool_id: 0,
+                            hlc_timestamp: entry.hlc.wall_time,
+                            hlc_logical: entry.hlc.logical,
+                            origin_node_id: entry.hlc.node_id,
+                            operation_id: 0,
+                        };
+                        (entry.key.clone(), record)
+                    })
+                    .collect();
+
+                // TODO: cluster mode does not yet support delimiter/CommonPrefixes
+                let empty_prefixes: Vec<String> = Vec::new();
+                let xml_response = if is_v2 {
+                    xml::list_objects_v2_response(
+                        &bucket,
+                        &prefix,
+                        params.delimiter.as_deref(),
+                        max_keys,
+                        result.is_truncated,
+                        &objects,
+                        params.continuation_token.as_deref(),
+                        result.next_continuation_token.as_deref(),
+                        &empty_prefixes,
+                    )
+                } else {
+                    xml::list_objects_response(
+                        &bucket,
+                        &prefix,
+                        params.delimiter.as_deref(),
+                        params.marker.as_deref(),
+                        result.next_continuation_token.as_deref(),
+                        max_keys,
+                        result.is_truncated,
+                        &objects,
+                        &empty_prefixes,
+                    )
+                };
+
+                if result.nodes_responded < result.nodes_queried {
+                    warn!(
+                        "ListObjects: {}/{} nodes responded for bucket={}",
+                        result.nodes_responded, result.nodes_queried, bucket
+                    );
+                }
+
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/xml")
+                    .body(Body::from(xml_response))
+                    .unwrap();
+            }
+            Err(s4_cluster::ClusterError::Placement(msg)) if msg.contains("no pool") => {
+                return S3Error::NoSuchBucket.into_response();
+            }
+            Err(e) => {
+                error!("Distributed list failed: {:?}", e);
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Cluster error: {}", e),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Standalone mode: local storage
+    let storage = state.storage.read().await;
+
+    // Check if bucket exists (standalone path — cluster mode returned above)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
+    }
 
     // Filter out empty delimiter — empty string matches at every position via str::find("")
     let delimiter = params.delimiter.as_deref().filter(|d| !d.is_empty());
@@ -424,6 +660,9 @@ pub async fn list_objects(
         // a single CommonPrefix, so we fetch in batches.
         let mut cp_set = std::collections::BTreeSet::new();
         let mut contents: Vec<(String, s4_core::IndexRecord)> = Vec::new();
+        // Track seen content keys to avoid duplicates across batches
+        // (version-stripped keys from different batches can produce the same clean key)
+        let mut seen_content_keys = std::collections::HashSet::<String>::new();
         // Use raw storage key as cursor to avoid infinite loop:
         // stripped keys (without version IDs) sort before their raw counterparts,
         // so list_objects_after with a stripped key would re-fetch the same objects.
@@ -474,7 +713,7 @@ pub async fn list_objects(
                 if let Some(pos) = after_prefix.find(delim) {
                     let cp = format!("{}{}", prefix, &after_prefix[..pos + delim.len()]);
                     cp_set.insert(cp);
-                } else {
+                } else if seen_content_keys.insert(key.clone()) {
                     contents.push((key, record));
                 }
 
@@ -510,10 +749,31 @@ pub async fn list_objects(
         is_truncated = found_truncated;
         objects = contents;
         common_prefixes = cp_set.into_iter().collect();
-        // Use the raw cursor (last storage key scanned) as pagination marker.
-        // Using a CommonPrefix like "D/" would cause infinite loops because
-        // list_objects_after("D/") returns "D/subkey" which collapses back into "D/".
-        next_marker = if is_truncated { cursor } else { None };
+        // When truncated, if the cursor falls within a common prefix range,
+        // advance it past all keys in that range. Otherwise, the next page
+        // would re-discover keys in the same prefix and emit duplicate prefixes.
+        // We append U+10FFFF (max Unicode codepoint) to the common prefix,
+        // which in UTF-8 byte ordering sorts after all practical keys within
+        // that prefix range, while still sorting before keys outside the range
+        // (e.g., "openclawbot-2/\u{10FFFF}" < "openclawbot-20").
+        next_marker = if is_truncated {
+            if let Some(ref cursor_val) = cursor {
+                let mut advanced = false;
+                for cp in &common_prefixes {
+                    if cursor_val.starts_with(cp.as_str()) {
+                        cursor = Some(format!("{}\u{10FFFF}", cp));
+                        advanced = true;
+                        break;
+                    }
+                }
+                if !advanced {
+                    // Cursor is not within a common prefix range; use as-is
+                }
+            }
+            cursor
+        } else {
+            None
+        };
     } else {
         // No delimiter — simple flat listing
         let fetch_limit = max_keys + 1;
@@ -625,11 +885,10 @@ pub async fn list_object_versions(
     }
 
     let storage = state.storage.read().await;
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
 
-    // Check if bucket exists
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     let prefix = params.prefix.unwrap_or_default();
@@ -751,10 +1010,9 @@ pub async fn delete_objects(
     let versioning_status = get_bucket_versioning_status(&state, &bucket).await;
     let storage = state.storage.read().await;
 
-    // Check bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     let bypass_governance = is_bypass_governance(&headers);
@@ -948,7 +1206,7 @@ fn strip_version_ids_from_keys(
 
     for (clean_key, mut versions) in grouped {
         // Sort by modified_at descending (newest first)
-        versions.sort_by(|a, b| b.1.modified_at.cmp(&a.1.modified_at));
+        versions.sort_by_key(|(_, record)| std::cmp::Reverse(record.modified_at));
 
         // Get the latest version (first after sorting)
         if let Some((_, latest_record)) = versions.first() {

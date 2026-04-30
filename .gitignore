@@ -34,6 +34,7 @@ cache/
 # Data directories (for local development)
 /data/
 /volumes/
+/s4-data-*/
 *.redb
 *.redb.lock
 

@@ -38,6 +38,193 @@ pub struct Config {
     pub compaction: CompactionConfig,
     /// Multipart upload cleanup configuration
     pub multipart: MultipartCleanupConfig,
+    /// Cluster mode configuration (Phase 10).
+    pub cluster: ClusterModeConfig,
+}
+
+/// Operating mode of the server.
+///
+/// Determined by the `S4_MODE` environment variable:
+/// - `single` (default): standalone server, no clustering
+/// - `cluster`: full cluster member with storage and quorum
+/// - `gateway`: stateless router that proxies to cluster nodes
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerMode {
+    /// Standalone server, no clustering. Existing deployments work unchanged.
+    #[default]
+    Single,
+    /// Cluster member with storage, gossip, gRPC, and quorum operations.
+    Cluster,
+    /// Stateless gateway that routes requests to cluster nodes (no local storage).
+    Gateway,
+}
+
+/// Cluster mode configuration, loaded from `S4_*` environment variables.
+///
+/// Only relevant when `mode == ServerMode::Cluster` or `ServerMode::Gateway`.
+/// In `Single` mode, all cluster fields are ignored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterModeConfig {
+    /// Operating mode (`S4_MODE`).
+    pub mode: ServerMode,
+
+    /// Cluster name for network isolation (`S4_CLUSTER_NAME`).
+    pub cluster_name: String,
+
+    /// Stable node identifier (`S4_NODE_ID`). Auto-generated on first run if not set.
+    pub node_id: Option<String>,
+
+    /// gRPC address for inter-node communication (`S4_NODE_GRPC_ADDR`).
+    pub grpc_addr: Option<String>,
+
+    /// HTTP address advertised to other nodes (`S4_NODE_HTTP_ADDR`).
+    pub http_addr: Option<String>,
+
+    /// Seed nodes for gossip discovery (`S4_SEEDS`, comma-separated).
+    pub seeds: Vec<String>,
+
+    /// Pool name this node belongs to (`S4_POOL_NAME`).
+    pub pool_name: Option<String>,
+
+    /// Pool node definitions (`S4_POOL_NODES`, format: `id:addr,id:addr,...`).
+    pub pool_nodes: Option<String>,
+
+    /// Replication factor (`S4_REPLICATION_FACTOR`, default: 3).
+    pub replication_factor: u8,
+
+    /// Write quorum size (`S4_WRITE_QUORUM`, default: 2).
+    pub write_quorum: u8,
+
+    /// Read quorum size (`S4_READ_QUORUM`, default: 2).
+    pub read_quorum: u8,
+
+    /// GC grace period in days (`S4_GC_GRACE_DAYS`, default: 7).
+    pub gc_grace_days: u32,
+
+    /// Maximum downtime (days) before a node must full-bootstrap (`S4_MAX_REJOIN_DOWNTIME_DAYS`).
+    pub max_rejoin_downtime_days: u32,
+
+    /// Anti-entropy interval in seconds (`S4_ANTI_ENTROPY_INTERVAL_SECS`, default: 600).
+    pub anti_entropy_interval_secs: u64,
+
+    /// Scrubber full-scan interval in days (`S4_SCRUBBER_FULL_SCAN_DAYS`, default: 30).
+    pub scrubber_full_scan_days: u32,
+
+    /// Hinted handoff TTL in hours (`S4_HINT_TTL_HOURS`, default: 3).
+    pub hint_ttl_hours: u32,
+
+    /// Drain timeout in seconds for graceful shutdown (`S4_DRAIN_TIMEOUT_SECS`, default: 30).
+    pub drain_timeout_secs: u64,
+}
+
+impl Default for ClusterModeConfig {
+    fn default() -> Self {
+        let mode = match std::env::var("S4_MODE").as_deref() {
+            Ok("cluster") => ServerMode::Cluster,
+            Ok("gateway") => ServerMode::Gateway,
+            _ => ServerMode::Single,
+        };
+
+        let seeds = std::env::var("S4_SEEDS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        Self {
+            mode,
+            cluster_name: std::env::var("S4_CLUSTER_NAME")
+                .unwrap_or_else(|_| "s4-cluster".to_string()),
+            node_id: std::env::var("S4_NODE_ID").ok(),
+            grpc_addr: std::env::var("S4_NODE_GRPC_ADDR").ok(),
+            http_addr: std::env::var("S4_NODE_HTTP_ADDR").ok(),
+            seeds,
+            pool_name: std::env::var("S4_POOL_NAME").ok(),
+            pool_nodes: std::env::var("S4_POOL_NODES").ok(),
+            replication_factor: std::env::var("S4_REPLICATION_FACTOR")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3),
+            write_quorum: std::env::var("S4_WRITE_QUORUM")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2),
+            read_quorum: std::env::var("S4_READ_QUORUM")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2),
+            gc_grace_days: std::env::var("S4_GC_GRACE_DAYS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(7),
+            max_rejoin_downtime_days: std::env::var("S4_MAX_REJOIN_DOWNTIME_DAYS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3),
+            anti_entropy_interval_secs: std::env::var("S4_ANTI_ENTROPY_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(600),
+            scrubber_full_scan_days: std::env::var("S4_SCRUBBER_FULL_SCAN_DAYS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30),
+            hint_ttl_hours: std::env::var("S4_HINT_TTL_HOURS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(3),
+            drain_timeout_secs: std::env::var("S4_DRAIN_TIMEOUT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30),
+        }
+    }
+}
+
+impl ClusterModeConfig {
+    /// Returns `true` if the server is running in cluster mode.
+    pub fn is_cluster(&self) -> bool {
+        self.mode == ServerMode::Cluster
+    }
+
+    /// Returns `true` if the server is running in gateway mode.
+    pub fn is_gateway(&self) -> bool {
+        self.mode == ServerMode::Gateway
+    }
+
+    /// Returns `true` if the server is running in single-node mode.
+    pub fn is_single(&self) -> bool {
+        self.mode == ServerMode::Single
+    }
+
+    /// Validate cluster-mode configuration.
+    ///
+    /// Returns an error if required fields are missing for cluster/gateway modes.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.mode {
+            ServerMode::Single => Ok(()),
+            ServerMode::Cluster => {
+                if self.seeds.is_empty() {
+                    return Err("S4_SEEDS is required in cluster mode".to_string());
+                }
+                if self.pool_name.is_none() {
+                    return Err("S4_POOL_NAME is required in cluster mode".to_string());
+                }
+                if self.pool_nodes.is_none() {
+                    return Err("S4_POOL_NODES is required in cluster mode".to_string());
+                }
+                Ok(())
+            }
+            ServerMode::Gateway => {
+                if self.seeds.is_empty() {
+                    return Err("S4_SEEDS is required in gateway mode".to_string());
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Server configuration.
@@ -240,6 +427,11 @@ pub struct CompactionConfig {
     /// Optional override in seconds — takes priority over `multipart_session_ttl_hours`.
     /// Intended for testing only (`S4_COMPACTION_MULTIPART_TTL_SECS`).
     pub multipart_session_ttl_secs_override: Option<u64>,
+    /// Daily full compaction time in "HH:MM" format (default: "02:00").
+    /// At this time the compactor runs with unlimited volumes (processes all).
+    /// Set to empty string to disable daily full compaction.
+    /// Can be set via `S4_COMPACTION_FULL_TIME` environment variable.
+    pub full_compaction_time: String,
 }
 
 /// Multipart upload cleanup worker configuration.
@@ -280,7 +472,7 @@ impl Default for CompactionConfig {
             interval_hours: std::env::var("S4_COMPACTION_INTERVAL_HOURS")
                 .ok()
                 .and_then(|s| s.parse().ok())
-                .unwrap_or(6),
+                .unwrap_or(1),
             fragmentation_threshold: std::env::var("S4_COMPACTION_THRESHOLD")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -295,6 +487,8 @@ impl Default for CompactionConfig {
             multipart_session_ttl_secs_override: std::env::var("S4_COMPACTION_MULTIPART_TTL_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok()),
+            full_compaction_time: std::env::var("S4_COMPACTION_FULL_TIME")
+                .unwrap_or_else(|_| "02:00".to_string()),
         }
     }
 }
@@ -392,6 +586,7 @@ impl Default for Config {
             lifecycle: LifecycleConfig::default(),
             compaction: CompactionConfig::default(),
             multipart: MultipartCleanupConfig::default(),
+            cluster: ClusterModeConfig::default(),
         }
     }
 }
@@ -513,5 +708,133 @@ mod tests {
         let result = tls.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("S4_TLS_KEY"));
+    }
+
+    // ----- Cluster mode config tests -----
+
+    #[test]
+    fn server_mode_default_is_single() {
+        std::env::remove_var("S4_MODE");
+        let config = ClusterModeConfig::default();
+        assert_eq!(config.mode, ServerMode::Single);
+        assert!(config.is_single());
+        assert!(!config.is_cluster());
+        assert!(!config.is_gateway());
+    }
+
+    #[test]
+    fn cluster_mode_validate_single_always_ok() {
+        let config = ClusterModeConfig {
+            mode: ServerMode::Single,
+            ..ClusterModeConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn cluster_mode_validate_requires_seeds() {
+        let config = ClusterModeConfig {
+            mode: ServerMode::Cluster,
+            seeds: vec![],
+            pool_name: Some("pool-1".into()),
+            pool_nodes: Some("node-1:10.0.1.1:9100".into()),
+            ..ClusterModeConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("S4_SEEDS"));
+    }
+
+    #[test]
+    fn cluster_mode_validate_requires_pool_name() {
+        let config = ClusterModeConfig {
+            mode: ServerMode::Cluster,
+            seeds: vec!["10.0.1.1:9100".into()],
+            pool_name: None,
+            pool_nodes: Some("node-1:10.0.1.1:9100".into()),
+            ..ClusterModeConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("S4_POOL_NAME"));
+    }
+
+    #[test]
+    fn cluster_mode_validate_requires_pool_nodes() {
+        let config = ClusterModeConfig {
+            mode: ServerMode::Cluster,
+            seeds: vec!["10.0.1.1:9100".into()],
+            pool_name: Some("pool-1".into()),
+            pool_nodes: None,
+            ..ClusterModeConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("S4_POOL_NODES"));
+    }
+
+    #[test]
+    fn cluster_mode_valid_config() {
+        let config = ClusterModeConfig {
+            mode: ServerMode::Cluster,
+            cluster_name: "production".into(),
+            seeds: vec!["10.0.1.1:9100".into(), "10.0.1.2:9100".into()],
+            pool_name: Some("pool-1".into()),
+            pool_nodes: Some(
+                "node-1:10.0.1.1:9100,node-2:10.0.1.2:9100,node-3:10.0.1.3:9100".into(),
+            ),
+            ..ClusterModeConfig::default()
+        };
+        assert!(config.validate().is_ok());
+        assert!(config.is_cluster());
+    }
+
+    #[test]
+    fn gateway_mode_validate_requires_seeds() {
+        let config = ClusterModeConfig {
+            mode: ServerMode::Gateway,
+            seeds: vec![],
+            ..ClusterModeConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("S4_SEEDS"));
+    }
+
+    #[test]
+    fn gateway_mode_valid_config() {
+        let config = ClusterModeConfig {
+            mode: ServerMode::Gateway,
+            seeds: vec!["10.0.1.1:9100".into()],
+            ..ClusterModeConfig::default()
+        };
+        assert!(config.validate().is_ok());
+        assert!(config.is_gateway());
+    }
+
+    #[test]
+    fn server_mode_serialization() {
+        assert_eq!(
+            serde_json::to_string(&ServerMode::Single).unwrap(),
+            "\"single\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ServerMode::Cluster).unwrap(),
+            "\"cluster\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ServerMode::Gateway).unwrap(),
+            "\"gateway\""
+        );
+    }
+
+    #[test]
+    fn cluster_defaults_match_plan() {
+        let config = ClusterModeConfig::default();
+        assert_eq!(config.replication_factor, 3);
+        assert_eq!(config.write_quorum, 2);
+        assert_eq!(config.read_quorum, 2);
+        assert_eq!(config.gc_grace_days, 7);
+        assert_eq!(config.max_rejoin_downtime_days, 3);
+        assert_eq!(config.anti_entropy_interval_secs, 600);
+        assert_eq!(config.scrubber_full_scan_days, 30);
+        assert_eq!(config.hint_ttl_hours, 3);
+        assert_eq!(config.drain_timeout_secs, 30);
     }
 }

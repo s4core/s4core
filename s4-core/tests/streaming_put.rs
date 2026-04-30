@@ -15,8 +15,9 @@
 //! Tests for `put_object_streaming` in the storage engine.
 
 use s4_core::storage::BitcaskStorageEngine;
-use s4_core::StorageEngine;
+use s4_core::{ReadOptions, StorageEngine};
 use std::collections::HashMap;
+use std::io::{Seek, SeekFrom, Write};
 use tempfile::TempDir;
 
 async fn create_engine() -> (BitcaskStorageEngine, TempDir) {
@@ -140,4 +141,47 @@ async fn test_streaming_put_large() {
     let (retrieved, _meta) = engine.get_object("test-bucket", "large.bin").await.unwrap();
     assert_eq!(retrieved.len(), data.len());
     assert_eq!(retrieved, data);
+}
+
+#[tokio::test]
+async fn test_streaming_read_detects_full_object_hash_mismatch() {
+    let (engine, tmp) = create_engine().await;
+
+    let size = 64 * 1024;
+    let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+    let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
+        Box::new(std::io::Cursor::new(data.clone()));
+
+    engine
+        .put_object_streaming(
+            "test-bucket",
+            "bitrot.bin",
+            reader,
+            data.len() as u64,
+            "application/octet-stream",
+            &HashMap::new(),
+            "etag-bitrot",
+        )
+        .await
+        .unwrap();
+
+    let volumes_dir = tmp.path().join("volumes");
+    let volume_path = std::fs::read_dir(volumes_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "dat"))
+        .unwrap();
+
+    let mut volume = std::fs::OpenOptions::new().write(true).open(volume_path).unwrap();
+    volume.seek(SeekFrom::End(-1)).unwrap();
+    volume.write_all(&[0xAA]).unwrap();
+    volume.sync_all().unwrap();
+
+    let err = engine
+        .open_object_stream("test-bucket", "bitrot.bin", ReadOptions { range: None })
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("Checksum mismatch"));
 }

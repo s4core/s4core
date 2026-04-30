@@ -291,13 +291,11 @@ pub fn parse_select_request(xml_bytes: &[u8]) -> Result<SelectRequest, SelectErr
                         csv_input_quote_char_set = false;
                         csv_output_quote_char_set = false;
                     }
-                    "ScanRange" => {
-                        if scan_start.is_some() || scan_end.is_some() {
-                            scan_range = Some(ScanRange {
-                                start: scan_start.take(),
-                                end: scan_end.take(),
-                            });
-                        }
+                    "ScanRange" if scan_start.is_some() || scan_end.is_some() => {
+                        scan_range = Some(ScanRange {
+                            start: scan_start.take(),
+                            end: scan_end.take(),
+                        });
                     }
                     _ => {}
                 }

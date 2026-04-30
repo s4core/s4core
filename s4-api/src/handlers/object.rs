@@ -28,6 +28,7 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use s4_cluster::ClusterError;
 use s4_core::{ReadOptions, StorageEngine};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -126,10 +127,9 @@ pub async fn put_object(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Extract content type
@@ -232,68 +232,95 @@ pub async fn put_object(
                 .map(|dt| dt.timestamp_nanos_opt().unwrap_or(0) as u64)
         });
 
-    // Store the object with versioning and optional default retention
-    match storage
-        .put_object_with_retention(
-            &bucket,
-            &key,
-            &body,
-            content_type,
-            &metadata,
-            versioning_status,
-            default_retention,
-        )
-        .await
-    {
-        Ok((etag, version_id)) => {
-            info!(
-                "Object stored: bucket={}, key={}, etag={}, version_id={:?}",
-                bucket, key, etag, version_id
-            );
-
-            // Apply per-object lock headers if provided
-            let needs_lock_update =
-                lock_legal_hold.is_some() || lock_mode.is_some() || lock_retain_until.is_some();
-
-            if needs_lock_update {
-                let vid = version_id.as_deref().unwrap_or("null");
-                if let Ok(mut record) = storage.head_object_version(&bucket, &key, vid).await {
-                    if let Some(hold) = lock_legal_hold {
-                        record.legal_hold = hold;
-                    }
-                    if let Some(mode) = lock_mode {
-                        record.retention_mode = Some(mode);
-                    }
-                    if let Some(retain_until) = lock_retain_until {
-                        record.retain_until_timestamp = Some(retain_until);
-                    }
-                    if let Err(e) = storage.update_object_metadata(&bucket, &key, vid, record).await
-                    {
-                        error!("Failed to apply object lock headers: {:?}", e);
-                    }
+    // Branch: cluster mode (quorum write) vs standalone (local storage)
+    let write_result: Result<(String, Option<String>), Response> =
+        if let Some(ref write_coord) = state.write_coordinator {
+            // Cluster mode: quorum write to W replicas
+            drop(storage); // Release read lock before coordinator call
+            match write_coord.write(&bucket, &key, &body, content_type, &metadata).await {
+                Ok(result) => {
+                    info!(
+                        "Quorum write: bucket={}, key={}, etag={}, acked={}/{}",
+                        bucket, key, result.etag, result.replicas_acked, result.replicas_total
+                    );
+                    Ok((result.etag, None))
+                }
+                Err(e) => {
+                    error!("Quorum write failed: {:?}", e);
+                    Err(cluster_error_to_response(&e))
                 }
             }
-
-            let mut builder = Response::builder()
-                .status(StatusCode::OK)
-                .header("ETag", format!("\"{}\"", etag));
-
-            // Add version ID header if versioning is active
-            if let Some(vid) = version_id {
-                builder = builder.header("x-amz-version-id", vid);
+        } else {
+            // Standalone mode: local storage with versioning and retention
+            match storage
+                .put_object_with_retention(
+                    &bucket,
+                    &key,
+                    &body,
+                    content_type,
+                    &metadata,
+                    versioning_status,
+                    default_retention,
+                )
+                .await
+            {
+                Ok((etag, version_id)) => Ok((etag, version_id)),
+                Err(e) => {
+                    error!("Failed to store object: {:?}", e);
+                    Err((
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to store object: {}", e),
+                    )
+                        .into_response())
+                }
             }
+        };
 
-            builder.body(Body::empty()).unwrap()
-        }
-        Err(e) => {
-            error!("Failed to store object: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to store object: {}", e),
-            )
-                .into_response()
+    let (etag, version_id) = match write_result {
+        Ok(r) => r,
+        Err(resp) => return resp,
+    };
+
+    info!(
+        "Object stored: bucket={}, key={}, etag={}, version_id={:?}",
+        bucket, key, etag, version_id
+    );
+
+    // Apply per-object lock headers if provided (standalone mode only)
+    if version_id.is_some() || state.write_coordinator.is_none() {
+        let needs_lock_update =
+            lock_legal_hold.is_some() || lock_mode.is_some() || lock_retain_until.is_some();
+
+        if needs_lock_update {
+            let storage = state.storage.read().await;
+            let vid = version_id.as_deref().unwrap_or("null");
+            if let Ok(mut record) = storage.head_object_version(&bucket, &key, vid).await {
+                if let Some(hold) = lock_legal_hold {
+                    record.legal_hold = hold;
+                }
+                if let Some(mode) = lock_mode {
+                    record.retention_mode = Some(mode);
+                }
+                if let Some(retain_until) = lock_retain_until {
+                    record.retain_until_timestamp = Some(retain_until);
+                }
+                if let Err(e) = storage.update_object_metadata(&bucket, &key, vid, record).await {
+                    error!("Failed to apply object lock headers: {:?}", e);
+                }
+            }
         }
     }
+
+    let mut builder = Response::builder()
+        .status(StatusCode::OK)
+        .header("ETag", format!("\"{}\"", etag));
+
+    // Add version ID header if versioning is active
+    if let Some(vid) = version_id {
+        builder = builder.header("x-amz-version-id", vid);
+    }
+
+    builder.body(Body::empty()).unwrap()
 }
 
 /// Copies an object within or between buckets.
@@ -371,10 +398,9 @@ pub async fn copy_object(
 
     let storage = state.storage.read().await;
 
-    // Check destination bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check destination bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Get the source object
@@ -519,12 +545,86 @@ pub async fn get_object(
         bucket, key, query.version_id
     );
 
+    // Cluster mode: use quorum streaming read with range support.
+    if let (Some(read_coord), None) = (&state.read_coordinator, &query.version_id) {
+        let read_range = if let Some(range_header) = headers.get(header::RANGE) {
+            let total_size = match read_coord.head(&bucket, &key).await {
+                Ok(result) => result.size,
+                Err(ClusterError::ObjectNotFound { .. }) => {
+                    return S3Error::NoSuchKey.into_response();
+                }
+                Err(e) => {
+                    error!("Quorum head failed before ranged read: {:?}", e);
+                    return cluster_error_to_response(&e);
+                }
+            };
+            let range_header = range_header.to_str().unwrap_or("");
+            match parse_range_header_u64(range_header, total_size) {
+                Some(range) => Some(range),
+                None => {
+                    let cr = format!("bytes */{}", total_size);
+                    return Response::builder()
+                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                        .header(header::CONTENT_RANGE, cr)
+                        .body(Body::empty())
+                        .unwrap();
+                }
+            }
+        } else {
+            None
+        };
+
+        return match read_coord.read_stream(&bucket, &key, read_range).await {
+            Ok(result) => {
+                let status = if result.content_range.is_some() {
+                    StatusCode::PARTIAL_CONTENT
+                } else {
+                    StatusCode::OK
+                };
+
+                let mut builder = Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_LENGTH, result.content_length)
+                    .header(header::CONTENT_TYPE, &result.content_type)
+                    .header("ETag", format!("\"{}\"", result.etag))
+                    .header(header::ACCEPT_RANGES, "bytes")
+                    .header(
+                        header::LAST_MODIFIED,
+                        format_last_modified(result.hlc.wall_time * 1_000_000), // millis → nanos
+                    );
+
+                if let Some((start, end, total)) = result.content_range {
+                    builder = builder.header(
+                        header::CONTENT_RANGE,
+                        format!("bytes {}-{}/{}", start, end, total),
+                    );
+                }
+                if let Some(ref vid) = result.version_id {
+                    builder = builder.header("x-amz-version-id", vid.clone());
+                }
+                for (meta_key, value) in &result.metadata {
+                    if !meta_key.starts_with('_') {
+                        builder = builder.header(format!("x-amz-meta-{}", meta_key), value);
+                    }
+                }
+
+                let reader_stream = ReaderStream::new(result.body);
+                builder.body(Body::from_stream(reader_stream)).unwrap()
+            }
+            Err(ClusterError::ObjectNotFound { .. }) => S3Error::NoSuchKey.into_response(),
+            Err(e) => {
+                error!("Quorum read failed: {:?}", e);
+                cluster_error_to_response(&e)
+            }
+        };
+    }
+
+    // Standalone mode: streaming read with full S3 feature support
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // We need HEAD first to know total_size for range parsing.
@@ -709,15 +809,33 @@ pub async fn delete_object(
         bucket, key, query.version_id
     );
 
+    // Cluster mode: quorum delete (basic, no versioning/Object Lock checks)
+    if let (Some(write_coord), None) = (&state.write_coordinator, &query.version_id) {
+        return match write_coord.delete(&bucket, &key).await {
+            Ok(result) => {
+                info!(
+                    "Quorum delete: bucket={}, key={}, acked={}/{}",
+                    bucket, key, result.replicas_acked, result.replicas_total
+                );
+                Response::builder().status(StatusCode::NO_CONTENT).body(Body::empty()).unwrap()
+            }
+            Err(e) => {
+                error!("Quorum delete failed: {:?}", e);
+                cluster_error_to_response(&e)
+            }
+        };
+    }
+
+    // Standalone mode: full versioning + Object Lock support
+
     // Get versioning status before acquiring storage lock
     let versioning_status = get_bucket_versioning_status(&state, &bucket).await;
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // CRITICAL: Check Object Lock before deletion
@@ -902,12 +1020,45 @@ pub async fn head_object(
         bucket, key, query.version_id
     );
 
+    // Cluster mode: use quorum HEAD
+    if let (Some(read_coord), None) = (&state.read_coordinator, &query.version_id) {
+        return match read_coord.head(&bucket, &key).await {
+            Ok(result) => {
+                let mut builder = Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_LENGTH, result.size)
+                    .header(header::CONTENT_TYPE, &result.content_type)
+                    .header("ETag", format!("\"{}\"", result.etag))
+                    .header(
+                        header::LAST_MODIFIED,
+                        format_last_modified(result.hlc.wall_time * 1_000_000), // millis → nanos
+                    );
+
+                if let Some(ref vid) = result.version_id {
+                    builder = builder.header("x-amz-version-id", vid.clone());
+                }
+                for (meta_key, value) in &result.metadata {
+                    if !meta_key.starts_with('_') {
+                        builder = builder.header(format!("x-amz-meta-{}", meta_key), value);
+                    }
+                }
+
+                builder.body(Body::empty()).unwrap()
+            }
+            Err(ClusterError::ObjectNotFound { .. }) => S3Error::NoSuchKey.into_response(),
+            Err(e) => {
+                error!("Quorum head failed: {:?}", e);
+                cluster_error_to_response(&e)
+            }
+        };
+    }
+
+    // Standalone mode
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Get object metadata (with or without specific version)
@@ -1105,10 +1256,9 @@ pub async fn get_object_tagging(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Get object metadata
@@ -1160,10 +1310,9 @@ pub async fn put_object_tagging(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Get existing object record
@@ -1261,10 +1410,9 @@ pub async fn delete_object_tagging(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Get existing object record
@@ -1488,10 +1636,9 @@ pub async fn post_object(
     let versioning_status = get_bucket_versioning_status(&state, &bucket).await;
     let storage = state.storage.write().await;
 
-    // Check bucket existence
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check bucket existence (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     let metadata = std::collections::HashMap::new();
@@ -1556,6 +1703,11 @@ pub async fn post_object(
             S3Error::InternalError("Failed to store object".to_string()).into_response()
         }
     }
+}
+
+/// Convert a cluster error into an HTTP response.
+fn cluster_error_to_response(err: &ClusterError) -> Response {
+    super::cluster_error_to_response(err)
 }
 
 #[cfg(test)]

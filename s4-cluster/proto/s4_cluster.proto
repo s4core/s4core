@@ -1,0 +1,522 @@
+// Copyright 2026 S4Core Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+syntax = "proto3";
+package s4.cluster;
+
+// Inter-node RPC service for S4 distributed storage.
+//
+// Every node in a server pool runs this service. The coordinator node
+// (whichever node received the S3 request) fans out to replica nodes
+// via these RPCs.
+service S4Node {
+    // === Data plane ===
+
+    // Write a blob to a replica node.
+    rpc WriteBlob(WriteBlobRequest) returns (WriteBlobResponse);
+
+    // Read a blob from a replica node.
+    rpc ReadBlob(ReadBlobRequest) returns (ReadBlobResponse);
+
+    // Delete a blob from a replica node (tombstone).
+    rpc DeleteBlob(DeleteBlobRequest) returns (DeleteBlobResponse);
+
+    // Create a native multipart upload session on a replica.
+    rpc CreateMultipartUploadReplica(CreateMultipartUploadReplicaRequest) returns (CreateMultipartUploadReplicaResponse);
+
+    // Store one native multipart part on a replica.
+    rpc UploadMultipartPartReplica(stream UploadMultipartPartReplicaChunk) returns (UploadMultipartPartReplicaResponse);
+
+    // Inspect multipart session and part metadata on a replica.
+    rpc InspectMultipartUploadReplica(InspectMultipartUploadReplicaRequest) returns (InspectMultipartUploadReplicaResponse);
+
+    // Publish a native multipart manifest on a replica.
+    rpc CompleteMultipartUploadReplica(CompleteMultipartUploadReplicaRequest) returns (CompleteMultipartUploadReplicaResponse);
+
+    // Abort a native multipart upload on a replica.
+    rpc AbortMultipartUploadReplica(AbortMultipartUploadReplicaRequest) returns (AbortMultipartUploadReplicaResponse);
+
+    // Streaming write for objects > 8MB.
+    rpc WriteBlobStream(stream WriteBlobChunk) returns (WriteBlobResponse);
+
+    // Streaming read for objects > 8MB.
+    rpc ReadBlobStream(ReadBlobRequest) returns (stream ReadBlobChunk);
+
+    // === Metadata plane ===
+
+    // Write a metadata record to a replica.
+    rpc WriteMetadata(WriteMetadataRequest) returns (WriteMetadataResponse);
+
+    // Read a metadata record from a replica.
+    rpc ReadMetadata(ReadMetadataRequest) returns (ReadMetadataResponse);
+
+    // Get object HEAD (metadata without data).
+    rpc HeadObject(HeadObjectRequest) returns (HeadObjectResponse);
+
+    // List objects on a replica.
+    rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+
+    // === Repair / Anti-entropy ===
+
+    // Exchange Merkle tree digests for divergence detection.
+    rpc ExchangeMerkleDigest(MerkleDigestRequest) returns (MerkleDigestResponse);
+
+    // Request specific keys for repair synchronization.
+    rpc RepairSync(RepairSyncRequest) returns (stream RepairSyncResponse);
+
+    // === Cluster management ===
+
+    // Health check for liveness and readiness probes.
+    rpc Health(HealthRequest) returns (HealthResponse);
+
+    // Stream a full snapshot for bootstrapping a new/replaced node.
+    rpc StreamSnapshot(SnapshotRequest) returns (stream SnapshotChunk);
+
+    // === Hinted handoff ===
+
+    // Deliver a hinted write to a node that has come back online.
+    rpc DeliverHint(HintRequest) returns (HintResponse);
+}
+
+// ============================================================================
+// Common types
+// ============================================================================
+
+// Hybrid Logical Clock timestamp for causal ordering (MVP: LWW).
+// See ADR-F4-REVISED: DVV is deferred to post-MVP.
+message HybridTimestamp {
+    // Physical wall clock time in milliseconds since Unix epoch.
+    uint64 wall_time = 1;
+    // Logical counter for events within the same millisecond.
+    uint32 logical = 2;
+    // Node ID (16 bytes, UUID v4) used as tiebreaker.
+    bytes node_id = 3;
+}
+
+// Reserved for post-MVP (ADR-F4-REVISED).
+// Dotted Version Vector for full causal context tracking.
+message DottedVersionVector {
+    // (replica_slot -> max_seen_counter) per replica.
+    map<uint32, uint64> entries = 1;
+    // The "dot" — the event that produced this version.
+    uint32 dot_slot = 2;
+    uint64 dot_counter = 3;
+}
+
+// ============================================================================
+// Data plane messages
+// ============================================================================
+
+message WriteBlobRequest {
+    string bucket = 1;
+    string key = 2;
+    bytes data = 3;
+    bytes content_hash = 4;         // SHA-256 of the data
+    string content_type = 5;
+    map<string, string> metadata = 6;
+    HybridTimestamp hlc = 7;
+    optional string version_id = 9;
+    bytes coordinator_id = 10;      // NodeId (16 bytes UUID)
+    bytes operation_id = 11;        // OperationId (16 bytes UUID)
+    uint64 topology_epoch = 12;     // Coordinator's current epoch
+}
+
+message WriteBlobResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 local_sequence = 3;      // Sequence in the local journal
+    bool epoch_mismatch = 4;        // true if replica has a different epoch
+}
+
+message ReadBlobRequest {
+    string bucket = 1;
+    string key = 2;
+    optional string version_id = 3;
+    bytes coordinator_id = 4;       // NodeId (16 bytes UUID)
+    bytes operation_id = 5;         // OperationId (16 bytes UUID)
+    uint64 topology_epoch = 6;
+    optional uint64 range_start = 7;
+    optional uint64 range_end = 8;
+}
+
+message ReadBlobResponse {
+    bool success = 1;
+    string error = 2;
+    bytes data = 3;
+    bytes content_hash = 4;         // SHA-256
+    string content_type = 5;
+    map<string, string> metadata = 6;
+    HybridTimestamp hlc = 7;
+    optional string version_id = 8;
+    uint64 content_length = 9;
+    bool epoch_mismatch = 10;
+}
+
+message DeleteBlobRequest {
+    string bucket = 1;
+    string key = 2;
+    HybridTimestamp hlc = 3;
+    bytes coordinator_id = 4;       // NodeId (16 bytes UUID)
+    bytes operation_id = 5;         // OperationId (16 bytes UUID)
+    uint64 topology_epoch = 6;
+    optional string version_id = 7;
+}
+
+message DeleteBlobResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 local_sequence = 3;
+    bool epoch_mismatch = 4;
+}
+
+message CreateMultipartUploadReplicaRequest {
+    string upload_id = 1;
+    string bucket = 2;
+    string key = 3;
+    string content_type = 4;
+    map<string, string> metadata = 5;
+    bytes coordinator_id = 6;
+    bytes operation_id = 7;
+    uint64 topology_epoch = 8;
+}
+
+message CreateMultipartUploadReplicaResponse {
+    bool success = 1;
+    string error = 2;
+    bool epoch_mismatch = 3;
+}
+
+message UploadMultipartPartReplicaHeader {
+    string upload_id = 1;
+    uint32 part_number = 2;
+    bytes coordinator_id = 3;
+    bytes operation_id = 4;
+    uint64 topology_epoch = 5;
+    uint64 total_size = 6;
+}
+
+message UploadMultipartPartReplicaChunk {
+    oneof payload {
+        UploadMultipartPartReplicaHeader header = 1;
+        bytes data = 2;
+    }
+}
+
+message UploadMultipartPartReplicaResponse {
+    bool success = 1;
+    string error = 2;
+    string etag = 3;
+    bytes part_record = 4;         // bincode MultipartPartRecord
+    bool epoch_mismatch = 5;
+}
+
+message InspectMultipartUploadReplicaRequest {
+    string bucket = 1;
+    string key = 2;
+    string upload_id = 3;
+    bytes coordinator_id = 4;
+    bytes operation_id = 5;
+    uint64 topology_epoch = 6;
+}
+
+message InspectMultipartUploadReplicaResponse {
+    bool success = 1;
+    string error = 2;
+    bytes session = 3;             // bincode MultipartUploadSession
+    repeated bytes part_records = 4; // bincode MultipartPartRecord
+    bool epoch_mismatch = 5;
+}
+
+message CompleteMultipartUploadReplicaRequest {
+    string bucket = 1;
+    string key = 2;
+    string upload_id = 3;
+    repeated bytes selected_part_records = 4; // bincode MultipartPartRecord
+    string s3_etag = 5;
+    string content_type = 6;
+    map<string, string> metadata = 7;
+    HybridTimestamp hlc = 8;
+    bytes coordinator_id = 9;
+    bytes operation_id = 10;
+    uint64 topology_epoch = 11;
+}
+
+message CompleteMultipartUploadReplicaResponse {
+    bool success = 1;
+    string error = 2;
+    bytes index_record = 3;        // bincode IndexRecord
+    bool epoch_mismatch = 4;
+}
+
+message AbortMultipartUploadReplicaRequest {
+    string upload_id = 1;
+    bytes coordinator_id = 2;
+    bytes operation_id = 3;
+    uint64 topology_epoch = 4;
+}
+
+message AbortMultipartUploadReplicaResponse {
+    bool success = 1;
+    string error = 2;
+    bool epoch_mismatch = 3;
+}
+
+// ============================================================================
+// Streaming messages (for objects > 8MB)
+// ============================================================================
+
+message WriteBlobChunk {
+    oneof payload {
+        WriteBlobHeader header = 1;  // First chunk: metadata
+        bytes data = 2;              // Subsequent chunks: raw data
+    }
+}
+
+message WriteBlobHeader {
+    string bucket = 1;
+    string key = 2;
+    bytes content_hash = 3;         // SHA-256 of the complete object
+    string content_type = 4;
+    map<string, string> metadata = 5;
+    HybridTimestamp hlc = 6;
+    optional string version_id = 7;
+    bytes coordinator_id = 8;
+    bytes operation_id = 9;
+    uint64 topology_epoch = 10;
+    uint64 total_size = 11;         // Total data size in bytes
+}
+
+message ReadBlobChunk {
+    oneof payload {
+        ReadBlobHeader header = 1;   // First chunk: metadata
+        bytes data = 2;              // Subsequent chunks: raw data
+    }
+}
+
+message ReadBlobHeader {
+    bytes content_hash = 1;
+    string content_type = 2;
+    map<string, string> metadata = 3;
+    HybridTimestamp hlc = 4;
+    optional string version_id = 5;
+    uint64 content_length = 6;
+    uint64 total_size = 7;
+    optional uint64 range_start = 8;
+    optional uint64 range_end = 9;
+}
+
+// ============================================================================
+// Metadata plane messages
+// ============================================================================
+
+message WriteMetadataRequest {
+    string bucket = 1;
+    string key = 2;
+    bytes record = 3;               // Serialized IndexRecord
+    HybridTimestamp hlc = 4;
+    bytes coordinator_id = 5;
+    bytes operation_id = 6;
+    uint64 topology_epoch = 7;
+    optional string version_id = 8;
+}
+
+message WriteMetadataResponse {
+    bool success = 1;
+    string error = 2;
+    uint64 local_sequence = 3;
+    bool epoch_mismatch = 4;
+}
+
+message ReadMetadataRequest {
+    string bucket = 1;
+    string key = 2;
+    optional string version_id = 3;
+    bytes coordinator_id = 4;
+    bytes operation_id = 5;
+    uint64 topology_epoch = 6;
+}
+
+message ReadMetadataResponse {
+    bool success = 1;
+    string error = 2;
+    bytes record = 3;               // Serialized IndexRecord
+    HybridTimestamp hlc = 4;
+    optional string version_id = 5;
+    bool epoch_mismatch = 6;
+}
+
+message HeadObjectRequest {
+    string bucket = 1;
+    string key = 2;
+    optional string version_id = 3;
+    uint64 topology_epoch = 4;
+}
+
+message HeadObjectResponse {
+    bool exists = 1;
+    string error = 2;
+    string content_type = 3;
+    uint64 content_length = 4;
+    map<string, string> metadata = 5;
+    HybridTimestamp hlc = 6;
+    optional string version_id = 7;
+    string etag = 8;
+    bool epoch_mismatch = 9;
+}
+
+message ListObjectsRequest {
+    string bucket = 1;
+    string prefix = 2;
+    string delimiter = 3;
+    uint32 max_keys = 4;
+    string continuation_token = 5;
+    uint64 topology_epoch = 6;
+}
+
+message ListObjectsResponse {
+    repeated ObjectInfo objects = 1;
+    repeated string common_prefixes = 2;
+    bool is_truncated = 3;
+    string next_continuation_token = 4;
+    string error = 5;
+    bool epoch_mismatch = 6;
+}
+
+message ObjectInfo {
+    string key = 1;
+    uint64 size = 2;
+    string content_type = 3;
+    string etag = 4;
+    HybridTimestamp hlc = 5;
+    optional string version_id = 6;
+}
+
+// ============================================================================
+// Repair / Anti-entropy messages
+// ============================================================================
+
+message MerkleDigestRequest {
+    string bucket = 1;
+    bytes range_start = 2;          // Key range start (inclusive)
+    bytes range_end = 3;            // Key range end (exclusive)
+    uint32 level = 4;               // Tree level (0 = leaf)
+    bytes tree_hash = 5;            // SHA-256 hash at this level
+    uint64 topology_epoch = 6;
+}
+
+message MerkleDigestResponse {
+    bool match = 1;
+    repeated MerkleRange divergent_ranges = 2;
+    bytes tree_hash = 3;
+    bool epoch_mismatch = 4;
+}
+
+message MerkleRange {
+    bytes range_start = 1;
+    bytes range_end = 2;
+    bytes local_hash = 3;
+}
+
+message RepairSyncRequest {
+    string bucket = 1;
+    repeated string keys = 2;       // Keys to synchronize
+    uint64 topology_epoch = 3;
+}
+
+message RepairSyncResponse {
+    string key = 1;
+    bytes data = 2;
+    bytes record = 3;               // Serialized IndexRecord
+    HybridTimestamp hlc = 4;
+    optional string version_id = 5;
+    bytes content_hash = 6;
+    string content_type = 7;
+    map<string, string> metadata = 8;
+}
+
+// ============================================================================
+// Cluster management messages
+// ============================================================================
+
+message HealthRequest {
+    // Empty — no parameters needed for basic health check.
+}
+
+message HealthResponse {
+    NodeHealthStatus status = 1;
+    bytes node_id = 2;              // 16 bytes UUID
+    string node_name = 3;
+    uint32 pool_id = 4;
+    uint64 uptime_seconds = 5;
+    uint64 topology_epoch = 6;
+    uint32 protocol_version = 7;
+    string s4_version = 8;
+    NodeCapacityInfo capacity = 9;
+    uint32 known_members = 10;
+    uint32 alive_members = 11;
+}
+
+enum NodeHealthStatus {
+    NODE_HEALTH_STATUS_UNKNOWN = 0;
+    NODE_HEALTH_STATUS_HEALTHY = 1;
+    NODE_HEALTH_STATUS_DEGRADED = 2;
+    NODE_HEALTH_STATUS_UNHEALTHY = 3;
+}
+
+message NodeCapacityInfo {
+    uint64 total_bytes = 1;
+    uint64 used_bytes = 2;
+    uint32 volume_count = 3;
+    uint64 object_count = 4;
+}
+
+// ============================================================================
+// Snapshot streaming messages
+// ============================================================================
+
+message SnapshotRequest {
+    string bucket = 1;              // Empty = full snapshot
+    uint64 from_sequence = 2;       // 0 = from the beginning
+    uint64 topology_epoch = 3;
+}
+
+message SnapshotChunk {
+    uint64 sequence = 1;
+    bytes data = 2;                 // Serialized key-value pairs
+    bool is_last = 3;
+    uint64 total_keys = 4;         // Estimated total (set in first chunk)
+    uint64 keys_sent = 5;          // Progress counter
+}
+
+// ============================================================================
+// Hinted handoff messages
+// ============================================================================
+
+message HintRequest {
+    bytes target_node_id = 1;       // Original intended recipient
+    string bucket = 2;
+    string key = 3;
+    bytes data = 4;
+    bytes content_hash = 5;
+    HybridTimestamp hlc = 6;
+    bytes operation_id = 7;
+    optional string version_id = 8;
+    map<string, string> metadata = 9;
+    string content_type = 10;
+}
+
+message HintResponse {
+    bool accepted = 1;
+    string error = 2;
+}

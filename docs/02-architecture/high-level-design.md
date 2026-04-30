@@ -29,7 +29,7 @@ S4 uses a three-layer architecture inspired by the Bitcask storage model.
 
 ## Design Principles
 
-- **Single-node focus** — optimized for maximum performance on one machine, no distributed consensus overhead
+- **Single-node or distributed** — runs as a standalone server or as a leaderless quorum cluster (see [Federation](../04-features/federation.md))
 - **Append-only writes** — all data is written sequentially for maximum throughput
 - **ACID metadata** — fjall provides crash-safe metadata storage with MVCC and atomic cross-keyspace batches
 - **Strict consistency** — every write is fsynced before returning success

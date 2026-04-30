@@ -253,6 +253,7 @@ impl VolumeCompactor {
 
         // Step 4: Analyze and compact
         let mut compacted = 0usize;
+        let mut hit_volume_limit = false;
         let max_per_run = self.config.max_volumes_per_run;
         for &vol_id in &volume_ids {
             if vol_id == current_volume_id {
@@ -403,6 +404,7 @@ impl VolumeCompactor {
 
             if max_per_run > 0 && compacted >= max_per_run {
                 info!("Compactor: reached max volumes per run ({})", max_per_run);
+                hit_volume_limit = true;
                 break;
             }
         }
@@ -410,7 +412,14 @@ impl VolumeCompactor {
         // Step 5: Compact metadata journal (single-node only).
         // In federation mode, the replication layer manages journal compaction
         // with replica-aware sequence tracking.
-        if self.config.compact_journal {
+        //
+        // SAFETY: only clear the journal when ALL volumes have been processed
+        // in this run. If we hit the max_volumes_per_run limit, dead volumes
+        // still exist on disk. Clearing the journal prematurely means a server
+        // restart could trigger volume-only recovery (if fjall internally
+        // compacts away object tombstones, making the objects keyspace appear
+        // empty), resurrecting objects that were already deleted.
+        if self.config.compact_journal && !hit_volume_limit {
             match self.index_db.compact_journal_all() {
                 Ok(removed) => {
                     if removed > 0 {
@@ -502,6 +511,30 @@ impl VolumeCompactor {
                     stats.errors += 1;
                 }
             }
+        }
+
+        // Journal compaction + WAL flush: this fast-path returns early and
+        // skips the normal Step 5/6 at the end of run(). Since we processed
+        // ALL volumes (no max_per_run limit in this path), clearing the
+        // journal is safe — no dead volume data can be resurrected.
+        if self.config.compact_journal {
+            match self.index_db.compact_journal_all() {
+                Ok(removed) => {
+                    if removed > 0 {
+                        info!(
+                            "Compactor: compacted metadata journal — {} entries removed",
+                            removed
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!("Compactor: journal compaction failed (non-fatal): {}", e);
+                }
+            }
+        }
+
+        if let Err(e) = self.index_db.persist() {
+            warn!("Compactor: WAL flush failed (non-fatal): {}", e);
         }
 
         Ok(stats.clone())

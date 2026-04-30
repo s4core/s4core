@@ -19,6 +19,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install System Dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -77,6 +80,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -90,10 +95,83 @@ jobs:
           tar czf s4-server-linux-x86_64.tar.gz -C release s4-server
           sha256sum s4-server-linux-x86_64.tar.gz > s4-server-linux-x86_64.tar.gz.sha256
 
+      - name: Generate release notes
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME}"
+          RELEASE_DATE="$(date -u +'%Y.%-m.%-d')"
+          COMMIT_MSG="$(git log -1 --format='%B' HEAD)"
+          SUBJECT="$(printf '%s\n' "${COMMIT_MSG}" | sed -n '1p')"
+
+          PREV_TAG="$(git tag --sort=-creatordate | grep '^v' | grep -v "^${TAG_NAME}$" | head -1 || true)"
+          if [ -n "${PREV_TAG}" ]; then
+            RANGE="${PREV_TAG}..HEAD"
+          else
+            RANGE="HEAD"
+          fi
+
+          AUTHORS="$(git log "${RANGE}" --format='%an' | sort -u)"
+
+          if printf '%s\n' "${SUBJECT}" | grep -q '^# '; then
+            printf '%s\n' "${COMMIT_MSG}" > release-notes.md
+          else
+            BODY="$(printf '%s\n' "${COMMIT_MSG}" | sed '1d' | sed '/^[[:space:]]*$/d')"
+
+            TYPE="Changes"
+            case "${SUBJECT}" in
+              fix:*|fix!:*|fix\(*\):*|fix\(*\)!:*) TYPE="Fixes" ;;
+              feat:*|feat!:*|feat\(*\):*|feat\(*\)!:*) TYPE="Changes" ;;
+              perf:*|perf!:*|perf\(*\):*|perf\(*\)!:*) TYPE="Performance" ;;
+              docs:*|docs!:*|docs\(*\):*|docs\(*\)!:*) TYPE="Documentation" ;;
+              ci:*|ci!:*|ci\(*\):*|ci\(*\)!:*) TYPE="CI" ;;
+              test:*|test!:*|test\(*\):*|test\(*\)!:*) TYPE="Tests" ;;
+              refactor:*|refactor!:*|refactor\(*\):*|refactor\(*\)!:*) TYPE="Changes" ;;
+              release:*|release!:*|release\(*\):*|release\(*\)!:*) TYPE="Release Notes" ;;
+            esac
+
+            CLEAN_SUBJECT="$(printf '%s' "${SUBJECT}" | sed -E 's/^[a-zA-Z]+(\([^)]+\))?!?:[[:space:]]*//')"
+
+            {
+              echo "### ${RELEASE_DATE}"
+              echo ""
+              echo "### ${TYPE}"
+              echo ""
+              echo "- ${CLEAN_SUBJECT}"
+              if [ -n "${BODY}" ]; then
+                printf '%s\n' "${BODY}" | sed -E 's/^[[:space:]]*[-*][[:space:]]*/- /'
+              fi
+            } > release-notes.md
+          fi
+
+          {
+            if [ "$(tail -c 1 release-notes.md | wc -c)" -ne 0 ]; then
+              echo ""
+            fi
+            echo ""
+            echo "### Artifacts"
+            echo ""
+            echo "- \`s4-server-linux-x86_64.tar.gz\`"
+            echo "- \`s4-server-linux-x86_64.tar.gz.sha256\`"
+            if [ -n "${PREV_TAG}" ]; then
+              echo ""
+              echo "### Full Changelog"
+              echo ""
+              echo "[${PREV_TAG}...${TAG_NAME}](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${TAG_NAME})"
+            fi
+            if [ -n "${AUTHORS}" ]; then
+              echo ""
+              echo "### Contributors"
+              echo ""
+              printf '%s\n' "${AUTHORS}" | sed 's/^/- /'
+            fi
+          } >> release-notes.md
+
+          echo "Generated release notes:"
+          cat release-notes.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: release-notes.md
           files: |
             s4-server-linux-x86_64.tar.gz
             s4-server-linux-x86_64.tar.gz.sha256
@@ -118,17 +196,38 @@ jobs:
         id: meta
         run: echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
 
-      - name: Build and push Docker image
+      - name: Build and push CE Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           build-args: |
             S4_VERSION=${{ steps.meta.outputs.version }}
+            EDITION=ce
           tags: |
             ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.version }}
             ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:ce
+            ghcr.io/${{ github.repository }}:ce-${{ steps.meta.outputs.version }}
             ${{ secrets.DOCKERHUB_USERNAME }}/s4core:${{ steps.meta.outputs.version }}
             ${{ secrets.DOCKERHUB_USERNAME }}/s4core:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/s4core:ce
+            ${{ secrets.DOCKERHUB_USERNAME }}/s4core:ce-${{ steps.meta.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push EE Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            S4_VERSION=${{ steps.meta.outputs.version }}
+            EDITION=ee
+          tags: |
+            ghcr.io/${{ github.repository }}:ee
+            ghcr.io/${{ github.repository }}:ee-${{ steps.meta.outputs.version }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/s4core:ee
+            ${{ secrets.DOCKERHUB_USERNAME }}/s4core:ee-${{ steps.meta.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

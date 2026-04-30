@@ -60,10 +60,9 @@ pub async fn get_bucket_cors(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Get CORS configuration
@@ -102,10 +101,9 @@ pub async fn put_bucket_cors(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Parse and validate CORS configuration
@@ -164,10 +162,9 @@ pub async fn delete_bucket_cors(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Delete CORS configuration
@@ -199,10 +196,9 @@ pub async fn get_bucket_versioning(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     let status = get_versioning_status_internal(&*storage, &bucket).await;
@@ -235,10 +231,9 @@ pub async fn put_bucket_versioning(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Parse versioning configuration from XML
@@ -359,10 +354,9 @@ pub async fn get_bucket_lifecycle(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Get lifecycle configuration
@@ -397,10 +391,9 @@ pub async fn put_bucket_lifecycle(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Parse and validate lifecycle configuration
@@ -463,10 +456,9 @@ pub async fn delete_bucket_lifecycle(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Delete lifecycle configuration
@@ -541,10 +533,9 @@ pub async fn get_bucket_location(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -575,10 +566,9 @@ pub async fn get_bucket_policy(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     let policy_key = format!("{}{}", POLICY_CONFIG_PREFIX, bucket);
@@ -627,10 +617,9 @@ pub async fn put_bucket_policy(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Validate JSON
@@ -670,10 +659,9 @@ pub async fn delete_bucket_policy(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     let policy_key = format!("{}{}", POLICY_CONFIG_PREFIX, bucket);
@@ -694,10 +682,9 @@ pub async fn get_bucket_policy_status(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Without Block Public Access settings, IsPublic is always false
@@ -744,10 +731,9 @@ pub async fn put_bucket_encryption(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return crate::s3::errors::S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Store encryption config
@@ -788,10 +774,9 @@ pub async fn get_bucket_encryption(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return crate::s3::errors::S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Get stored encryption config, or return error if not set
@@ -822,10 +807,9 @@ pub async fn delete_bucket_encryption(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return crate::s3::errors::S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Delete stored config (will return default on next GET)

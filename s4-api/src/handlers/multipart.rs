@@ -30,9 +30,10 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use s4_core::StorageEngine;
+use s4_core::{ReadOptions, StorageEngine};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::io;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info};
 use uuid::Uuid;
@@ -40,7 +41,11 @@ use uuid::Uuid;
 use s4_core::types::composite::MultipartPartRecord;
 use tokio_stream::StreamExt;
 
-use crate::middleware::{decode_aws_chunked, is_aws_chunked, validate_decoded_content_length};
+use tokio_util::io::{ReaderStream, StreamReader};
+
+use crate::middleware::{
+    decode_aws_chunked, decode_aws_chunked_stream, decoded_content_length, is_aws_chunked,
+};
 use crate::s3::errors::S3Error;
 use crate::server::AppState;
 
@@ -84,10 +89,9 @@ pub async fn create_multipart_upload(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Generate upload ID
@@ -111,17 +115,28 @@ pub async fn create_multipart_upload(
         }
     }
 
-    // Create durable session in storage engine
-    if let Err(e) = storage
-        .create_multipart_session(&upload_id, &bucket, &key, content_type, &custom_metadata)
-        .await
-    {
-        error!("Failed to create multipart session: {:?}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to initiate multipart upload",
-        )
-            .into_response();
+    if let Some(write_coord) = state.write_coordinator.clone() {
+        drop(storage);
+        if let Err(e) = write_coord
+            .create_multipart_upload(&upload_id, &bucket, &key, content_type, &custom_metadata)
+            .await
+        {
+            error!("Failed to create cluster multipart session: {:?}", e);
+            return super::cluster_error_to_response(&e);
+        }
+    } else {
+        // Create durable session in storage engine
+        if let Err(e) = storage
+            .create_multipart_session(&upload_id, &bucket, &key, content_type, &custom_metadata)
+            .await
+        {
+            error!("Failed to create multipart session: {:?}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to initiate multipart upload",
+            )
+                .into_response();
+        }
     }
 
     info!(
@@ -177,15 +192,117 @@ pub async fn upload_part(
 
     let storage = state.storage.read().await;
 
-    // Validate bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
-    // Verify multipart upload session exists
-    if storage.get_multipart_session(&upload_id).await.is_err() {
+    // Verify multipart upload session exists in standalone mode.
+    // In cluster mode the coordinator checks the replica set; the HTTP node
+    // that received this request is not a source of truth for multipart state.
+    if state.write_coordinator.is_none() && storage.get_multipart_session(&upload_id).await.is_err()
+    {
         return S3Error::NoSuchUpload.into_response();
+    }
+
+    // Cluster mode: each part is a quorum write to the replica set.
+    if let Some(write_coord) = state.write_coordinator.clone() {
+        if let Some(copy_source) = headers.get("x-amz-copy-source") {
+            let Some(read_coord) = state.read_coordinator.clone() else {
+                return S3Error::InternalError(
+                    "Cluster read coordinator is not configured".to_string(),
+                )
+                .into_response();
+            };
+            drop(storage);
+            return upload_part_copy_cluster(UploadPartCopyClusterCtx {
+                read_coord: &read_coord,
+                write_coord: &write_coord,
+                bucket: &bucket,
+                key: &key,
+                upload_id: &upload_id,
+                part_number,
+                copy_source,
+                headers: &headers,
+            })
+            .await;
+        }
+
+        drop(storage);
+
+        if is_aws_chunked(&headers) {
+            let content_length = match required_decoded_content_length(&headers) {
+                Ok(len) => len,
+                Err(e) => return e.into_response(),
+            };
+            info!(
+                "UploadPart(cluster/aws-chunked): bucket={}, key={}, uploadId={}, partNumber={}, content_length={}",
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                content_length
+            );
+
+            let raw_stream = body.into_data_stream().map(|item| {
+                item.map_err(|e| io::Error::other(format!("error reading request body: {e}")))
+            });
+            let decoded_stream = decode_aws_chunked_stream(raw_stream, Some(content_length));
+            let result = write_coord
+                .upload_multipart_part_streaming(
+                    &bucket,
+                    &key,
+                    &upload_id,
+                    part_number,
+                    decoded_stream,
+                    content_length,
+                )
+                .await;
+
+            return upload_part_cluster_result(result, &upload_id, part_number);
+        }
+
+        let content_length = match headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            Some(len) => len,
+            None => {
+                return S3Error::InvalidRequest(
+                    "Content-Length is required for cluster multipart upload".to_string(),
+                )
+                .into_response();
+            }
+        };
+
+        info!(
+            "UploadPart(cluster/streaming): bucket={}, key={}, uploadId={}, partNumber={}, content_length={}",
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            content_length
+        );
+
+        let body_stream = body.into_data_stream().map(|item| {
+            item.map_err(|e| io::Error::other(format!("error reading request body: {e}")))
+        });
+
+        return upload_part_cluster_result(
+            write_coord
+                .upload_multipart_part_streaming(
+                    &bucket,
+                    &key,
+                    &upload_id,
+                    part_number,
+                    body_stream,
+                    content_length,
+                )
+                .await,
+            &upload_id,
+            part_number,
+        );
     }
 
     // Check for server-side copy (x-amz-copy-source header)
@@ -212,10 +329,7 @@ pub async fn upload_part(
             let body_stream = body.into_data_stream().map(|item: Result<Bytes, _>| {
                 item.map_err(|e| std::io::Error::other(e.to_string()))
             });
-            (
-                Box::new(tokio_util::io::StreamReader::new(body_stream)),
-                content_length,
-            )
+            (Box::new(StreamReader::new(body_stream)), content_length)
         } else {
             // Buffer to learn the size
             match collect_body(body).await {
@@ -259,6 +373,109 @@ pub async fn upload_part(
     }
 }
 
+fn upload_part_cluster_result(
+    result: Result<s4_cluster::QuorumMultipartPartResult, s4_cluster::ClusterError>,
+    upload_id: &str,
+    part_number: u32,
+) -> Response {
+    match result {
+        Ok(result) => {
+            info!(
+                "Part uploaded via quorum: uploadId={}, partNumber={}, etag={}, acked={}/{}",
+                upload_id, part_number, result.etag, result.replicas_acked, result.replicas_total
+            );
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("ETag", format!("\"{}\"", result.etag))
+                .body(Body::empty())
+                .unwrap()
+        }
+        Err(s4_cluster::ClusterError::Io(e)) if e.kind() == io::ErrorKind::InvalidData => {
+            S3Error::InvalidRequest(e.to_string()).into_response()
+        }
+        Err(e) => {
+            error!("Cluster multipart part write failed: {:?}", e);
+            super::cluster_error_to_response(&e)
+        }
+    }
+}
+
+fn required_decoded_content_length(headers: &HeaderMap) -> Result<u64, S3Error> {
+    decoded_content_length(headers)?.ok_or_else(|| {
+        S3Error::InvalidRequest(
+            "x-amz-decoded-content-length is required for aws-chunked multipart upload".to_string(),
+        )
+    })
+}
+
+struct UploadPartCopyClusterCtx<'a> {
+    read_coord: &'a s4_cluster::QuorumReadCoordinator,
+    write_coord: &'a s4_cluster::QuorumWriteCoordinator,
+    bucket: &'a str,
+    key: &'a str,
+    upload_id: &'a str,
+    part_number: u32,
+    copy_source: &'a axum::http::HeaderValue,
+    headers: &'a HeaderMap,
+}
+
+async fn upload_part_copy_cluster(ctx: UploadPartCopyClusterCtx<'_>) -> Response {
+    let (src_bucket, src_key) = match parse_copy_source(ctx.copy_source) {
+        Ok(source) => source,
+        Err(e) => return e.into_response(),
+    };
+
+    debug!(
+        "UploadPart(cluster): server-side copy from bucket={}, key={}",
+        src_bucket, src_key
+    );
+
+    let src_head = match ctx.read_coord.head(&src_bucket, &src_key).await {
+        Ok(result) => result,
+        Err(e) => {
+            error!("Failed to head source object for cluster copy: {:?}", e);
+            return super::cluster_error_to_response(&e);
+        }
+    };
+
+    let range = match parse_copy_source_range(ctx.headers, src_head.size) {
+        Ok(range) => range,
+        Err(e) => return e.into_response(),
+    };
+
+    let src_stream = match ctx.read_coord.read_stream(&src_bucket, &src_key, range).await {
+        Ok(stream) => stream,
+        Err(e) => {
+            error!("Failed to open source stream for cluster copy: {:?}", e);
+            return super::cluster_error_to_response(&e);
+        }
+    };
+
+    let content_length = src_stream.content_length;
+    let body_stream = ReaderStream::new(src_stream.body)
+        .map(|item| item.map_err(|e| io::Error::other(format!("error reading copy source: {e}"))));
+
+    let result = ctx
+        .write_coord
+        .upload_multipart_part_streaming(
+            ctx.bucket,
+            ctx.key,
+            ctx.upload_id,
+            ctx.part_number,
+            body_stream,
+            content_length,
+        )
+        .await;
+
+    match result {
+        Ok(result) => copy_part_success_response(&result.etag),
+        Err(e) => {
+            error!("Cluster multipart copy part write failed: {:?}", e);
+            super::cluster_error_to_response(&e)
+        }
+    }
+}
+
 /// Handles UploadPart with server-side copy (x-amz-copy-source).
 ///
 /// Source data is fetched from another object and written as a part
@@ -270,15 +487,9 @@ async fn upload_part_copy(
     copy_source: &axum::http::HeaderValue,
     headers: &HeaderMap,
 ) -> Response {
-    let copy_source_str = copy_source.to_str().unwrap_or("");
-    let copy_source_str = copy_source_str.trim_start_matches('/');
-
-    let (src_bucket, src_key) = match copy_source_str.split_once('/') {
-        Some((b, k)) => (b.to_string(), k.to_string()),
-        None => {
-            return S3Error::InvalidRequest("Invalid x-amz-copy-source format".to_string())
-                .into_response()
-        }
+    let (src_bucket, src_key) = match parse_copy_source(copy_source) {
+        Ok(source) => source,
+        Err(e) => return e.into_response(),
     };
 
     debug!(
@@ -286,40 +497,34 @@ async fn upload_part_copy(
         src_bucket, src_key
     );
 
-    // Get the source object
-    let (src_data, _) = match storage.get_object(&src_bucket, &src_key).await {
-        Ok(data) => data,
+    let src_record = match storage.head_object(&src_bucket, &src_key).await {
+        Ok(record) => record,
         Err(e) => {
-            error!("Failed to get source object for copy: {:?}", e);
+            error!("Failed to head source object for copy: {:?}", e);
             return S3Error::NoSuchKey.into_response();
         }
     };
 
-    // Check for range copy (x-amz-copy-source-range header)
-    let data = if let Some(range_header) = headers.get("x-amz-copy-source-range") {
-        let range_str = range_header.to_str().unwrap_or("");
-        let range_str = range_str.trim_start_matches("bytes=");
-        let (start, end) = match range_str.split_once('-') {
-            Some((s, e)) => {
-                let start: usize = s.parse().unwrap_or(0);
-                let end: usize = e.parse().unwrap_or(src_data.len() - 1);
-                (start, end)
-            }
-            None => (0, src_data.len() - 1),
-        };
-
-        let end_exclusive = (end + 1).min(src_data.len());
-        if start >= src_data.len() || start > end_exclusive {
-            return S3Error::InvalidRequest("Invalid range".to_string()).into_response();
-        }
-
-        src_data[start..end_exclusive].to_vec()
-    } else {
-        src_data
+    let range = match parse_copy_source_range(headers, src_record.size) {
+        Ok(range) => range,
+        Err(e) => return e.into_response(),
     };
 
-    let content_length = data.len() as u64;
-    let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> = Box::new(std::io::Cursor::new(data));
+    let src_stream =
+        match storage.open_object_stream(&src_bucket, &src_key, ReadOptions { range }).await {
+            Ok(stream) => stream,
+            Err(s4_core::StorageError::ObjectNotFound { .. }) => {
+                return S3Error::NoSuchKey.into_response();
+            }
+            Err(e) => {
+                error!("Failed to open source stream for copy: {:?}", e);
+                return S3Error::InternalError("Failed to read source object".to_string())
+                    .into_response();
+            }
+        };
+
+    let content_length = src_stream.content_length;
+    let reader = src_stream.body;
 
     match storage
         .upload_part_streaming(upload_id, part_number, reader, content_length)
@@ -330,21 +535,7 @@ async fn upload_part_copy(
                 "Part uploaded: uploadId={}, partNumber={}, etag={} (copy)",
                 upload_id, part_number, native_result.etag
             );
-            use chrono::Utc;
-            let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
-            let xml = format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-<CopyPartResult>
-    <ETag>"{}"</ETag>
-    <LastModified>{}</LastModified>
-</CopyPartResult>"#,
-                native_result.etag, now
-            );
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/xml")
-                .body(Body::from(xml))
-                .unwrap()
+            copy_part_success_response(&native_result.etag)
         }
         Err(e) => {
             error!("Failed to store copied part: {:?}", e);
@@ -353,10 +544,77 @@ async fn upload_part_copy(
     }
 }
 
+fn parse_copy_source(copy_source: &axum::http::HeaderValue) -> Result<(String, String), S3Error> {
+    let copy_source_str = copy_source.to_str().unwrap_or("");
+    let copy_source_str = copy_source_str.trim_start_matches('/');
+
+    match copy_source_str.split_once('/') {
+        Some((bucket, key)) if !bucket.is_empty() && !key.is_empty() => {
+            Ok((bucket.to_string(), key.to_string()))
+        }
+        _ => Err(S3Error::InvalidRequest(
+            "Invalid x-amz-copy-source format".to_string(),
+        )),
+    }
+}
+
+fn parse_copy_source_range(
+    headers: &HeaderMap,
+    source_size: u64,
+) -> Result<Option<(u64, u64)>, S3Error> {
+    let Some(range_header) = headers.get("x-amz-copy-source-range") else {
+        return Ok(None);
+    };
+
+    let range_str = range_header
+        .to_str()
+        .map_err(|_| S3Error::InvalidRequest("Invalid range".to_string()))?;
+    let Some(range_str) = range_str.strip_prefix("bytes=") else {
+        return Err(S3Error::InvalidRequest("Invalid range".to_string()));
+    };
+    let (start, end) = match range_str.split_once('-') {
+        Some((s, e)) => {
+            if s.is_empty() || e.is_empty() {
+                return Err(S3Error::InvalidRequest("Invalid range".to_string()));
+            }
+            let start: u64 =
+                s.parse().map_err(|_| S3Error::InvalidRequest("Invalid range".to_string()))?;
+            let end: u64 =
+                e.parse().map_err(|_| S3Error::InvalidRequest("Invalid range".to_string()))?;
+            (start, end)
+        }
+        None => return Err(S3Error::InvalidRequest("Invalid range".to_string())),
+    };
+
+    if source_size == 0 || start >= source_size || start > end {
+        return Err(S3Error::InvalidRequest("Invalid range".to_string()));
+    }
+
+    Ok(Some((start, end.min(source_size - 1))))
+}
+
+fn copy_part_success_response(etag: &str) -> Response {
+    use chrono::Utc;
+    let now = Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ");
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<CopyPartResult>
+    <ETag>"{}"</ETag>
+    <LastModified>{}</LastModified>
+</CopyPartResult>"#,
+        etag, now
+    );
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/xml")
+        .body(Body::from(xml))
+        .unwrap()
+}
+
 /// Handles UploadPart with AWS chunked transfer encoding.
 ///
-/// AWS chunked encoding requires the full body to decode, so this path
-/// buffers the body, decodes, then writes to volume storage.
+/// Decodes aws-chunked framing as a stream and writes directly to volume
+/// storage, keeping memory bounded by the request/body buffers.
 async fn upload_part_chunked(
     storage: &s4_core::BitcaskStorageEngine,
     upload_id: &str,
@@ -364,35 +622,22 @@ async fn upload_part_chunked(
     headers: &HeaderMap,
     body: Body,
 ) -> Response {
-    // Collect body chunks for decoding (aws-chunked requires full body)
-    let body_bytes = match collect_body(body).await {
-        Ok(b) => b,
-        Err(e) => {
-            error!("Failed to read aws-chunked body: {:?}", e);
-            return S3Error::InternalError("Failed to read request body".to_string())
-                .into_response();
-        }
-    };
-
-    debug!(
-        "UploadPart: detected aws-chunked encoding, decoding body (raw size={})",
-        body_bytes.len()
-    );
-    let decoded = match decode_aws_chunked(&body_bytes) {
-        Ok(d) => d,
+    let content_length = match required_decoded_content_length(headers) {
+        Ok(len) => len,
         Err(e) => return e.into_response(),
     };
-    debug!(
-        "UploadPart: decoded aws-chunked body (decoded size={})",
-        decoded.len()
-    );
-    if let Err(e) = validate_decoded_content_length(headers, &decoded) {
-        return e.into_response();
-    }
 
-    let content_length = decoded.len() as u64;
+    debug!(
+        "UploadPart: detected aws-chunked encoding, streaming decoded size={}",
+        content_length
+    );
+
+    let raw_stream = body
+        .into_data_stream()
+        .map(|item| item.map_err(|e| io::Error::other(format!("error reading request body: {e}"))));
+    let decoded_stream = decode_aws_chunked_stream(raw_stream, Some(content_length));
     let reader: Box<dyn tokio::io::AsyncRead + Unpin + Send> =
-        Box::new(std::io::Cursor::new(decoded));
+        Box::new(StreamReader::new(decoded_stream));
 
     match storage
         .upload_part_streaming(upload_id, part_number, reader, content_length)
@@ -408,6 +653,12 @@ async fn upload_part_chunked(
                 .header("ETag", format!("\"{}\"", native_result.etag))
                 .body(Body::empty())
                 .unwrap()
+        }
+        Err(s4_core::StorageError::Io(e)) if e.kind() == io::ErrorKind::InvalidData => {
+            S3Error::InvalidRequest(e.to_string()).into_response()
+        }
+        Err(s4_core::StorageError::InvalidData(message)) => {
+            S3Error::InvalidRequest(message).into_response()
         }
         Err(e) => {
             error!("Failed to store chunked part: {:?}", e);
@@ -489,10 +740,66 @@ pub async fn complete_multipart_upload(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
+    }
+
+    if let Some(write_coord) = state.write_coordinator.clone() {
+        let manifest_for_cluster: Vec<(u32, String)> = manifest_parts
+            .iter()
+            .map(|part| (part.part_number, part.etag.clone()))
+            .collect();
+
+        info!(
+            "CompleteMultipartUpload(cluster): bucket={}, key={}, uploadId={}, parts={}",
+            bucket,
+            key,
+            upload_id,
+            manifest_for_cluster.len()
+        );
+
+        drop(storage);
+
+        return match write_coord
+            .complete_multipart_upload(&bucket, &key, &upload_id, &manifest_for_cluster)
+            .await
+        {
+            Ok(result) => {
+                info!(
+                    "Multipart upload completed via quorum: bucket={}, key={}, etag={}, size={}, acked={}/{}",
+                    bucket,
+                    key,
+                    result.s3_etag,
+                    result.total_size,
+                    result.replicas_acked,
+                    result.replicas_total
+                );
+                let xml = format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Location>http://localhost:9000/{}/{}</Location>
+  <Bucket>{}</Bucket>
+  <Key>{}</Key>
+  <ETag>"{}"</ETag>
+</CompleteMultipartUploadResult>"#,
+                    escape_xml(&bucket),
+                    escape_xml(&key),
+                    escape_xml(&bucket),
+                    escape_xml(&key),
+                    result.s3_etag
+                );
+                Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/xml")
+                    .body(Body::from(xml))
+                    .unwrap()
+            }
+            Err(e) => {
+                error!("Cluster multipart complete failed: {:?}", e);
+                super::cluster_error_to_response(&e)
+            }
+        };
     }
 
     // Get upload session from durable storage
@@ -553,6 +860,7 @@ pub async fn complete_multipart_upload(
     drop(storage);
 
     let storage_arc = state.storage.clone();
+    let write_coordinator = state.write_coordinator.clone();
 
     tokio::spawn(async move {
         // Keep-alive: send whitespace periodically (safety mechanism —
@@ -584,12 +892,78 @@ pub async fn complete_multipart_upload(
                 &metadata,
             )
             .await;
-        drop(storage);
+
+        // Cluster mode: replicate the completed object to REMOTE replicas only.
+        // The local node already has the correct composite manifest from
+        // complete_multipart_native(). We read back the assembled data and
+        // send it to remote replicas via replicate_to_remotes (skips local
+        // put_object to preserve the composite manifest).
+        let cluster_result = if result.is_ok() {
+            if let Some(ref write_coord) = write_coordinator {
+                match storage.get_object(&bucket_clone, &key_clone).await {
+                    Ok((data, _record)) => {
+                        drop(storage); // Release lock before coordinator call
+                        match write_coord
+                            .replicate_to_remotes(
+                                &bucket_clone,
+                                &key_clone,
+                                &data,
+                                &content_type,
+                                &metadata,
+                            )
+                            .await
+                        {
+                            Ok(qr) => {
+                                info!(
+                                    "Multipart remote replication: bucket={}, key={}, acked={}/{}",
+                                    bucket_clone, key_clone, qr.replicas_acked, qr.replicas_total
+                                );
+                                // Stamp the same HLC on the local node's IndexRecord
+                                // so that digest-based reads see consistent HLC across
+                                // all replicas (prevents spurious read-repair cycles).
+                                let storage = storage_arc.read().await;
+                                if let Ok(mut record) =
+                                    storage.head_object(&bucket_clone, &key_clone).await
+                                {
+                                    record.hlc_timestamp = qr.hlc.wall_time;
+                                    record.hlc_logical = qr.hlc.logical;
+                                    record.origin_node_id = qr.hlc.node_id;
+                                    let _ = storage
+                                        .update_object_metadata(
+                                            &bucket_clone,
+                                            &key_clone,
+                                            "",
+                                            record,
+                                        )
+                                        .await;
+                                }
+                                Ok(())
+                            }
+                            Err(e) => {
+                                error!("Multipart remote replication failed: {:?}", e);
+                                Err(format!("remote replication failed: {e:?}"))
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        drop(storage);
+                        error!("Failed to read back completed multipart object: {:?}", e);
+                        Err(format!("failed to read back completed object: {e:?}"))
+                    }
+                }
+            } else {
+                drop(storage);
+                Ok(())
+            }
+        } else {
+            drop(storage);
+            Ok(())
+        };
 
         keepalive_handle.abort();
 
         match result {
-            Ok(_) => {
+            Ok(_) if cluster_result.is_ok() => {
                 info!(
                     "Multipart upload completed (native): bucket={}, key={}, etag={}, size={}, parts={}",
                     bucket_clone, key_clone, s3_etag_clone, total_size, selected_parts.len()
@@ -611,6 +985,24 @@ pub async fn complete_multipart_upload(
                 );
 
                 let _ = tx.send(Ok(Bytes::from(xml))).await;
+            }
+            Ok(_) => {
+                // Local completion OK but cluster replication failed
+                let err_msg = cluster_result.unwrap_err();
+                error!(
+                    "Multipart upload completed locally but cluster replication failed: {}",
+                    err_msg
+                );
+                let error_xml = format!(
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>InternalError</Code>
+  <Message>Failed to complete multipart upload: {}</Message>
+  <RequestId>0</RequestId>
+</Error>"#,
+                    escape_xml(&err_msg)
+                );
+                let _ = tx.send(Ok(Bytes::from(error_xml))).await;
             }
             Err(e) => {
                 error!("Failed to complete multipart upload: {:?}", e);
@@ -658,6 +1050,22 @@ pub async fn abort_multipart_upload(
         "AbortMultipartUpload: bucket={}, key={}, uploadId={}",
         bucket, key, upload_id
     );
+
+    if let Some(write_coord) = state.write_coordinator.clone() {
+        return match write_coord.abort_multipart_upload(&bucket, &key, &upload_id).await {
+            Ok(result) => {
+                info!(
+                    "Multipart upload aborted via quorum: uploadId={}, acked={}/{}",
+                    upload_id, result.replicas_acked, result.replicas_total
+                );
+                StatusCode::NO_CONTENT.into_response()
+            }
+            Err(e) => {
+                error!("Cluster multipart abort failed: {:?}", e);
+                super::cluster_error_to_response(&e)
+            }
+        };
+    }
 
     let storage = state.storage.read().await;
 
@@ -740,10 +1148,9 @@ pub async fn list_parts(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Verify multipart upload session exists

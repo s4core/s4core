@@ -10,27 +10,47 @@ repository.workspace = true
 name = "s4-server"
 path = "src/main.rs"
 
+[features]
+default = []
+enterprise = ["dep:s4-ee", "dep:s4-ee-license"]
+
 [dependencies]
-# Workspace dependencies
+# Workspace crates
 s4-core = { path = "../s4-core" }
 s4-api = { path = "../s4-api" }
 s4-features = { path = "../s4-features" }
 s4-compactor = { path = "../s4-compactor" }
+s4-cluster = { path = "../s4-cluster" }
+
+# Enterprise Edition (optional, ELv2)
+s4-ee = { path = "../ee/s4-ee", optional = true }
+s4-ee-license = { path = "../ee/s4-ee-license", optional = true }
+
+# Runtime & framework
 tokio = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+tower = { workspace = true }
+
+# Serialization & config
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 config = { workspace = true }
+
+# Logging & metrics
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
-tower = { workspace = true }
+
+# Async
+async-trait = "0.1"
+
+# Error handling
+anyhow = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.10"

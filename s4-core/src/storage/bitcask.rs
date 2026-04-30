@@ -58,12 +58,18 @@ use crate::types::{
 use crate::StorageEngine;
 use base64::Engine;
 use serde::Serialize;
+use sha2::Digest as ShaDigest;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Instant;
+use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf};
 use tokio::sync::RwLock;
+
+const STREAM_VERIFY_BUFFER_SIZE: usize = 1024 * 1024;
 
 // ============================================================================
 // Diagnostic Counters
@@ -855,8 +861,38 @@ impl BitcaskStorageEngine {
         };
 
         let mut record = record;
-        record.metadata.extend(metadata.clone());
         record.modified_at = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+
+        // Extract cluster HLC fields from metadata (passed by coordinator/replica
+        // to achieve atomic HLC stamping in the same batch as the object write).
+        // These reserved keys are stripped before persisting user-visible metadata.
+        for (k, v) in metadata {
+            match k.as_str() {
+                "_s4_hlc_wall" => {
+                    if let Ok(val) = v.parse::<u64>() {
+                        record.hlc_timestamp = val;
+                    }
+                }
+                "_s4_hlc_logical" => {
+                    if let Ok(val) = v.parse::<u32>() {
+                        record.hlc_logical = val;
+                    }
+                }
+                "_s4_hlc_node_id" => {
+                    if let Ok(val) = v.parse::<u128>() {
+                        record.origin_node_id = val;
+                    }
+                }
+                "_s4_operation_id" => {
+                    if let Ok(val) = v.parse::<u128>() {
+                        record.operation_id = val;
+                    }
+                }
+                _ => {
+                    record.metadata.insert(k.clone(), v.clone());
+                }
+            }
+        }
 
         Ok((record, etag, dedup_op))
     }
@@ -1538,6 +1574,20 @@ impl BitcaskStorageEngine {
         }
     }
 
+    /// Reads an existing BlobRefEntry. Multipart completion must never create
+    /// placeholder refs for selected parts; missing refs indicate local
+    /// multipart state corruption or an incomplete replica.
+    fn get_existing_blob_ref(&self, blob_id: &BlobId) -> Result<BlobRefEntry, StorageError> {
+        let ks = self.index_db.blob_refs_keyspace();
+        let value = ks
+            .get(blob_id.as_bytes())
+            .map_err(|e| StorageError::Database(e.to_string()))?
+            .ok_or_else(|| StorageError::BlobRefNotFound {
+                blob_id: blob_id.to_string(),
+            })?;
+        bincode::deserialize(&value).map_err(|e| StorageError::Serialization(e.to_string()))
+    }
+
     /// Creates a batch op to decrement staged ref count for a blob.
     /// Returns None if the blob ref doesn't exist.
     fn decrement_staged_ref_op(&self, blob_id: &BlobId) -> Result<Option<BatchOp>, StorageError> {
@@ -1590,19 +1640,34 @@ impl BitcaskStorageEngine {
     ) -> Result<Vec<BatchOp>, StorageError> {
         let mut ops = Vec::new();
         if let Some(manifest_blob_id) = record.composite_manifest_blob_id() {
-            // Load manifest to find all segment BlobIds
-            let manifest = self.load_composite_manifest(&manifest_blob_id).await?;
-            for seg in &manifest.segments {
-                if let Some(op) = self.decrement_committed_ref_op(&seg.blob_id)? {
+            // Load manifest to find all segment BlobIds.
+            // If the manifest blob ref is missing (e.g. lost during compaction
+            // or crash recovery), we still allow the delete to proceed —
+            // orphaned blobs will be reclaimed by the next compaction cycle.
+            let manifest = match self.load_composite_manifest(&manifest_blob_id).await {
+                Ok(m) => Some(m),
+                Err(StorageError::BlobRefNotFound { .. }) => {
+                    tracing::warn!(
+                        "Manifest blob ref missing during delete, skipping ref cleanup: {}",
+                        manifest_blob_id
+                    );
+                    None
+                }
+                Err(e) => return Err(e),
+            };
+            if let Some(manifest) = manifest {
+                for seg in &manifest.segments {
+                    if let Some(op) = self.decrement_committed_ref_op(&seg.blob_id)? {
+                        ops.push(op);
+                    }
+                    // Also unregister segment from dedup keyspace so compactor
+                    // sees dead blobs correctly (fixes orphaned dedup entries).
+                    ops.push(self.deduplicator.make_unregister_op(&seg.physical_hash));
+                }
+                // Also decrement the manifest blob itself
+                if let Some(op) = self.decrement_committed_ref_op(&manifest_blob_id)? {
                     ops.push(op);
                 }
-                // Also unregister segment from dedup keyspace so compactor
-                // sees dead blobs correctly (fixes orphaned dedup entries).
-                ops.push(self.deduplicator.make_unregister_op(&seg.physical_hash));
-            }
-            // Also decrement the manifest blob itself
-            if let Some(op) = self.decrement_committed_ref_op(&manifest_blob_id)? {
-                ops.push(op);
             }
         }
         Ok(ops)
@@ -1632,6 +1697,33 @@ impl BitcaskStorageEngine {
     ) -> Result<IndexRecord, StorageError> {
         let total_size: u64 = selected_parts.iter().map(|p| p.size).sum();
         let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+
+        for selected in selected_parts {
+            let Some(local) = self.get_multipart_part(upload_id, selected.part_number)? else {
+                return Err(StorageError::InvalidData(format!(
+                    "Multipart part {} is missing locally for upload {}",
+                    selected.part_number, upload_id
+                )));
+            };
+            if local.etag_md5_hex != selected.etag_md5_hex
+                || local.size != selected.size
+                || local.physical_hash != selected.physical_hash
+                || local.blob_id != selected.blob_id
+                || local.crc32 != selected.crc32
+            {
+                return Err(StorageError::InvalidData(format!(
+                    "Multipart part {} does not match local durable record for upload {}",
+                    selected.part_number, upload_id
+                )));
+            }
+            let blob_ref = self.get_existing_blob_ref(&selected.blob_id)?;
+            if blob_ref.ref_count_staged == 0 {
+                return Err(StorageError::InvalidData(format!(
+                    "Multipart part {} has no staged blob ref for upload {}",
+                    selected.part_number, upload_id
+                )));
+            }
+        }
 
         // Build CompositeManifest
         let segments: Vec<ManifestSegmentRef> = selected_parts
@@ -1694,8 +1786,34 @@ impl BitcaskStorageEngine {
             s3_etag.to_string(),
             content_type.to_string(),
         );
-        record.metadata.extend(metadata.clone());
         record.modified_at = now;
+        for (k, v) in metadata {
+            match k.as_str() {
+                "_s4_hlc_wall" => {
+                    if let Ok(val) = v.parse::<u64>() {
+                        record.hlc_timestamp = val;
+                    }
+                }
+                "_s4_hlc_logical" => {
+                    if let Ok(val) = v.parse::<u32>() {
+                        record.hlc_logical = val;
+                    }
+                }
+                "_s4_hlc_node_id" => {
+                    if let Ok(val) = v.parse::<u128>() {
+                        record.origin_node_id = val;
+                    }
+                }
+                "_s4_operation_id" => {
+                    if let Ok(val) = v.parse::<u128>() {
+                        record.operation_id = val;
+                    }
+                }
+                _ => {
+                    record.metadata.insert(k.clone(), v.clone());
+                }
+            }
+        }
         record.layout = Some(ObjectLayout::CompositeManifest {
             manifest_blob_id,
             manifest_blob_len: manifest_bytes.len() as u32,
@@ -1741,11 +1859,7 @@ impl BitcaskStorageEngine {
 
         // 4. Convert staged→committed refs for selected parts
         for part in selected_parts {
-            let blob_ref = self.get_or_create_blob_ref(
-                &part.blob_id,
-                0,
-                0, // won't be used since it must exist
-            )?;
+            let blob_ref = self.get_existing_blob_ref(&part.blob_id)?;
             let updated = BlobRefEntry {
                 location: blob_ref.location,
                 ref_count_committed: blob_ref.ref_count_committed + 1,
@@ -1833,11 +1947,8 @@ impl BitcaskStorageEngine {
         let ref_bytes = ks
             .get(manifest_blob_id.as_bytes())
             .map_err(|e| StorageError::Database(e.to_string()))?
-            .ok_or_else(|| {
-                StorageError::InvalidData(format!(
-                    "Manifest blob ref not found: {}",
-                    manifest_blob_id
-                ))
+            .ok_or_else(|| StorageError::BlobRefNotFound {
+                blob_id: manifest_blob_id.to_string(),
             })?;
         let blob_ref: BlobRefEntry = bincode::deserialize(&ref_bytes)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -1860,7 +1971,9 @@ impl BitcaskStorageEngine {
         let ref_bytes = ks
             .get(blob_id.as_bytes())
             .map_err(|e| StorageError::Database(e.to_string()))?
-            .ok_or_else(|| StorageError::InvalidData(format!("Blob ref not found: {}", blob_id)))?;
+            .ok_or_else(|| StorageError::BlobRefNotFound {
+                blob_id: blob_id.to_string(),
+            })?;
         let blob_ref: BlobRefEntry = bincode::deserialize(&ref_bytes)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
         Ok(blob_ref.location)
@@ -1882,6 +1995,29 @@ impl StorageEngine for BitcaskStorageEngine {
         // Write object data and get dedup batch op
         let (record, etag, dedup_op) =
             self.write_object_data(&full_key, data, content_type, metadata).await?;
+
+        // LWW guard: in cluster mode (HLC present), skip write if existing
+        // record has a newer HLC timestamp. This prevents a concurrent write
+        // with an older HLC from overwriting a version that arrived first.
+        if record.hlc_timestamp > 0 {
+            if let Some(existing) = self.index_db.get(&full_key).await? {
+                if existing.hlc_timestamp > 0 {
+                    let existing_ord = (
+                        existing.hlc_timestamp,
+                        existing.hlc_logical,
+                        existing.origin_node_id,
+                    );
+                    let new_ord = (
+                        record.hlc_timestamp,
+                        record.hlc_logical,
+                        record.origin_node_id,
+                    );
+                    if existing_ord >= new_ord {
+                        return Ok(existing.etag);
+                    }
+                }
+            }
+        }
 
         // ATOMIC BATCH: object record + dedup registration + journal entry
         let record_bytes =
@@ -3146,7 +3282,247 @@ impl tokio::io::AsyncRead for CompositeObjectReader {
     }
 }
 
+struct HashVerifyingReader {
+    inner: Box<dyn AsyncRead + Unpin + Send>,
+    hasher: sha2::Sha256,
+    expected: [u8; 32],
+    verified: bool,
+    object_label: String,
+}
+
+impl HashVerifyingReader {
+    fn new(
+        inner: Box<dyn AsyncRead + Unpin + Send>,
+        expected: [u8; 32],
+        object_label: String,
+    ) -> Self {
+        Self {
+            inner,
+            hasher: sha2::Sha256::new(),
+            expected,
+            verified: false,
+            object_label,
+        }
+    }
+}
+
+impl AsyncRead for HashVerifyingReader {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        let before = buf.filled().len();
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                let after = buf.filled().len();
+                if after > before {
+                    self.hasher.update(&buf.filled()[before..after]);
+                    return Poll::Ready(Ok(()));
+                }
+
+                if !self.verified {
+                    self.verified = true;
+                    let actual: [u8; 32] = std::mem::take(&mut self.hasher).finalize().into();
+                    if actual != self.expected {
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("streaming read checksum mismatch for {}", self.object_label),
+                        )));
+                    }
+                }
+
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+fn full_stream_hash_verifier(
+    record: &IndexRecord,
+    options: &crate::storage::engine::ReadOptions,
+    body: Box<dyn AsyncRead + Unpin + Send>,
+) -> Box<dyn AsyncRead + Unpin + Send> {
+    if options.range.is_none() && record.content_hash != [0u8; 32] {
+        Box::new(HashVerifyingReader::new(
+            body,
+            record.content_hash,
+            format!(
+                "etag={}, version={}",
+                record.etag,
+                record.version_id.as_deref().unwrap_or(NULL_VERSION_ID)
+            ),
+        ))
+    } else {
+        body
+    }
+}
+
+fn integrity_error_label(record: &IndexRecord) -> String {
+    format!(
+        "etag={}, version={}",
+        record.etag,
+        record.version_id.as_deref().unwrap_or(NULL_VERSION_ID)
+    )
+}
+
 impl BitcaskStorageEngine {
+    async fn verify_record_stream_integrity(
+        &self,
+        record: &IndexRecord,
+    ) -> Result<(), StorageError> {
+        if record.content_hash == [0u8; 32] {
+            return Ok(());
+        }
+
+        if record.file_id == u32::MAX && !record.is_composite() {
+            let inline_data_str = record
+                .metadata
+                .get("_inline_data")
+                .ok_or_else(|| StorageError::InvalidData("Inline data not found".to_string()))?;
+            let data =
+                base64::engine::general_purpose::STANDARD.decode(inline_data_str).map_err(|e| {
+                    StorageError::InvalidData(format!("Failed to decode inline data: {}", e))
+                })?;
+            if Deduplicator::compute_hash(&data) != record.content_hash {
+                return Err(StorageError::ChecksumMismatch {
+                    key: integrity_error_label(record),
+                });
+            }
+            return Ok(());
+        }
+
+        let mut object_hasher = sha2::Sha256::new();
+
+        if record.is_composite() {
+            use crate::types::composite::ObjectLayout;
+
+            let manifest_blob_id = match record.effective_layout() {
+                ObjectLayout::CompositeManifest {
+                    manifest_blob_id, ..
+                } => manifest_blob_id,
+                _ => {
+                    return Err(StorageError::InvalidData(
+                        "Expected CompositeManifest layout".to_string(),
+                    ))
+                }
+            };
+
+            let manifest = self.load_composite_manifest(&manifest_blob_id).await?;
+            let mut total_size = 0u64;
+
+            for segment in &manifest.segments {
+                let loc = self.resolve_blob_location(&segment.blob_id)?;
+                self.verify_blob_stream_and_feed_hash(
+                    loc.volume_id,
+                    loc.offset,
+                    Some(segment.size),
+                    Some(segment.crc32),
+                    Some(segment.physical_hash),
+                    &mut object_hasher,
+                )
+                .await?;
+                total_size = total_size.saturating_add(segment.size);
+            }
+
+            if total_size != record.size {
+                return Err(StorageError::InvalidData(format!(
+                    "Composite object size mismatch: manifest={}, record={}",
+                    total_size, record.size
+                )));
+            }
+        } else {
+            self.verify_blob_stream_and_feed_hash(
+                record.file_id,
+                record.offset,
+                Some(record.size),
+                None,
+                Some(record.content_hash),
+                &mut object_hasher,
+            )
+            .await?;
+        }
+
+        let actual: [u8; 32] = object_hasher.finalize().into();
+        if actual != record.content_hash {
+            return Err(StorageError::ChecksumMismatch {
+                key: integrity_error_label(record),
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn verify_blob_stream_and_feed_hash(
+        &self,
+        volume_id: u32,
+        offset: u64,
+        expected_len: Option<u64>,
+        expected_crc32: Option<u32>,
+        expected_hash: Option<[u8; 32]>,
+        object_hasher: &mut sha2::Sha256,
+    ) -> Result<(), StorageError> {
+        let reader = VolumeReader::new(&self.volumes_dir);
+        let (header, key, mut data_reader) = reader.open_blob_stream(volume_id, offset).await?;
+
+        if let Some(expected_len) = expected_len {
+            if header.blob_len != expected_len {
+                return Err(StorageError::InvalidData(format!(
+                    "Blob length mismatch for {}: header={}, expected={}",
+                    key, header.blob_len, expected_len
+                )));
+            }
+        }
+
+        let mut crc_hasher = crc32fast::Hasher::new();
+        let mut blob_hasher = sha2::Sha256::new();
+        let mut bytes_read = 0u64;
+        let mut buf = vec![0u8; STREAM_VERIFY_BUFFER_SIZE];
+
+        loop {
+            let n = data_reader.read(&mut buf).await.map_err(StorageError::Io)?;
+            if n == 0 {
+                break;
+            }
+            let chunk = &buf[..n];
+            crc_hasher.update(chunk);
+            blob_hasher.update(chunk);
+            object_hasher.update(chunk);
+            bytes_read += n as u64;
+        }
+
+        if bytes_read != header.blob_len {
+            return Err(StorageError::InvalidData(format!(
+                "Short blob read for {}: read={}, expected={}",
+                key, bytes_read, header.blob_len
+            )));
+        }
+
+        let actual_crc = crc_hasher.finalize();
+        if header.crc != 0 && actual_crc != header.crc {
+            return Err(StorageError::ChecksumMismatch { key });
+        }
+        if let Some(expected_crc32) = expected_crc32 {
+            if actual_crc != expected_crc32 {
+                return Err(StorageError::ChecksumMismatch { key });
+            }
+        }
+
+        if let Some(expected_hash) = expected_hash {
+            let actual_hash: [u8; 32] = blob_hasher.finalize().into();
+            if actual_hash != expected_hash {
+                return Err(StorageError::ChecksumMismatch { key });
+            }
+        }
+
+        Ok(())
+    }
+
     /// Opens a streaming reader for a given IndexRecord.
     ///
     /// Handles legacy inline objects, single-blob volume objects, and
@@ -3164,6 +3540,7 @@ impl BitcaskStorageEngine {
         }
 
         let total_size = record.size;
+        self.verify_record_stream_integrity(&record).await?;
 
         // Legacy inline storage: fall back to buffered read
         if record.file_id == u32::MAX && !record.is_composite() {
@@ -3177,12 +3554,17 @@ impl BitcaskStorageEngine {
                 })?;
             let (response_data, content_length, content_range) =
                 apply_range_to_vec(data, total_size, &options);
+            let body = full_stream_hash_verifier(
+                &record,
+                &options,
+                Box::new(std::io::Cursor::new(response_data)),
+            );
             return Ok(crate::storage::engine::ObjectStream {
                 record,
                 total_size,
                 content_length,
                 content_range,
-                body: Box::new(std::io::Cursor::new(response_data)),
+                body,
             });
         }
 
@@ -3220,13 +3602,14 @@ impl BitcaskStorageEngine {
             None => {
                 let (_header, _key, data_reader) =
                     reader.open_blob_stream(record.file_id, record.offset).await?;
+                let body = full_stream_hash_verifier(&record, &options, Box::new(data_reader));
 
                 Ok(crate::storage::engine::ObjectStream {
                     record,
                     total_size,
                     content_length: total_size,
                     content_range: None,
-                    body: Box::new(data_reader),
+                    body,
                 })
             }
         }
@@ -3318,12 +3701,14 @@ impl BitcaskStorageEngine {
             None
         };
 
+        let body = full_stream_hash_verifier(&record, &options, Box::new(composite_reader));
+
         Ok(crate::storage::engine::ObjectStream {
             record,
             total_size,
             content_length: range_len,
             content_range,
-            body: Box::new(composite_reader),
+            body,
         })
     }
 }
@@ -3873,6 +4258,58 @@ mod tests {
 
         // Should be gone
         assert!(engine.get_object("bucket", "key.bin").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_native_multipart_complete_rejects_missing_blob_ref() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = create_test_engine(&temp_dir).await;
+
+        let upload_id = "test-complete-missing-blob-ref-001";
+        let metadata = HashMap::new();
+        engine
+            .create_multipart_session(
+                upload_id,
+                "bucket",
+                "key.bin",
+                "application/octet-stream",
+                &metadata,
+            )
+            .await
+            .unwrap();
+
+        let part = vec![7u8; 256];
+        let uploaded = engine
+            .upload_part_streaming(upload_id, 1, Box::new(std::io::Cursor::new(part)), 256)
+            .await
+            .unwrap();
+        let selected = uploaded.record;
+
+        engine
+            .index_db
+            .batch_write(vec![BatchOp {
+                keyspace: KeyspaceId::BlobRefs,
+                action: BatchAction::Delete(selected.blob_id.as_bytes().to_vec()),
+            }])
+            .await
+            .unwrap();
+
+        engine.mark_session_completing(upload_id).await.unwrap();
+        let err = engine
+            .complete_multipart_native(
+                "bucket",
+                "key.bin",
+                upload_id,
+                &[selected],
+                "etag",
+                "application/octet-stream",
+                &metadata,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, StorageError::BlobRefNotFound { .. }));
+        assert!(engine.head_object("bucket", "key.bin").await.is_err());
     }
 
     #[tokio::test]

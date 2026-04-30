@@ -12,6 +12,7 @@ s4-core = { path = "../s4-core" }
 s4-features = { path = "../s4-features" }
 s4-select = { path = "../s4-select" }
 s4-compactor = { path = "../s4-compactor" }
+s4-cluster = { path = "../s4-cluster" }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }

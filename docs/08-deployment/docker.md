@@ -140,6 +140,10 @@ S4 stores all data in the `/data` directory inside the container. Always use a D
 
 **Warning:** Without a volume, all data is lost when the container is removed.
 
+## Cluster Deployment (Docker)
+
+For deploying a multi-node S4 cluster with Docker Compose, see [Cluster Deployment](clustering.md#docker-compose).
+
 ## Resource Recommendations
 
 | Workload | CPU | RAM | Storage |

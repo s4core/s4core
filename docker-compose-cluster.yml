@@ -1,0 +1,92 @@
+services:
+  haproxy:
+    image: haproxy:3.1-alpine
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "9000:9000"
+      - "8404:8404"
+    depends_on:
+      s4-node1:
+        condition: service_healthy
+      s4-node2:
+        condition: service_healthy
+      s4-node3:
+        condition: service_healthy
+
+  s4-node1:
+    image: s4core/s4core:latest
+    environment:
+      S4_MODE: cluster
+      S4_BIND: "0.0.0.0:9000"
+      S4_CLUSTER_NAME: production
+      S4_NODE_ID: node-1
+      S4_NODE_GRPC_ADDR: s4-node1:9100
+      S4_NODE_HTTP_ADDR: s4-node1:9000
+      S4_SEEDS: s4-node1:9100,s4-node2:9100,s4-node3:9100
+      S4_POOL_NAME: pool-1
+      S4_POOL_NODES: "node-1:s4-node1:9100,node-2:s4-node2:9100,node-3:s4-node3:9100"
+      S4_DATA_DIR: /data
+      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
+      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
+    volumes:
+      - s4-data-1:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+  s4-node2:
+    image: s4core/s4core:latest
+    environment:
+      S4_MODE: cluster
+      S4_BIND: "0.0.0.0:9000"
+      S4_CLUSTER_NAME: production
+      S4_NODE_ID: node-2
+      S4_NODE_GRPC_ADDR: s4-node2:9100
+      S4_NODE_HTTP_ADDR: s4-node2:9000
+      S4_SEEDS: s4-node1:9100,s4-node2:9100,s4-node3:9100
+      S4_POOL_NAME: pool-1
+      S4_POOL_NODES: "node-1:s4-node1:9100,node-2:s4-node2:9100,node-3:s4-node3:9100"
+      S4_DATA_DIR: /data
+      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
+      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
+    volumes:
+      - s4-data-2:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+  s4-node3:
+    image: s4core/s4core:latest
+    environment:
+      S4_MODE: cluster
+      S4_BIND: "0.0.0.0:9000"
+      S4_CLUSTER_NAME: production
+      S4_NODE_ID: node-3
+      S4_NODE_GRPC_ADDR: s4-node3:9100
+      S4_NODE_HTTP_ADDR: s4-node3:9000
+      S4_SEEDS: s4-node1:9100,s4-node2:9100,s4-node3:9100
+      S4_POOL_NAME: pool-1
+      S4_POOL_NODES: "node-1:s4-node1:9100,node-2:s4-node2:9100,node-3:s4-node3:9100"
+      S4_DATA_DIR: /data
+      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
+      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
+    volumes:
+      - s4-data-3:/data
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+volumes:
+  s4-data-1:
+  s4-data-2:
+  s4-data-3:

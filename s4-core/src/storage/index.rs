@@ -1004,6 +1004,89 @@ impl IndexDb {
         .map_err(|e| StorageError::Database(e.to_string()))?
     }
     // ========================================================================
+    // Tombstone scanning (Phase 8: Distributed GC)
+    // ========================================================================
+
+    /// Returns a clone of the `objects` keyspace handle.
+    ///
+    /// Used by distributed GC (Phase 8) to scan for tombstones and live
+    /// objects without going through the string-prefix routing layer.
+    pub fn objects_keyspace(&self) -> Keyspace {
+        self.objects.clone()
+    }
+
+    /// Scans the objects keyspace and returns all tombstone (delete marker) records.
+    ///
+    /// A tombstone is an [`IndexRecord`] with `is_delete_marker == true`.
+    /// Returns `(key, record)` pairs for all tombstones found.
+    ///
+    /// # Performance
+    ///
+    /// Full scan of the objects keyspace. Intended for periodic background GC,
+    /// not hot-path usage.
+    pub async fn scan_tombstones(&self) -> Result<Vec<(String, IndexRecord)>, StorageError> {
+        let objects = self.objects.clone();
+
+        task::spawn_blocking(move || {
+            let mut results = Vec::new();
+
+            for guard in objects.iter() {
+                let (key_bytes, value_bytes) =
+                    guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
+
+                let record: IndexRecord = bincode::deserialize(&value_bytes)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+                if record.is_delete_marker {
+                    let key_str = std::str::from_utf8(&key_bytes)
+                        .map_err(|e| StorageError::Database(e.to_string()))?
+                        .to_string();
+
+                    results.push((key_str, record));
+                }
+            }
+
+            Ok(results)
+        })
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+    }
+
+    /// Scans the objects keyspace and returns all live (non-tombstone) content hashes.
+    ///
+    /// Used by mark-sweep dedup GC (Phase 8) to identify which content hashes
+    /// are still referenced by at least one live object.
+    ///
+    /// # Returns
+    ///
+    /// A set of SHA-256 content hashes (`[u8; 32]`) for all live objects.
+    pub async fn scan_live_content_hashes(
+        &self,
+    ) -> Result<std::collections::HashSet<[u8; 32]>, StorageError> {
+        let objects = self.objects.clone();
+
+        task::spawn_blocking(move || {
+            let mut live_hashes = std::collections::HashSet::new();
+
+            for guard in objects.iter() {
+                let (_key_bytes, value_bytes) =
+                    guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
+
+                let record: IndexRecord = bincode::deserialize(&value_bytes)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+
+                if !record.is_delete_marker && record.content_hash != [0u8; 32] {
+                    live_hashes.insert(record.content_hash);
+                }
+            }
+
+            Ok(live_hashes)
+        })
+        .await
+        .map_err(|e| StorageError::Database(e.to_string()))?
+    }
+
+    // ========================================================================
     // Compaction support
     // ========================================================================
 

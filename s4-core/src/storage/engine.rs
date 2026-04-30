@@ -497,9 +497,10 @@ pub trait StorageEngine: Send + Sync {
     /// For range requests, only the requested byte range is read from disk.
     /// Memory usage is O(buffer_size), not O(object_size).
     ///
-    /// **This method does NOT verify the content hash.** The caller is
-    /// responsible for CRC verification if needed. For large objects,
-    /// full-body hash verification is impractical in streaming mode.
+    /// Implementations should validate local storage integrity before exposing
+    /// bytes to the caller when content hashes or per-blob checksums are
+    /// available. This includes ranged reads: implementations may need to
+    /// validate the backing blob/object before returning a range stream.
     async fn open_object_stream(
         &self,
         bucket: &str,

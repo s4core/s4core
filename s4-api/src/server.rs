@@ -26,6 +26,7 @@ use axum::{
     routing::{delete, get, head, post, put},
     Router,
 };
+use s4_cluster::{DistributedListCoordinator, QuorumReadCoordinator, QuorumWriteCoordinator};
 use s4_core::storage::{BitcaskStorageEngine, StorageEngine};
 use s4_features::iam::{models::User, AuthService, IamStorage, JwtManager};
 
@@ -69,6 +70,16 @@ pub struct AppState {
     /// Parts are written to temp files on disk, keeping memory usage flat.
     /// Data is lost on server crash — incomplete multipart uploads are not recoverable.
     pub part_store: Arc<DiskPartStore>,
+
+    // --- Cluster coordinators (Phase 4-5 integration) ---
+    // When `Some`, handlers route operations through quorum coordinators.
+    // When `None` (standalone mode), handlers use the local storage engine directly.
+    /// Quorum write coordinator for distributed PUT/DELETE.
+    pub write_coordinator: Option<Arc<QuorumWriteCoordinator>>,
+    /// Quorum read coordinator for distributed GET/HEAD.
+    pub read_coordinator: Option<Arc<QuorumReadCoordinator>>,
+    /// Distributed LIST coordinator for scatter-gather list operations.
+    pub list_coordinator: Option<Arc<DistributedListCoordinator>>,
 }
 
 impl AppState {
@@ -141,6 +152,9 @@ impl AppState {
             prometheus_handle: None,
             start_time: std::time::Instant::now(),
             part_store,
+            write_coordinator: None,
+            read_coordinator: None,
+            list_coordinator: None,
         }
     }
 
@@ -151,6 +165,27 @@ impl AppState {
     ) -> Self {
         self.prometheus_handle = Some(handle);
         self
+    }
+
+    /// Sets the cluster coordinators for distributed mode.
+    ///
+    /// When coordinators are set, handlers route PUT/GET/HEAD/DELETE/LIST
+    /// through quorum coordinators instead of the local storage engine.
+    pub fn with_cluster_coordinators(
+        mut self,
+        write: Arc<QuorumWriteCoordinator>,
+        read: Arc<QuorumReadCoordinator>,
+        list: Arc<DistributedListCoordinator>,
+    ) -> Self {
+        self.write_coordinator = Some(write);
+        self.read_coordinator = Some(read);
+        self.list_coordinator = Some(list);
+        self
+    }
+
+    /// Returns true if cluster mode is active (coordinators are set).
+    pub fn is_cluster_mode(&self) -> bool {
+        self.write_coordinator.is_some()
     }
 }
 
@@ -1060,6 +1095,23 @@ pub fn create_router(state: AppState) -> Router {
             get(handlers::admin::list_bucket_objects),
         )
         .route("/compaction/run", post(handlers::admin::run_compaction))
+        .route("/scrubber/run", post(handlers::admin::run_scrubber))
+        .route("/scrubber/status", get(handlers::admin::scrubber_status))
+        // Cluster operations (Phase 10)
+        .route(
+            "/cluster/health",
+            get(handlers::admin_cluster::cluster_health),
+        )
+        .route(
+            "/cluster/topology",
+            get(handlers::admin_cluster::cluster_topology),
+        )
+        .route(
+            "/cluster/repair-status",
+            get(handlers::admin_cluster::repair_status),
+        )
+        .route("/node/health", get(handlers::admin_cluster::node_health))
+        .route("/node/drain", post(handlers::admin_cluster::node_drain))
         // Add JWT authentication middleware
         .layer(middleware::from_fn_with_state(
             state.clone(),

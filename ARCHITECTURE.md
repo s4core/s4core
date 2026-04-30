@@ -156,6 +156,13 @@ blob data remains as dead space. The compactor reclaims this space:
    - Rename old volume to `.dat.compacted`, then delete (crash-safe two-phase removal)
 5. **Report** statistics: volumes compacted, bytes reclaimed, errors
 
+### Two Compaction Modes
+
+- **Regular** (every N hours, default 6): processes up to 10 volumes per cycle — lightweight, minimal I/O impact
+- **Full** (once daily at configured time, default 02:00 local): processes all volumes with no limits — reclaims all dead space
+
+The daily full compaction time is configurable via `S4_COMPACTION_FULL_TIME` (format: "HH:MM"). Set to empty string to disable.
+
 ### Key Invariants
 
 - **Never lose confirmed data** — old volume is deleted only after all live blobs are verified relocated
@@ -181,10 +188,80 @@ or data corruption. It reports the number of healthy and corrupted blobs.
 - **Throughput**: Limited by disk sequential write speed (~500MB/s on SSD)
 - **Concurrency**: High (async I/O with tokio)
 
-## Scalability
+## Scalability & Federation
 
-S4 is designed as a single-node system. For high availability:
-- Use Active-Passive HA with external replication (DRBD, filesystem-level)
-- Use load balancer for multiple instances (each with separate storage)
+S4 supports two deployment modes:
 
-Distributed mode (Raft, sharding) is not implemented to keep the codebase simple and maintainable.
+### Single-Node Mode (Default)
+
+Optimized for maximum performance on one machine. No distributed overhead. All data is stored locally.
+
+### Distributed Mode (Federation)
+
+S4 uses **leaderless quorum replication** for high availability. Any node can accept any request — there is no single leader.
+
+```
+                    ┌─────────────────────┐
+                    │   Load Balancer     │
+                    │   (HAProxy/Nginx)   │
+                    └──────────┬──────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              │                │                │
+        ┌─────▼─────┐   ┌─────▼─────┐   ┌─────▼─────┐
+        │  Node 1   │   │  Node 2   │   │  Node 3   │
+        │           │◄─►│           │◄─►│           │
+        │ S3 API +  │   │ S3 API +  │   │ S3 API +  │
+        │ Storage   │   │ Storage   │   │ Storage   │
+        ├───────────┤   ├───────────┤   ├───────────┤
+        │ fjall     │   │ fjall     │   │ fjall     │
+        │ volumes   │   │ volumes   │   │ volumes   │
+        ├───────────┤   ├───────────┤   ├───────────┤
+        │ Gossip    │◄─►│ Gossip    │◄─►│ Gossip    │
+        │ (SWIM)    │   │ (SWIM)    │   │ (SWIM)    │
+        └───────────┘   └───────────┘   └───────────┘
+              Pool 1 (immutable after creation)
+```
+
+**Key properties:**
+- **Server Pools**: Cluster = union of immutable pools. Each pool is a fixed set of nodes (recommended: 3). Horizontal scaling = adding new pools.
+- **Quorum (N=3, W=2, R=2)**: Reads and writes tolerate 1 node failure. W+R > N guarantees read-your-writes.
+- **SWIM Gossip**: Failure detection via the `foca` crate (suspect: 5s, dead: 30s).
+- **gRPC Inter-Node**: Data and metadata replication over gRPC (port 9100), optional TLS.
+- **Multipart Quorum State**: Multipart sessions, uploaded part records, and completion are stored through the replica quorum, so load balancers do not need sticky sessions. `UploadPart`, `UploadPartCopy`, and aws-chunked multipart requests stream through bounded buffers instead of materializing full parts in RAM.
+- **Bucket-to-Pool Pinning**: Each bucket belongs to one pool. All objects in a bucket are on the same set of nodes.
+- **Hinted Handoff**: Writes to offline replicas are stored as hints (TTL: 3h) and delivered on recovery.
+- **Read Repair**: Stale replicas are asynchronously updated when detected during reads.
+- **HLC Ordering**: Hybrid Logical Clocks provide causal ordering; conflicts resolved by Last-Writer-Wins (LWW).
+- **Anti-Entropy**: Background Merkle tree exchange every 10 minutes detects and repairs divergences between replicas.
+- **Distributed Tombstones**: Tombstones live for `gc_grace` (7 days) and are only purged after all replicas confirm synchronization via repair frontier.
+- **Per-Node Dedup**: Deduplication remains local to each node (no cross-node dedup coordination). Mark-sweep GC replaces ref-count decrement.
+- **Bit Rot Protection**: Background scrubber verifies CRC32 checksums across all volumes (full scan every 30 days). Corrupted blobs are auto-healed from replicas.
+- **Deployment Modes**: `single` (default), `cluster` (storage + replication), `gateway` (stateless router).
+- **Graceful Operations**: Graceful shutdown with drain, rolling upgrades with protocol versioning, admin API for cluster health and operations.
+
+## Editions (CE / EE)
+
+S4 follows an Open-Core model with two editions built from the same codebase:
+
+- **Community Edition (CE)**: Apache 2.0. Full single-node and 3-node cluster (1 pool, RF=3, W=2, R=2). All clustering primitives (gossip, gRPC, quorum, anti-entropy, tombstone GC, CRC scrubber) are included.
+- **Enterprise Edition (EE)**: Elastic License 2.0. Removes scaling limits (unlimited pools and nodes) and adds operational features (deep SHA-256 scrubber, rolling upgrades, automated node replacement, LDAP/SAML/OIDC, WebDAV, audit log).
+
+### CE/EE Boundary
+
+The boundary is enforced at two levels:
+
+1. **Quantitative limits** (`ClusterLimits`): CE = 1 pool, 3 nodes. EE limits come from the Ed25519-signed license.
+2. **Trait-based DI** (`ClusterServices`): EE behavioral features (deep scrubber, node replacer, etc.) are injected via trait objects. CE uses noop implementations.
+
+`#[cfg(feature = "enterprise")]` appears **only** in `s4-server/src/edition.rs`. No feature gates in domain code.
+
+### Docker Images
+
+| Tag | Edition |
+|-----|---------|
+| `s4core:latest` | CE (default) |
+| `s4core:ce` | CE (explicit alias) |
+| `s4core:ee` | EE (requires `S4_LICENSE_KEY`) |
+
+Build locally: `docker build .` (CE) or `docker build --build-arg EDITION=ee .` (EE).

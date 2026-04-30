@@ -23,6 +23,7 @@
 //! - Admin API operations (user management, IAM)
 
 pub mod admin;
+pub mod admin_cluster;
 pub mod bucket;
 pub mod bucket_config;
 pub mod multipart;
@@ -56,3 +57,71 @@ pub use object_lock::{
     put_bucket_object_lock_configuration, put_object_legal_hold, put_object_retention,
 };
 pub use select::{bucket_sql_query, select_object_content};
+
+/// Check if a bucket exists in standalone mode.
+///
+/// In cluster mode (when `write_coordinator` is present), bucket markers are
+/// replicated to all nodes via the write coordinator during `CreateBucket`, and
+/// the replica write handler auto-creates markers as a defense-in-depth measure.
+/// Therefore, this check is only needed in standalone mode.
+///
+/// Returns `Some(NoSuchBucket response)` if the bucket does not exist in
+/// standalone mode, or `None` if the check passes (or cluster mode is active).
+pub(crate) async fn check_bucket_standalone(
+    state: &crate::server::AppState,
+    storage: &dyn s4_core::StorageEngine,
+    bucket: &str,
+) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse;
+    if state.write_coordinator.is_some() {
+        return None; // cluster mode: bucket markers are replicated
+    }
+    let marker_key = format!("__s4_bucket_marker_{}", bucket);
+    if storage.head_object("__system__", &marker_key).await.is_err() {
+        return Some(crate::s3::errors::S3Error::NoSuchBucket.into_response());
+    }
+    None
+}
+
+/// Convert a cluster error into an HTTP response.
+///
+/// Shared by all handlers that interact with cluster coordinators.
+pub(crate) fn cluster_error_to_response(
+    err: &s4_cluster::ClusterError,
+) -> axum::response::Response {
+    use crate::s3::errors::S3Error;
+    use axum::body::Body;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    match err {
+        s4_cluster::ClusterError::ObjectNotFound { .. } => S3Error::NoSuchKey.into_response(),
+        s4_cluster::ClusterError::MultipartUploadNotFound { .. } => {
+            S3Error::NoSuchUpload.into_response()
+        }
+        s4_cluster::ClusterError::InvalidMultipartPart { message, .. } => {
+            S3Error::InvalidRequest(message.clone()).into_response()
+        }
+        s4_cluster::ClusterError::MultipartPartTooSmall { .. } => {
+            S3Error::EntityTooSmall.into_response()
+        }
+        s4_cluster::ClusterError::QuorumNotMet { .. }
+        | s4_cluster::ClusterError::WriteTimeout(_)
+        | s4_cluster::ClusterError::ReadTimeout(_) => axum::response::Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from(format!("{}", err)))
+            .unwrap(),
+        s4_cluster::ClusterError::EpochMismatch { .. } => axum::response::Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from("Cluster topology is changing, retry"))
+            .unwrap(),
+        s4_cluster::ClusterError::Placement(msg) if msg.contains("no pool") => {
+            S3Error::NoSuchBucket.into_response()
+        }
+        _ => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Cluster error: {}", err),
+        )
+            .into_response(),
+    }
+}

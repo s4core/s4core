@@ -1,0 +1,17 @@
+[package]
+name = "s4-ee"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "Elastic-2.0"
+description = "S4Core Enterprise Edition — feature implementations"
+
+[dependencies]
+s4-cluster = { path = "../../s4-cluster" }
+s4-ee-license = { path = "../s4-ee-license" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }

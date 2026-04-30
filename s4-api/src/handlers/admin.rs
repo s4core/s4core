@@ -520,11 +520,22 @@ pub async fn run_compaction(
 
     let storage = state.storage.read().await;
 
-    let config = s4_compactor::CompactionConfig::on_demand(
+    let mut config = s4_compactor::CompactionConfig::on_demand(
         params.threshold.unwrap_or(0.0),
         params.dry_run.unwrap_or(false),
         s4_compactor::CompactionConfig::multipart_ttl_from_env(),
     );
+
+    // Override max volumes if specified (useful for testing partial compaction)
+    if let Some(max_vols) = params.max_volumes {
+        config.max_volumes_per_run = max_vols;
+    }
+
+    // In cluster mode, journal compaction is managed by the replication layer
+    // with replica-aware sequence tracking — disable it for on-demand runs too.
+    if state.is_cluster_mode() {
+        config.compact_journal = false;
+    }
 
     let compactor = s4_compactor::VolumeCompactor::new(
         storage.volumes_dir().to_path_buf(),
@@ -558,6 +569,77 @@ pub struct CompactionParams {
     pub dry_run: Option<bool>,
     /// Fragmentation threshold (0.0-1.0). Default 0.0 = compact all fragmented volumes.
     pub threshold: Option<f64>,
+    /// Maximum number of volumes to compact per run. Default 0 = unlimited.
+    pub max_volumes: Option<usize>,
+}
+
+/// Run an on-demand CRC32 integrity scrub of all volumes.
+///
+/// POST /api/admin/scrubber/run
+/// Headers: `Authorization: Bearer <token>`
+/// Returns: `{ "blobs_checked": N, "blobs_ok": N, "blobs_corrupted": N, ... }`
+pub async fn run_scrubber(
+    State(state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+) -> Result<Json<serde_json::Value>, AdminError> {
+    if !claims.role.can_admin() {
+        return Err(AdminError::Forbidden);
+    }
+
+    let storage = state.storage.read().await;
+    let scrubber = s4_compactor::VolumeScrubber::new(storage.volumes_dir());
+
+    let result = scrubber
+        .scrub_all()
+        .await
+        .map_err(|e| AdminError::Storage(format!("Scrubber failed: {e}")))?;
+
+    let errors: Vec<serde_json::Value> = result
+        .errors
+        .iter()
+        .map(|e| {
+            json!({
+                "volume_id": e.volume_id,
+                "offset": e.offset,
+                "key": e.key,
+                "expected_crc": e.expected_crc,
+                "actual_crc": e.actual_crc,
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "blobs_checked": result.blobs_checked,
+        "blobs_ok": result.blobs_ok,
+        "blobs_corrupted": result.blobs_corrupted,
+        "volumes_scanned": result.volumes_scanned,
+        "errors": errors,
+    })))
+}
+
+/// Get the status of the background scrubber (if running in cluster mode).
+///
+/// GET /api/admin/scrubber/status
+/// Headers: `Authorization: Bearer <token>`
+/// Returns: `{ "mode": "standalone", "message": "..." }`
+///
+/// In standalone mode, returns a static message. In cluster mode (Phase 10),
+/// this will return live scrubber metrics from the background service.
+pub async fn scrubber_status(
+    State(_state): State<AppState>,
+    Extension(claims): Extension<JwtClaims>,
+) -> Result<Json<serde_json::Value>, AdminError> {
+    if !claims.role.can_admin() {
+        return Err(AdminError::Forbidden);
+    }
+
+    // In standalone mode, there is no background scrubber running.
+    // Use POST /api/admin/scrubber/run for on-demand scrubbing.
+    Ok(Json(json!({
+        "mode": "standalone",
+        "background_scrubber": false,
+        "message": "Use POST /api/admin/scrubber/run for on-demand CRC32 integrity check. Background scrubber is available in cluster mode.",
+    })))
 }
 
 /// Admin API error type.

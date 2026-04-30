@@ -720,6 +720,177 @@ async fn test_compaction_preserves_recently_active_session() {
     );
 }
 
+/// Regression test: partial compaction (max_volumes_per_run hit) must NOT clear
+/// the metadata journal. Clearing journal prematurely causes ghost objects on
+/// server restart — volume-only recovery resurrects deleted objects from
+/// uncompacted volumes when the objects keyspace is empty and the journal
+/// cannot provide the delete events.
+///
+/// Bug scenario (before fix):
+///   1. Upload objects → journal has ObjectPut entries
+///   2. Delete all objects → journal has ObjectDelete entries
+///   3. Background compactor runs with max_volumes_per_run=10
+///      → compacts 10 volumes, clears ENTIRE journal
+///   4. Server restarts → objects keyspace empty (fjall compacted tombstones),
+///      journal empty → falls back to volume-only recovery → ghost objects!
+///
+/// Fix: journal is only cleared when ALL volumes have been processed
+/// (no max_volumes_per_run limit hit).
+#[tokio::test]
+async fn test_partial_compaction_preserves_journal() {
+    let temp = TempDir::new().unwrap();
+    let engine = create_test_engine(&temp).await;
+    let bucket = "test-ghost";
+
+    // 1. Write enough objects to create multiple volumes (4KB each, ~200B per object)
+    //    Need at least 4 volumes: 2 will be compacted (limited run), 1+ remain, 1 active.
+    let objects = write_objects(&engine, bucket, 60, "ghost-").await;
+    engine.sync().await.unwrap();
+
+    let volumes_after_write = count_volume_files(&temp);
+    assert!(
+        volumes_after_write >= 4,
+        "Need at least 4 volumes to test partial compaction, got {}",
+        volumes_after_write
+    );
+
+    // Verify journal has entries (ObjectPut events)
+    assert!(
+        !engine.journal().is_empty().unwrap(),
+        "Journal should have entries after writing objects"
+    );
+
+    // 2. Delete most objects, keep one alive to prevent the purge_all_dead_volumes
+    //    fast-path (which triggers when dedup index is empty). We need the normal
+    //    compaction path to test max_volumes_per_run behavior.
+    let survivor_key = &objects[0].0;
+    for (key, _) in &objects[1..] {
+        engine.delete_object(bucket, key).await.unwrap();
+    }
+    engine.sync().await.unwrap();
+
+    // Journal should still have entries (both Put and Delete events)
+    assert!(
+        !engine.journal().is_empty().unwrap(),
+        "Journal should have entries after deleting objects"
+    );
+
+    // 3. Run compaction with max_volumes_per_run=2 (partial — simulates background compactor)
+    let config = CompactionConfig {
+        fragmentation_threshold: 0.0,
+        min_dead_bytes: 0,
+        max_volumes_per_run: 2,
+        compact_journal: true,
+        max_volume_size: 1024 * 1024 * 1024,
+        multipart_session_ttl_secs: 24 * 3600,
+        dry_run: false,
+    };
+
+    let compactor = VolumeCompactor::new(
+        engine.volumes_dir().to_path_buf(),
+        engine.index_db().clone(),
+        engine.deduplicator().clone(),
+        engine.volume_writer().clone(),
+        config,
+    );
+
+    let stats = compactor.run().await.unwrap();
+
+    // Should have compacted exactly 2 volumes (hit the limit)
+    assert_eq!(
+        stats.volumes_compacted, 2,
+        "Expected exactly 2 volumes compacted (limited run), got {}",
+        stats.volumes_compacted
+    );
+
+    // KEY ASSERTION: journal must NOT be cleared after partial compaction!
+    // If journal is empty here, a server restart could trigger volume-only
+    // recovery and resurrect deleted objects from uncompacted volumes.
+    assert!(
+        !engine.journal().is_empty().unwrap(),
+        "BUG: journal was cleared after partial compaction! \
+         This causes ghost objects on server restart."
+    );
+
+    // Verify the survivor is still readable
+    let (data, _record) = engine.get_object(bucket, survivor_key).await.unwrap();
+    assert_eq!(
+        data, objects[0].1,
+        "Surviving object data should be intact after partial compaction"
+    );
+
+    // 4. Delete the survivor and run unlimited compaction
+    engine.delete_object(bucket, survivor_key).await.unwrap();
+    engine.sync().await.unwrap();
+
+    let config_unlimited = CompactionConfig::on_demand(0.0, false, 24 * 3600);
+
+    let compactor2 = VolumeCompactor::new(
+        engine.volumes_dir().to_path_buf(),
+        engine.index_db().clone(),
+        engine.deduplicator().clone(),
+        engine.volume_writer().clone(),
+        config_unlimited,
+    );
+
+    let stats2 = compactor2.run().await.unwrap();
+    assert_eq!(stats2.errors, 0);
+
+    // After unlimited compaction, journal SHOULD be cleared
+    assert!(
+        engine.journal().is_empty().unwrap(),
+        "Journal should be cleared after full (unlimited) compaction"
+    );
+}
+
+/// Regression test: the purge_all_dead_volumes fast-path (when both dedup and
+/// blob_ref indices are empty) must also clear the journal and flush WAL.
+/// Before the fix, this path returned early and skipped Step 5 (journal) and
+/// Step 6 (WAL flush).
+#[tokio::test]
+async fn test_purge_fast_path_clears_journal() {
+    let temp = TempDir::new().unwrap();
+    let engine = create_test_engine(&temp).await;
+    let bucket = "test-purge-journal";
+
+    // 1. Write objects to create volumes
+    let objects = write_objects(&engine, bucket, 20, "purge-j-").await;
+    engine.sync().await.unwrap();
+
+    // 2. Delete ALL objects (dedup entries will be removed)
+    for (key, _) in &objects {
+        engine.delete_object(bucket, key).await.unwrap();
+    }
+    engine.sync().await.unwrap();
+
+    // Journal should have entries
+    assert!(
+        !engine.journal().is_empty().unwrap(),
+        "Journal should have entries before compaction"
+    );
+
+    // 3. Run unlimited compaction — should take the purge_all_dead_volumes fast-path
+    //    (dedup index is empty after all objects deleted)
+    let config = CompactionConfig::on_demand(0.0, false, 24 * 3600);
+    let compactor = VolumeCompactor::new(
+        engine.volumes_dir().to_path_buf(),
+        engine.index_db().clone(),
+        engine.deduplicator().clone(),
+        engine.volume_writer().clone(),
+        config,
+    );
+
+    let stats = compactor.run().await.unwrap();
+    assert_eq!(stats.errors, 0);
+    assert!(stats.volumes_compacted > 0);
+
+    // Journal MUST be cleared by the fast-path (before fix, it wasn't)
+    assert!(
+        engine.journal().is_empty().unwrap(),
+        "BUG: purge_all_dead_volumes fast-path did not clear journal!"
+    );
+}
+
 fn count_volume_files(temp: &TempDir) -> usize {
     std::fs::read_dir(temp.path().join("volumes"))
         .unwrap()

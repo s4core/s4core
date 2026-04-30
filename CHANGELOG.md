@@ -1,3 +1,32 @@
+# v1.0.0-beta-federation
+
+# S4-Federation, Cluster Recovery & Compaction
+
+**Release Overview**
+In this major update (67 commits), full support for distributed mode (S4-Federation). Alongside clustering, this update brings critical improvements to crash recovery, optimizes startup memory consumption, and resolves fundamental garbage collection (compactor) issues related to multipart uploads and "dead" volumes.
+
+## 🚀 New Features
+* **S4-Federation:** Completed the implementation of the distributed mode. Added support for load balancers, proper cluster node resolution, and reliable state synchronization.
+* **Enterprise Edition:** Added the architectural foundation and build support for the Enterprise Edition.
+* **Configurable Daily Compaction:** Added the ability to schedule a daily full garbage collector run (default is 02:00 AM) to completely free up unused disk space.
+
+## ⚡ Performance & Architecture Optimizations
+* **Fast Startup (O(1) Memory):** The `count_inline_objects` algorithm now uses O(1) memory. This completely eliminates multi-minute hangs during cold starts on large keyspaces.
+* **Metadata Journal Compaction:** Implemented the `compact_journal_all` method to prevent unbounded growth of the metadata journal.
+* **WAL and LSM Optimization:** Added a `persist()` method to forcefully flush the write-ahead log (fjall) to disk and immediately trigger LSM compaction after bulk object deletions.
+* **Deduplicator Optimization:** During normal system startup, deduplicator rebuilding is now skipped if the deduplication data is already persistent.
+
+## 🛡️ Crash Recovery
+* **Safe Volume Handling:** The garbage collector (compactor) now safely bypasses unreadable and corrupted volumes (bit-rot protection) and correctly cleans up completely orphaned multipart sessions and "dead" volumes with no active references.
+
+## 🐛 Bug Fixes
+* **Memory/Space Leak on Multipart Object Deletion:** Fixed a critical bug in `bitcask.rs` where deleting multipart objects did not decrement the reference count in `DedupEntry`. This caused deleted segments to be forever considered "alive" and endlessly copied by the compactor (reported as ~11GB of unprocessed dead data).
+* **Pagination Fix in ListObjects:** Resolved a bug with duplicate directory prefixes (fixed by advancing the cursor with the `U+10FFFF` character).
+* **UTF-8 Correctness in AWS SigV4:** Fixed the `percent_decode` logic for correct UTF-8 handling during AWS Signature V4 canonicalization.
+* **Handling 500 Errors (DeleteObject):** Added graceful handling for `BlobRefNotFound`, eliminating the 500 error when deleting an object with a missing manifest.
+* **Ghost Objects Fix:** Introduced a series of fixes (ghost scripts/objects) that stabilize the cleanup process and prevent "ghost" objects from appearing during compaction. Added corresponding regression CI tests. Added a `/health` endpoint for the compactor.
+
+
 # v0.0.7-alpha-fix-journal-compaction
 
 fix: implement metadata journal compaction and optimize startup
@@ -8,6 +37,7 @@ fix: implement metadata journal compaction and optimize startup
 - Optimize `count_inline_objects` to use O(1) memory iteration, preventing multi-minute startup hangs on large keyspaces.
 - Skip deduplicator rebuilding on normal startup if the dedup data is already persistent.
 - Add unit tests for `IndexDb` operations and architectural documentation for S4-Federation and Erasure Coding.
+
 
 # v0.0.6-alpha-fix-compaction-dead-volumes
 

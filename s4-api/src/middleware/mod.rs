@@ -23,7 +23,10 @@ pub mod metrics;
 
 pub use admin_auth::admin_auth_middleware;
 pub use auth::auth_middleware;
-pub use aws_chunked::{decode_aws_chunked, is_aws_chunked, validate_decoded_content_length};
+pub use aws_chunked::{
+    decode_aws_chunked, decode_aws_chunked_stream, decoded_content_length, is_aws_chunked,
+    validate_decoded_content_length,
+};
 pub use iam_auth::iam_auth_middleware;
 pub use logging::logging_middleware;
 pub use metrics::metrics_middleware;

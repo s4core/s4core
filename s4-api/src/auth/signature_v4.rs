@@ -213,15 +213,15 @@ impl SignatureRequestData {
                 if let (Some(alg), Some(cred), Some(dh), Some(sh), Some(sig)) =
                     (algorithm, credential, date, signed_headers, signature)
                 {
-                    let alg_dec = url_decode(alg);
-                    let cred_dec = url_decode(cred);
-                    let dh_dec = url_decode(dh);
-                    let sh_dec = url_decode(sh);
-                    let sig_dec = url_decode(sig);
+                    let alg_dec = percent_decode(alg);
+                    let cred_dec = percent_decode(cred);
+                    let dh_dec = percent_decode(dh);
+                    let sh_dec = percent_decode(sh);
+                    let sig_dec = percent_decode(sig);
 
                     // Validate expiration if provided
                     if let Some(exp_str) = expires {
-                        if let Ok(exp_secs) = url_decode(exp_str).parse::<i64>() {
+                        if let Ok(exp_secs) = percent_decode(exp_str).parse::<i64>() {
                             if dh_dec.len() == 16 && dh_dec.ends_with('Z') {
                                 // yyyymmddThhmmssZ
                                 if let Ok(dt) =
@@ -628,14 +628,14 @@ fn canonicalize_query_string(query: Option<&str>) -> Result<String, S3Error> {
 
             // X-Amz-Signature must NOT be included in canonical request
             if key_encoded.eq_ignore_ascii_case("x-amz-signature")
-                || url_decode(key_encoded).eq_ignore_ascii_case("x-amz-signature")
+                || percent_decode(key_encoded).eq_ignore_ascii_case("x-amz-signature")
             {
                 return None;
             }
 
             // URL-decode key and value
-            let key = url_decode(key_encoded);
-            let value = url_decode(value_encoded);
+            let key = percent_decode(key_encoded);
+            let value = percent_decode(value_encoded);
 
             Some((key, value))
         })
@@ -654,40 +654,31 @@ fn canonicalize_query_string(query: Option<&str>) -> Result<String, S3Error> {
 }
 
 /// URL-decodes a percent-encoded string.
-fn url_decode(s: &str) -> String {
-    // Simple URL decoding - replace %XX with corresponding byte
-    let mut result = String::new();
-    let mut chars = s.chars().peekable();
-
-    while let Some(ch) = chars.next() {
-        if ch == '%' {
-            // Try to decode %XX
-            let mut hex_str = String::new();
-            for _ in 0..2 {
-                if let Some(hex_ch) = chars.next() {
-                    hex_str.push(hex_ch);
-                } else {
-                    // Invalid encoding, keep as-is
-                    result.push('%');
-                    result.push_str(&hex_str);
-                    break;
+///
+/// Accumulates decoded bytes and interprets the result as UTF-8. This is
+/// critical for correct SigV4 canonicalization: percent-encoded sequences
+/// like `%F4%8F%BF%BF` (UTF-8 bytes of U+10FFFF) must be decoded as a single
+/// Unicode scalar, not as four individual Latin-1 characters, otherwise
+/// re-encoding produces double-encoded output and the signature mismatches.
+fn percent_decode(s: &str) -> String {
+    let mut result: Vec<u8> = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = &bytes[i + 1..i + 3];
+            if let Ok(hex_str) = std::str::from_utf8(hex) {
+                if let Ok(byte) = u8::from_str_radix(hex_str, 16) {
+                    result.push(byte);
+                    i += 3;
+                    continue;
                 }
             }
-            if hex_str.len() == 2 {
-                if let Ok(byte) = u8::from_str_radix(&hex_str, 16) {
-                    result.push(byte as char);
-                } else {
-                    // Invalid hex, keep as-is
-                    result.push('%');
-                    result.push_str(&hex_str);
-                }
-            }
-        } else {
-            result.push(ch);
         }
+        result.push(bytes[i]);
+        i += 1;
     }
-
-    result
+    String::from_utf8_lossy(&result).into_owned()
 }
 
 /// Creates canonical headers string.
@@ -800,27 +791,6 @@ fn percent_encode(s: &str) -> String {
     encoded
 }
 
-/// Decodes percent-encoded string (e.g. `%28` → `(`).
-fn percent_decode(s: &str) -> String {
-    let mut result = Vec::new();
-    let bytes = s.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) =
-                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
-            {
-                result.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        result.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&result).into_owned()
-}
-
 /// Constant-time comparison of byte slices.
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -869,12 +839,38 @@ mod tests {
     }
 
     #[test]
-    fn test_url_decode() {
-        assert_eq!(url_decode("hello"), "hello");
-        assert_eq!(url_decode("hello%20world"), "hello world");
-        assert_eq!(url_decode("test%2Ffile"), "test/file");
-        assert_eq!(url_decode("test%2520file"), "test%20file"); // Double encoding
-        assert_eq!(url_decode("a%3Db"), "a=b");
+    fn test_percent_decode() {
+        // Basic ASCII cases
+        assert_eq!(percent_decode(""), "");
+        assert_eq!(percent_decode("hello"), "hello");
+        assert_eq!(percent_decode("hello%20world"), "hello world");
+        assert_eq!(percent_decode("test%2Ffile"), "test/file");
+        assert_eq!(percent_decode("test%2520file"), "test%20file"); // Double encoding
+        assert_eq!(percent_decode("a%3Db"), "a=b");
+
+        // Malformed / truncated input must pass through unchanged.
+        assert_eq!(percent_decode("%"), "%");
+        assert_eq!(percent_decode("%2"), "%2");
+        assert_eq!(percent_decode("abc%"), "abc%");
+        assert_eq!(percent_decode("abc%2"), "abc%2");
+        assert_eq!(percent_decode("%ZZ"), "%ZZ"); // invalid hex
+        assert_eq!(percent_decode("%20%"), " %"); // valid then truncated
+
+        // Multi-byte UTF-8 sequences must decode to a single scalar, not
+        // per-byte Latin-1 characters. Covers 2-, 3-, and 4-byte forms.
+        // U+10FFFF (4-byte) is used as a pagination sentinel in list-objects
+        // continuation tokens — this is the exact case that caused the
+        // SignatureDoesNotMatch bug when the decoder incorrectly treated
+        // each byte as Latin-1.
+        assert_eq!(percent_decode("%C3%A9"), "é"); // U+00E9, 2-byte
+        assert_eq!(percent_decode("%E2%98%83"), "☃"); // U+2603, 3-byte
+        assert_eq!(percent_decode("%F4%8F%BF%BF"), "\u{10FFFF}"); // 4-byte
+        assert_eq!(percent_decode("prefix%2F%F4%8F%BF%BF"), "prefix/\u{10FFFF}");
+
+        // Round-trip: decode then re-encode must be idempotent for the
+        // SigV4 canonical query string. This guards against double-encoding.
+        let original = "prefix%2F%F4%8F%BF%BF";
+        assert_eq!(percent_encode(&percent_decode(original)), original);
     }
 
     #[test]

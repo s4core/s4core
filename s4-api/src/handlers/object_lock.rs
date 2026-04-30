@@ -60,10 +60,9 @@ pub async fn get_bucket_object_lock_configuration(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // Get Object Lock configuration
@@ -107,10 +106,9 @@ pub async fn put_bucket_object_lock_configuration(
 
     let storage = state.storage.read().await;
 
-    // Check if bucket exists
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-        return S3Error::NoSuchBucket.into_response();
+    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+        return resp;
     }
 
     // CRITICAL: Check versioning is Enabled (not just Suspended)

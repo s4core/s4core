@@ -1,5 +1,7 @@
 # Multipart Upload
 
+> Last updated: 2026-04-25
+
 S4 supports S3-compatible multipart uploads for large files. The AWS CLI and SDKs use multipart upload automatically for files larger than a configurable threshold (typically 8MB).
 
 ## How It Works
@@ -9,6 +11,19 @@ S4 supports S3-compatible multipart uploads for large files. The AWS CLI and SDK
 3. **Complete** — finalize the upload by listing all parts
 
 Parts are stored individually in volume files. On completion, they are logically combined without copying data.
+
+In cluster mode, multipart upload state is quorum-replicated: session creation,
+each `UploadPart`, `CompleteMultipartUpload`, and abort are sent to the bucket's
+replica set and acknowledged by the configured write quorum. A load balancer may
+round-robin multipart requests across nodes; sticky sessions are not required.
+Part data is sent between nodes using streaming gRPC chunks, so ordinary AWS CLI
+multipart chunks such as 64MB are not constrained by unary gRPC message limits.
+
+Before completing a multipart upload in cluster mode, S4 inspects the replica set
+and validates the requested part list against replica-local multipart metadata.
+Replicas only acknowledge completion if their local durable part records and blob
+references match the selected parts. This prevents a node that missed a part from
+publishing a corrupt composite object.
 
 ## AWS CLI
 

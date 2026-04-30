@@ -131,11 +131,19 @@ The fjall database directory can be backed up independently for faster metadata 
 
 ## High Availability
 
-S4 is a single-node system. For high availability:
+S4 supports two deployment models for high availability:
 
-- Use filesystem-level replication (DRBD, ZFS send/receive)
-- Set up Active-Passive failover using a shared volume
-- Use cloud provider features (EBS snapshots, Azure Managed Disks)
+### Federation (Recommended)
+
+S4 has built-in **leaderless quorum replication** (`S4_MODE=cluster`). A 3-node cluster with default quorum (N=3, W=2, R=2) tolerates 1 node failure with zero downtime. See [Cluster Deployment](clustering.md) for setup instructions and [Federation](../04-features/federation.md) for architecture details.
+
+### Single-Node HA (Alternative)
+
+For single-node deployments (`S4_MODE=single`, the default), you can use infrastructure-level replication:
+
+- Filesystem-level replication (DRBD, ZFS send/receive)
+- Active-Passive failover using a shared volume
+- Cloud provider features (EBS snapshots, Azure Managed Disks)
 
 ## Reverse Proxy
 

@@ -20,16 +20,20 @@
 //! - TLS/HTTPS configuration
 //! - Graceful shutdown
 
+use crate::cluster_bootstrap;
 use crate::compaction_worker::CompactionWorker;
-use crate::config::Config;
+use crate::config::{Config, ServerMode};
+use crate::edition;
 use crate::lifecycle_worker::LifecycleWorker;
 use crate::multipart_cleanup_worker::MultipartCleanupWorker;
 use anyhow::{Context, Result};
 use axum::http::Uri;
 use axum::ServiceExt;
 use s4_api::{create_router, AppState};
+use s4_cluster::{ClusterLimits, ClusterServices, NodeLifecycle, PROTOCOL_VERSION, S4_VERSION};
 use s4_core::storage::BitcaskStorageEngine;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower::Service;
 use tracing::info;
@@ -97,6 +101,14 @@ pub struct App {
     config: Config,
     /// Storage engine.
     storage: BitcaskStorageEngine,
+    /// Edition-derived cluster limits (CE or EE).
+    #[allow(dead_code)]
+    cluster_limits: ClusterLimits,
+    /// Trait-object DI container for edition-dependent services.
+    #[allow(dead_code)]
+    cluster_services: ClusterServices,
+    /// Cluster node lifecycle tracker (drain/shutdown coordination).
+    node_lifecycle: Arc<NodeLifecycle>,
 }
 
 impl App {
@@ -104,6 +116,40 @@ impl App {
     ///
     /// Initializes the storage engine with configuration settings.
     pub async fn new(config: Config) -> Result<Self> {
+        info!("S4 {} starting", edition::edition_label());
+
+        // Validate cluster configuration early
+        config.cluster.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Log operating mode
+        match config.cluster.mode {
+            ServerMode::Single => info!("Operating mode: standalone (single-node)"),
+            ServerMode::Cluster => {
+                info!(
+                    cluster_name = %config.cluster.cluster_name,
+                    protocol_version = PROTOCOL_VERSION,
+                    s4_version = S4_VERSION,
+                    rf = config.cluster.replication_factor,
+                    wq = config.cluster.write_quorum,
+                    rq = config.cluster.read_quorum,
+                    "Operating mode: cluster"
+                );
+            }
+            ServerMode::Gateway => {
+                info!(
+                    cluster_name = %config.cluster.cluster_name,
+                    "Operating mode: gateway (stateless router)"
+                );
+            }
+        }
+
+        // Resolve CE/EE edition limits and services
+        let cluster_limits = edition::resolve_cluster_limits();
+        let cluster_services = edition::build_cluster_services(&cluster_limits);
+
+        // Create lifecycle tracker
+        let node_lifecycle = NodeLifecycle::new();
+
         info!("Initializing S4 application...");
 
         // Ensure directories exist
@@ -127,7 +173,13 @@ impl App {
 
         info!("Storage engine initialized successfully");
 
-        Ok(Self { config, storage })
+        Ok(Self {
+            config,
+            storage,
+            cluster_limits,
+            cluster_services,
+            node_lifecycle,
+        })
     }
 
     /// Runs the application (HTTP/HTTPS server).
@@ -201,6 +253,29 @@ impl App {
             state = state.with_prometheus_handle(handle);
         }
 
+        // Bootstrap cluster services if in cluster mode
+        let cluster_state = if self.config.cluster.is_cluster() {
+            let cs = cluster_bootstrap::bootstrap_cluster(
+                &self.config.cluster,
+                state.storage.clone(),
+                &self.config.storage.data_path,
+                &self.cluster_limits,
+            )
+            .await
+            .context("Failed to bootstrap cluster services")?;
+
+            // Inject quorum coordinators into AppState so handlers route through them
+            state = state.with_cluster_coordinators(
+                cs.write_coordinator.clone(),
+                cs.read_coordinator.clone(),
+                cs.list_coordinator.clone(),
+            );
+
+            Some(cs)
+        } else {
+            None
+        };
+
         // Initialize root user from environment variables if configured
         initialize_root_user(&state).await?;
 
@@ -250,8 +325,11 @@ impl App {
                 self.config.compaction.fragmentation_threshold * 100.0,
                 self.config.compaction.dry_run,
             );
-            let worker =
-                CompactionWorker::new(state.storage.clone(), self.config.compaction.clone());
+            let worker = if self.config.cluster.is_cluster() {
+                CompactionWorker::new_cluster(state.storage.clone(), self.config.compaction.clone())
+            } else {
+                CompactionWorker::new(state.storage.clone(), self.config.compaction.clone())
+            };
             Some(worker.spawn())
         } else {
             info!("Compaction worker disabled");
@@ -270,6 +348,16 @@ impl App {
             run_http_server(addr, router).await
         };
 
+        // Run cluster graceful shutdown if in cluster mode
+        if self.config.cluster.is_cluster() {
+            let drain_timeout =
+                std::time::Duration::from_secs(self.config.cluster.drain_timeout_secs);
+            if let Err(e) = s4_cluster::graceful_shutdown(&self.node_lifecycle, drain_timeout).await
+            {
+                tracing::warn!("Cluster graceful shutdown error: {}", e);
+            }
+        }
+
         // Abort background workers on shutdown
         multipart_cleanup_handle.abort();
         info!("Multipart cleanup worker stopped");
@@ -280,6 +368,17 @@ impl App {
         if let Some(handle) = compaction_handle {
             handle.abort();
             info!("Compaction worker stopped");
+        }
+
+        // Shutdown cluster background workers and gRPC server
+        if let Some(cs) = cluster_state {
+            for handle in cs.background_handles {
+                handle.abort();
+            }
+            if let Err(e) = cs.rpc_handle.shutdown().await {
+                tracing::warn!("gRPC server shutdown error: {}", e);
+            }
+            info!("Cluster services stopped");
         }
 
         result

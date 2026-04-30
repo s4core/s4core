@@ -45,20 +45,27 @@ Compaction is crash-safe by design:
 | Environment Variable | Default | Description |
 |---|---|---|
 | `S4_COMPACTION_ENABLED` | `true` | Enable/disable the background compaction worker |
-| `S4_COMPACTION_INTERVAL_HOURS` | `6` | How often the compaction worker checks for fragmented volumes |
+| `S4_COMPACTION_INTERVAL_HOURS` | `1` | How often the compaction worker checks for fragmented volumes |
 | `S4_COMPACTION_THRESHOLD` | `0.3` | Minimum fragmentation ratio (dead bytes / total bytes) to trigger compaction |
 | `S4_COMPACTION_DRY_RUN` | `false` | When `true`, analyze fragmentation without actually compacting |
+| `S4_COMPACTION_FULL_TIME` | `02:00` | Daily full compaction time in HH:MM (local time). Set to empty string to disable |
 | `S4_MULTIPART_UPLOAD_TTL_HOURS` | `24` | TTL for multipart sessions — used by both the cleanup worker and the compactor's orphan purge |
 | `S4_COMPACTION_MULTIPART_TTL_SECS` | None | *Dev/testing only.* Overrides multipart session TTL for the compactor in seconds (takes priority over `S4_MULTIPART_UPLOAD_TTL_HOURS`) |
 
 ## Background Worker
 
-Compaction runs automatically as a background task in `s4-server`. It:
+Compaction runs automatically as a background task in `s4-server`. It operates in two modes:
+
+- **Regular cycle** (every N hours, default 1): processes up to 10 volumes per run — lightweight, minimal I/O impact on production traffic
+- **Daily full compaction** (once per day at configured time, default 02:00 local): processes all volumes with no limits, reclaiming all dead space
+
+The worker:
 
 - Starts on server boot (if enabled)
-- Runs periodically at the configured interval
+- On each interval tick, checks whether a daily full run is due (current time ≥ `S4_COMPACTION_FULL_TIME` and no full run done today)
+- If due, runs full compaction; otherwise runs a regular cycle
 - Does not block normal reads or writes
-- Logs statistics after each run
+- Logs statistics after each run (prefixed with "Full compaction" or "Compaction")
 
 ## Dedup Awareness
 

@@ -17,8 +17,10 @@
 //! This module exports the public API for the S4 server, including
 //! configuration types and the main application.
 
+pub mod cluster_bootstrap;
 pub mod compaction_worker;
 pub mod config;
+pub mod edition;
 pub mod lifecycle_worker;
 pub mod multipart_cleanup_worker;
 
@@ -26,6 +28,7 @@ mod app;
 
 pub use app::App;
 pub use compaction_worker::CompactionWorker;
-pub use config::Config;
+pub use config::{ClusterModeConfig, Config, ServerMode};
+pub use edition::{build_cluster_services, edition_label, resolve_cluster_limits};
 pub use lifecycle_worker::LifecycleWorker;
 pub use multipart_cleanup_worker::MultipartCleanupWorker;
