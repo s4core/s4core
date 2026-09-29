@@ -31,6 +31,9 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status};
 use tracing::{error, info};
 
+use crate::ec_object::{
+    EcContentDigest, EcContentDigestScan, EcHeatQuery, EcTombstoneProbe, EcTombstoneProbeService,
+};
 use crate::error::ClusterError;
 use crate::gossip::GossipHandle;
 use crate::identity::{NodeId, NodeMeta};
@@ -77,6 +80,9 @@ pub struct NodeRpcServer {
     multipart_handler: Option<Arc<ReplicaMultipartHandler>>,
     read_handler: Option<Arc<ReplicaReadHandler>>,
     anti_entropy: Option<Arc<AntiEntropyService>>,
+    heat_query: Option<Arc<dyn EcHeatQuery>>,
+    content_digest_scan: Option<Arc<dyn EcContentDigestScan>>,
+    tombstone_probe: Option<Arc<dyn EcTombstoneProbeService>>,
     started_at: std::time::Instant,
 }
 
@@ -98,6 +104,9 @@ impl NodeRpcServer {
             replica_handler: None,
             multipart_handler: None,
             read_handler: None,
+            heat_query: None,
+            content_digest_scan: None,
+            tombstone_probe: None,
             anti_entropy: None,
             started_at: std::time::Instant::now(),
         }
@@ -124,6 +133,36 @@ impl NodeRpcServer {
     /// processed by the storage engine instead of returning `Unimplemented`.
     pub fn with_read_handler(mut self, handler: Arc<ReplicaReadHandler>) -> Self {
         self.read_handler = Some(handler);
+        self
+    }
+
+    /// Attach the source of this node's erasure-coding activity marks.
+    ///
+    /// Only an Enterprise node running an EC pool has any; without it the node
+    /// answers `Unimplemented`, which peers read as "no mark here".
+    pub fn with_heat_query(mut self, query: Arc<dyn EcHeatQuery>) -> Self {
+        self.heat_query = Some(query);
+        self
+    }
+
+    /// Attach the source of this node's EC content digests.
+    ///
+    /// Only an Enterprise node running an EC pool has manifests to report;
+    /// without it the node answers `Unimplemented`, which the dedup measurement
+    /// counts as a node it could not read rather than as a node with no
+    /// duplicates.
+    pub fn with_content_digest_scan(mut self, scan: Arc<dyn EcContentDigestScan>) -> Self {
+        self.content_digest_scan = Some(scan);
+        self
+    }
+
+    /// Attach the answer to "do you hold these deletes?".
+    ///
+    /// Only an Enterprise node running an EC pool holds tombstone manifests;
+    /// without it the node answers `Unimplemented`, and the sweep asks about
+    /// each delete on its own instead.
+    pub fn with_tombstone_probe(mut self, probe: Arc<dyn EcTombstoneProbeService>) -> Self {
+        self.tombstone_probe = Some(probe);
         self
     }
 
@@ -188,6 +227,19 @@ impl NodeRpcServer {
             join_handle,
             shutdown_timeout,
         })
+    }
+}
+
+fn delete_request_from_hint(hint_req: &proto::HintRequest) -> proto::DeleteBlobRequest {
+    proto::DeleteBlobRequest {
+        bucket: hint_req.bucket.clone(),
+        key: hint_req.key.clone(),
+        hlc: hint_req.hlc.clone(),
+        coordinator_id: Vec::new(),
+        operation_id: hint_req.operation_id.clone(),
+        topology_epoch: 0,
+        version_id: hint_req.version_id.clone(),
+        expected_source_hlc: hint_req.expected_source_hlc.clone(),
     }
 }
 
@@ -307,6 +359,78 @@ impl s4_node_server::S4Node for NodeRpcServer {
                     success: false,
                     error: e.to_string(),
                     local_sequence: 0,
+                    epoch_mismatch: false,
+                }))
+            }
+        }
+    }
+
+    async fn detach_object_data(
+        &self,
+        request: Request<proto::DetachObjectDataRequest>,
+    ) -> Result<Response<proto::DetachObjectDataResponse>, Status> {
+        let Some(handler) = &self.replica_handler else {
+            return Err(Status::unimplemented(
+                "DetachObjectData requires a storage engine (not configured)",
+            ));
+        };
+
+        match handler.handle_detach_object_data(request.get_ref()).await {
+            Ok(response) => Ok(Response::new(response)),
+            Err(e) => {
+                error!(error = %e, "replica detach failed");
+                Ok(Response::new(proto::DetachObjectDataResponse {
+                    success: false,
+                    error: e.to_string(),
+                    detached: false,
+                    epoch_mismatch: false,
+                }))
+            }
+        }
+    }
+
+    async fn attach_object_data(
+        &self,
+        request: Request<proto::AttachObjectDataRequest>,
+    ) -> Result<Response<proto::AttachObjectDataResponse>, Status> {
+        let Some(handler) = &self.replica_handler else {
+            return Err(Status::unimplemented(
+                "AttachObjectData requires a storage engine (not configured)",
+            ));
+        };
+
+        match handler.handle_attach_object_data(request.get_ref()).await {
+            Ok(response) => Ok(Response::new(response)),
+            Err(e) => {
+                error!(error = %e, "replica attach failed");
+                Ok(Response::new(proto::AttachObjectDataResponse {
+                    success: false,
+                    error: e.to_string(),
+                    attached: false,
+                    epoch_mismatch: false,
+                }))
+            }
+        }
+    }
+
+    async fn restore_namespace_entry(
+        &self,
+        request: Request<proto::RestoreNamespaceEntryRequest>,
+    ) -> Result<Response<proto::RestoreNamespaceEntryResponse>, Status> {
+        let Some(handler) = &self.replica_handler else {
+            return Err(Status::unimplemented(
+                "RestoreNamespaceEntry requires a storage engine (not configured)",
+            ));
+        };
+
+        match handler.handle_restore_namespace_entry(request.get_ref()).await {
+            Ok(response) => Ok(Response::new(response)),
+            Err(e) => {
+                error!(error = %e, "replica namespace restore failed");
+                Ok(Response::new(proto::RestoreNamespaceEntryResponse {
+                    success: false,
+                    error: e.to_string(),
+                    restored: false,
                     epoch_mismatch: false,
                 }))
             }
@@ -438,16 +562,50 @@ impl s4_node_server::S4Node for NodeRpcServer {
     }
 
     // ========================================================================
-    // Streaming data plane — Phase 4+
+    // Streaming data plane
+    //
+    // A body that does not fit one message travels in chunks. Both directions
+    // end at the same handlers the unary methods use, so an object is written
+    // and read the same way whichever transport carried it.
     // ========================================================================
 
+    /// Accept a blob the coordinator sends as a stream of chunks.
+    ///
+    /// The object body is carried in chunks rather than in one message, so an
+    /// object larger than the unary message limit can still be replicated. The
+    /// stream is reassembled here and handed to the very same
+    /// [`ReplicaWriteHandler::handle_write`] the unary path uses: the epoch
+    /// check, the idempotency cache, the HLC stamping and the durable ACK
+    /// boundary must not have a second implementation that can drift from it.
     async fn write_blob_stream(
         &self,
-        _request: Request<tonic::Streaming<proto::WriteBlobChunk>>,
+        request: Request<tonic::Streaming<proto::WriteBlobChunk>>,
     ) -> Result<Response<proto::WriteBlobResponse>, Status> {
-        Err(Status::unimplemented(
-            "WriteBlobStream will be available after Phase 4",
-        ))
+        let Some(handler) = &self.replica_handler else {
+            return Err(Status::unimplemented(
+                "WriteBlobStream requires a storage engine (not configured)",
+            ));
+        };
+
+        let mut stream = request.into_inner();
+        let mut blob = StreamedBlob::default();
+        while let Some(chunk) = stream.message().await? {
+            blob.push(chunk)?;
+        }
+        let assembled = blob.finish()?;
+
+        match handler.handle_write(&assembled).await {
+            Ok(response) => Ok(Response::new(response)),
+            Err(e) => {
+                error!(error = %e, "streamed replica write failed");
+                Ok(Response::new(proto::WriteBlobResponse {
+                    success: false,
+                    error: e.to_string(),
+                    local_sequence: 0,
+                    epoch_mismatch: false,
+                }))
+            }
+        }
     }
 
     type ReadBlobStreamStream =
@@ -575,11 +733,13 @@ impl s4_node_server::S4Node for NodeRpcServer {
                     error: e.to_string(),
                     content_type: String::new(),
                     content_length: 0,
+                    erasure_coded: false,
                     metadata: Default::default(),
                     hlc: None,
                     version_id: None,
                     etag: String::new(),
                     epoch_mismatch: false,
+                    content_hash: Vec::new(),
                 }))
             }
         }
@@ -606,6 +766,145 @@ impl s4_node_server::S4Node for NodeRpcServer {
                     next_continuation_token: String::new(),
                     error: e.to_string(),
                     epoch_mismatch: false,
+                }))
+            }
+        }
+    }
+
+    async fn read_object_heat(
+        &self,
+        request: Request<proto::ReadObjectHeatRequest>,
+    ) -> Result<Response<proto::ReadObjectHeatResponse>, Status> {
+        let Some(query) = &self.heat_query else {
+            return Err(Status::unimplemented(
+                "ReadObjectHeat requires an Enterprise erasure-coded pool (not configured)",
+            ));
+        };
+
+        let request = request.into_inner();
+        let version_id = (!request.version_id.is_empty()).then_some(request.version_id.as_str());
+        match query
+            .local_object_heat(
+                &request.bucket,
+                &request.key,
+                version_id,
+                request.window_nanos,
+            )
+            .await
+        {
+            Ok(Some(mark)) => Ok(Response::new(proto::ReadObjectHeatResponse {
+                success: true,
+                error: String::new(),
+                found: true,
+                last_access_nanos: mark.last_access_nanos,
+                window_access_count: mark.window_access_count,
+            })),
+            Ok(None) => Ok(Response::new(proto::ReadObjectHeatResponse {
+                success: true,
+                error: String::new(),
+                found: false,
+                last_access_nanos: 0,
+                window_access_count: 0,
+            })),
+            Err(error) => {
+                error!(error = %error, "replica object heat read failed");
+                Ok(Response::new(proto::ReadObjectHeatResponse {
+                    success: false,
+                    error: error.to_string(),
+                    found: false,
+                    last_access_nanos: 0,
+                    window_access_count: 0,
+                }))
+            }
+        }
+    }
+
+    async fn scan_ec_content_digests(
+        &self,
+        request: Request<proto::ScanEcContentDigestsRequest>,
+    ) -> Result<Response<proto::ScanEcContentDigestsResponse>, Status> {
+        let Some(scan) = &self.content_digest_scan else {
+            return Err(Status::unimplemented(
+                "ScanEcContentDigests requires an Enterprise erasure-coded pool (not configured)",
+            ));
+        };
+
+        let request = request.into_inner();
+        let max_entries = request.max_entries as usize;
+        match scan.local_content_digests(max_entries).await {
+            Ok(page) => Ok(Response::new(proto::ScanEcContentDigestsResponse {
+                success: true,
+                error: String::new(),
+                digests: page.digests.into_iter().map(content_digest_to_proto).collect(),
+                scanned: u32::try_from(page.scanned).unwrap_or(u32::MAX),
+                truncated: page.truncated,
+            })),
+            Err(error) => {
+                error!(error = %error, "local EC content digest scan failed");
+                Ok(Response::new(proto::ScanEcContentDigestsResponse {
+                    success: false,
+                    error: error.to_string(),
+                    digests: Vec::new(),
+                    scanned: 0,
+                    truncated: false,
+                }))
+            }
+        }
+    }
+
+    async fn probe_ec_tombstones(
+        &self,
+        request: Request<proto::ProbeEcTombstonesRequest>,
+    ) -> Result<Response<proto::ProbeEcTombstonesResponse>, Status> {
+        let Some(probe_service) = &self.tombstone_probe else {
+            return Err(Status::unimplemented(
+                "ProbeEcTombstones requires an Enterprise erasure-coded pool (not configured)",
+            ));
+        };
+
+        let request = request.into_inner();
+        let mut probes = Vec::with_capacity(request.probes.len());
+        for probe in request.probes {
+            let operation_id = probe
+                .operation_id
+                .as_slice()
+                .try_into()
+                .map(u128::from_be_bytes)
+                .map_err(|_| Status::invalid_argument("operation_id must be 16 bytes"))?;
+            let hlc_node_id = probe
+                .hlc_node_id
+                .as_slice()
+                .try_into()
+                .map(u128::from_be_bytes)
+                .map_err(|_| Status::invalid_argument("hlc_node_id must be 16 bytes"))?;
+            probes.push(EcTombstoneProbe {
+                bucket: probe.bucket,
+                key: probe.key,
+                version_id: Some(probe.version_id).filter(|id| !id.is_empty()),
+                operation_id,
+                hlc: crate::hlc::HlcTimestamp {
+                    wall_time: probe.hlc_wall_time,
+                    logical: probe.hlc_logical,
+                    node_id: hlc_node_id,
+                },
+            });
+        }
+
+        let asked = probes.len();
+        match probe_service.holds_tombstones(probes).await {
+            Ok(held) => Ok(Response::new(proto::ProbeEcTombstonesResponse {
+                success: true,
+                error: String::new(),
+                held,
+            })),
+            Err(error) => {
+                error!(error = %error, "EC tombstone probe failed");
+                Ok(Response::new(proto::ProbeEcTombstonesResponse {
+                    success: false,
+                    error: error.to_string(),
+                    // A node that could not answer has not been shown to hold
+                    // anything, which is what the gate asks.
+                    held: vec![false; asked],
                 }))
             }
         }
@@ -724,19 +1023,23 @@ impl s4_node_server::S4Node for NodeRpcServer {
 
         let hint_req = request.get_ref();
 
-        // Convert hint to a write request and apply
+        // Convert hint to the original data-plane request and apply it.
         if hint_req.data.is_empty() && hint_req.content_type.is_empty() {
-            // This is a delete hint — not enough context to replay without
-            // a full DeleteBlobRequest. For now, accept and log.
-            tracing::debug!(
-                bucket = %hint_req.bucket,
-                key = %hint_req.key,
-                "received delete hint, accepted"
-            );
-            return Ok(Response::new(proto::HintResponse {
-                accepted: true,
-                error: String::new(),
-            }));
+            let delete_req = delete_request_from_hint(hint_req);
+            return match handler.handle_delete(&delete_req).await {
+                Ok(resp) if resp.success => Ok(Response::new(proto::HintResponse {
+                    accepted: true,
+                    error: String::new(),
+                })),
+                Ok(resp) => Ok(Response::new(proto::HintResponse {
+                    accepted: false,
+                    error: resp.error,
+                })),
+                Err(e) => Ok(Response::new(proto::HintResponse {
+                    accepted: false,
+                    error: e.to_string(),
+                })),
+            };
         }
 
         // Reconstruct a WriteBlobRequest from the hint
@@ -768,6 +1071,160 @@ impl s4_node_server::S4Node for NodeRpcServer {
                 error: e.to_string(),
             })),
         }
+    }
+}
+
+/// Reassemble a streamed blob into the request the unary write path takes.
+///
+/// The stream is a header followed by the body in chunks, so the shape is
+/// checked before any of it is trusted: the header comes first and only once,
+/// and the body is accepted only up to the length the header declared. A
+/// stream that sends more bytes than it announced, or ends before it delivers
+/// them, is refused rather than written — a short write would otherwise be
+/// acknowledged as durable.
+/// What was wrong with a stream of blob chunks.
+///
+/// Every one of these is the sender's fault, so the boundary reports them all
+/// as `InvalidArgument`. They are named rather than formatted at the point of
+/// failure so that a test can state which fault it expects.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamedBlobError {
+    /// The stream ended without ever sending a header.
+    MissingHeader,
+    /// A second header arrived; one stream carries one object.
+    DuplicateHeader,
+    /// Body arrived before the header that describes it.
+    BodyBeforeHeader,
+    /// A chunk was neither header nor body.
+    EmptyPayload,
+    /// More body arrived than the header announced.
+    TooMuchBody { received: u64, announced: u64 },
+    /// The stream ended before the announced body had arrived.
+    TooLittleBody { received: u64, announced: u64 },
+}
+
+impl std::fmt::Display for StreamedBlobError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingHeader => write!(formatter, "streamed blob carries no header"),
+            Self::DuplicateHeader => write!(formatter, "streamed blob carries a second header"),
+            Self::BodyBeforeHeader => {
+                write!(formatter, "streamed blob sent body before its header")
+            }
+            Self::EmptyPayload => {
+                write!(formatter, "streamed blob carries a chunk with no payload")
+            }
+            Self::TooMuchBody {
+                received,
+                announced,
+            } => write!(
+                formatter,
+                "streamed blob sent {received} byte(s) but announced {announced}"
+            ),
+            Self::TooLittleBody {
+                received,
+                announced,
+            } => write!(
+                formatter,
+                "streamed blob ended after {received} byte(s) but announced {announced}"
+            ),
+        }
+    }
+}
+
+impl From<StreamedBlobError> for Status {
+    fn from(error: StreamedBlobError) -> Self {
+        Status::invalid_argument(error.to_string())
+    }
+}
+
+/// A blob being rebuilt from the chunks of one `WriteBlobStream` call.
+///
+/// Holds the header until the body has arrived in full, so that nothing is
+/// written on a stream that turns out to be malformed.
+#[derive(Default)]
+struct StreamedBlob {
+    header: Option<proto::WriteBlobHeader>,
+    data: Vec<u8>,
+}
+
+impl StreamedBlob {
+    /// Take the next chunk of the stream.
+    fn push(&mut self, chunk: proto::WriteBlobChunk) -> Result<(), StreamedBlobError> {
+        use proto::write_blob_chunk::Payload;
+
+        match chunk.payload {
+            Some(Payload::Header(incoming)) => {
+                if self.header.is_some() {
+                    return Err(StreamedBlobError::DuplicateHeader);
+                }
+                // The declared length decides how much body is accepted, so it
+                // is never used as an allocation size on its own: a peer could
+                // otherwise announce any number it liked and make this node
+                // reserve it. The buffer starts at what a single unary message
+                // could have carried and grows with the bytes that arrive.
+                let reserve = usize::try_from(incoming.total_size)
+                    .unwrap_or(usize::MAX)
+                    .min(DEFAULT_MAX_MESSAGE_SIZE);
+                self.data.reserve(reserve);
+                self.header = Some(incoming);
+                Ok(())
+            }
+            Some(Payload::Data(bytes)) => {
+                let Some(header) = self.header.as_ref() else {
+                    return Err(StreamedBlobError::BodyBeforeHeader);
+                };
+                let received = self.data.len().saturating_add(bytes.len()) as u64;
+                if received > header.total_size {
+                    return Err(StreamedBlobError::TooMuchBody {
+                        received,
+                        announced: header.total_size,
+                    });
+                }
+                self.data.extend_from_slice(&bytes);
+                Ok(())
+            }
+            None => Err(StreamedBlobError::EmptyPayload),
+        }
+    }
+
+    /// The request the unary write path takes, once the stream has ended.
+    fn finish(self) -> Result<proto::WriteBlobRequest, StreamedBlobError> {
+        let Some(header) = self.header else {
+            return Err(StreamedBlobError::MissingHeader);
+        };
+        if self.data.len() as u64 != header.total_size {
+            return Err(StreamedBlobError::TooLittleBody {
+                received: self.data.len() as u64,
+                announced: header.total_size,
+            });
+        }
+
+        Ok(proto::WriteBlobRequest {
+            bucket: header.bucket,
+            key: header.key,
+            data: self.data,
+            content_hash: header.content_hash,
+            content_type: header.content_type,
+            metadata: header.metadata,
+            hlc: header.hlc,
+            version_id: header.version_id,
+            coordinator_id: header.coordinator_id,
+            operation_id: header.operation_id,
+            topology_epoch: header.topology_epoch,
+        })
+    }
+}
+
+fn content_digest_to_proto(digest: EcContentDigest) -> proto::EcContentDigest {
+    proto::EcContentDigest {
+        bucket: digest.bucket,
+        key: digest.key,
+        version_id: digest.version_id.unwrap_or_default(),
+        content_hash_sha256: digest.content_hash_sha256.to_vec(),
+        original_size: digest.original_size,
+        erasure_set_id: digest.erasure_set_id,
+        packed: digest.packed,
     }
 }
 
@@ -846,7 +1303,7 @@ mod tests {
             },
             pool_id: PoolId::new(1),
             topology_epoch: 1,
-            protocol_version: 1,
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             capacity: NodeCapacity {
                 total_bytes: 1_000_000_000,
                 used_bytes: 100_000_000,
@@ -861,6 +1318,189 @@ mod tests {
 
     fn test_gossip_handle() -> GossipHandle {
         GossipHandle::new_for_testing(HashMap::new())
+    }
+
+    #[test]
+    fn delete_hint_replay_request_preserves_generation_guard() {
+        let hlc = proto::HybridTimestamp {
+            wall_time: 100,
+            logical: 1,
+            node_id: vec![1; 16],
+        };
+        let expected_source_hlc = proto::HybridTimestamp {
+            wall_time: 90,
+            logical: 3,
+            node_id: vec![2; 16],
+        };
+        let operation_id = uuid::Uuid::new_v4().as_u128().to_be_bytes().to_vec();
+        let hint = proto::HintRequest {
+            target_node_id: vec![3; 16],
+            bucket: "bucket".to_string(),
+            key: "key".to_string(),
+            data: Vec::new(),
+            content_hash: Vec::new(),
+            hlc: Some(hlc.clone()),
+            operation_id: operation_id.clone(),
+            version_id: Some("version".to_string()),
+            metadata: HashMap::new(),
+            content_type: String::new(),
+            expected_source_hlc: Some(expected_source_hlc.clone()),
+        };
+
+        let request = delete_request_from_hint(&hint);
+
+        assert_eq!(request.bucket, "bucket");
+        assert_eq!(request.key, "key");
+        assert_eq!(request.hlc, Some(hlc));
+        assert_eq!(request.operation_id, operation_id);
+        assert_eq!(request.topology_epoch, 0);
+        assert_eq!(request.version_id, Some("version".to_string()));
+        assert_eq!(request.expected_source_hlc, Some(expected_source_hlc));
+    }
+
+    fn blob_header(total_size: u64) -> proto::WriteBlobChunk {
+        proto::WriteBlobChunk {
+            payload: Some(proto::write_blob_chunk::Payload::Header(
+                proto::WriteBlobHeader {
+                    bucket: "bucket".into(),
+                    key: "key".into(),
+                    content_hash: vec![9u8; 32],
+                    content_type: "text/plain".into(),
+                    metadata: HashMap::from([("a".to_string(), "b".to_string())]),
+                    hlc: None,
+                    version_id: Some("v7".into()),
+                    coordinator_id: vec![3u8; 16],
+                    operation_id: vec![4u8; 16],
+                    topology_epoch: 11,
+                    total_size,
+                },
+            )),
+        }
+    }
+
+    fn blob_body(bytes: &[u8]) -> proto::WriteBlobChunk {
+        proto::WriteBlobChunk {
+            payload: Some(proto::write_blob_chunk::Payload::Data(bytes.to_vec())),
+        }
+    }
+
+    fn assemble(
+        chunks: Vec<proto::WriteBlobChunk>,
+    ) -> Result<proto::WriteBlobRequest, StreamedBlobError> {
+        let mut blob = StreamedBlob::default();
+        for chunk in chunks {
+            blob.push(chunk)?;
+        }
+        blob.finish()
+    }
+
+    /// The body is put back together in order, and every field of the header
+    /// reaches the request the durable write path takes.
+    #[test]
+    fn a_well_formed_stream_rebuilds_the_unary_request() {
+        let request = assemble(vec![
+            blob_header(6),
+            blob_body(b"abc"),
+            blob_body(b"de"),
+            blob_body(b"f"),
+        ])
+        .expect("a well-formed stream is accepted");
+
+        assert_eq!(request.data, b"abcdef");
+        assert_eq!(request.bucket, "bucket");
+        assert_eq!(request.key, "key");
+        assert_eq!(request.content_hash, vec![9u8; 32]);
+        assert_eq!(request.content_type, "text/plain");
+        assert_eq!(
+            request.metadata,
+            HashMap::from([("a".to_string(), "b".to_string())])
+        );
+        assert_eq!(request.version_id, Some("v7".to_string()));
+        assert_eq!(request.coordinator_id, vec![3u8; 16]);
+        assert_eq!(request.operation_id, vec![4u8; 16]);
+        assert_eq!(request.topology_epoch, 11);
+    }
+
+    /// A zero-length object is a header and nothing more.
+    #[test]
+    fn a_stream_of_no_body_is_an_empty_object() {
+        let request = assemble(vec![blob_header(0)]).expect("an empty body is an object too");
+        assert!(request.data.is_empty());
+    }
+
+    /// Every malformed shape is refused, and nothing reaches the write path.
+    /// A short stream matters most: acknowledging it would report a truncated
+    /// object as durable.
+    #[test]
+    fn a_malformed_stream_is_refused_rather_than_written() {
+        for (name, chunks, expected) in [
+            (
+                "no header at all",
+                vec![blob_body(b"abc")],
+                StreamedBlobError::BodyBeforeHeader,
+            ),
+            (
+                "body before the header",
+                vec![blob_body(b"abc"), blob_header(3)],
+                StreamedBlobError::BodyBeforeHeader,
+            ),
+            (
+                "a second header",
+                vec![blob_header(3), blob_header(3)],
+                StreamedBlobError::DuplicateHeader,
+            ),
+            (
+                "more body than announced",
+                vec![blob_header(2), blob_body(b"abc")],
+                StreamedBlobError::TooMuchBody {
+                    received: 3,
+                    announced: 2,
+                },
+            ),
+            (
+                "less body than announced",
+                vec![blob_header(9), blob_body(b"abc")],
+                StreamedBlobError::TooLittleBody {
+                    received: 3,
+                    announced: 9,
+                },
+            ),
+            ("an empty stream", vec![], StreamedBlobError::MissingHeader),
+            (
+                "a chunk with no payload",
+                vec![blob_header(3), proto::WriteBlobChunk { payload: None }],
+                StreamedBlobError::EmptyPayload,
+            ),
+        ] {
+            let error = assemble(chunks).expect_err(&format!("{name} must be refused"));
+            assert_eq!(error, expected, "{name} must say what was wrong");
+            assert_eq!(
+                Status::from(error).code(),
+                tonic::Code::InvalidArgument,
+                "{name} is the sender's fault, not this node's"
+            );
+        }
+    }
+
+    /// The announced length must not become an allocation on its own: a peer
+    /// claiming a body of gigabytes reserves nothing until bytes arrive, and
+    /// the bytes it then sends are refused for exceeding what it announced.
+    #[test]
+    fn an_absurd_announced_length_reserves_nothing_and_is_refused() {
+        let mut blob = StreamedBlob::default();
+        blob.push(blob_header(u64::MAX)).expect("the header alone is not yet a fault");
+        assert!(
+            blob.data.capacity() <= DEFAULT_MAX_MESSAGE_SIZE,
+            "the buffer must not grow to the announced length"
+        );
+        blob.push(blob_body(b"abc")).expect("a small body is within the announcement");
+        assert_eq!(
+            blob.finish().expect_err("a body shorter than announced is refused"),
+            StreamedBlobError::TooLittleBody {
+                received: 3,
+                announced: u64::MAX,
+            }
+        );
     }
 
     #[tokio::test]
@@ -905,7 +1545,7 @@ mod tests {
         assert_eq!(response.status, proto::NodeHealthStatus::Healthy as i32);
         assert_eq!(response.node_name, "test-node");
         assert_eq!(response.pool_id, 1);
-        assert_eq!(response.protocol_version, 1);
+        assert_eq!(response.protocol_version, crate::protocol::PROTOCOL_VERSION);
         assert_eq!(response.s4_version, "0.1.0");
         assert!(response.uptime_seconds < 10);
 
@@ -938,6 +1578,14 @@ mod tests {
 
         // WriteBlob should be unimplemented without handler.
         let err = client.write_blob(proto::WriteBlobRequest::default()).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+
+        // So is the streaming form, and with the same code: that is what tells
+        // a coordinator to fall back to a unary write rather than give up.
+        let err = client
+            .write_blob_stream(tokio_stream::iter(Vec::<proto::WriteBlobChunk>::new()))
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unimplemented);
 
         // ReadBlob should still be unimplemented.

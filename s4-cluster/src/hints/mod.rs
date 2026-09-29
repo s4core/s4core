@@ -107,6 +107,21 @@ pub enum HintOperation {
         /// Topology epoch at the time of the delete.
         topology_epoch: u64,
     },
+    /// A generation-guarded physical purge that needs to be replayed.
+    DeleteIfHlc {
+        /// Bucket name.
+        bucket: String,
+        /// Object key.
+        key: String,
+        /// Expected object generation to remove.
+        expected_source_hlc: crate::hlc::HlcTimestamp,
+        /// Operation ID for idempotency.
+        operation_id: Vec<u8>,
+        /// Optional version ID.
+        version_id: Option<String>,
+        /// Topology epoch at the time of the purge.
+        topology_epoch: u64,
+    },
 }
 
 /// Configuration for the hinted handoff subsystem.
@@ -175,7 +190,8 @@ impl HintedHandoffManager {
         // Extract operation_id for filename
         let op_id = match &hint.operation {
             HintOperation::Write { operation_id, .. }
-            | HintOperation::Delete { operation_id, .. } => hex_encode(operation_id),
+            | HintOperation::Delete { operation_id, .. }
+            | HintOperation::DeleteIfHlc { operation_id, .. } => hex_encode(operation_id),
         };
 
         let hint_path = target_dir.join(format!("{op_id}.hint"));
@@ -436,6 +452,7 @@ fn hint_to_request(hint: &Hint) -> proto::HintRequest {
             version_id: version_id.clone(),
             metadata: metadata.clone(),
             content_type: content_type.clone(),
+            expected_source_hlc: None,
         },
         HintOperation::Delete {
             bucket,
@@ -453,6 +470,26 @@ fn hint_to_request(hint: &Hint) -> proto::HintRequest {
             version_id: None,
             metadata: Default::default(),
             content_type: String::new(),
+            expected_source_hlc: None,
+        },
+        HintOperation::DeleteIfHlc {
+            bucket,
+            key,
+            operation_id,
+            expected_source_hlc,
+            ..
+        } => proto::HintRequest {
+            target_node_id: hint.target_node.to_be_bytes().to_vec(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            data: Vec::new(),
+            content_hash: Vec::new(),
+            hlc: None,
+            operation_id: operation_id.clone(),
+            version_id: None,
+            metadata: Default::default(),
+            content_type: String::new(),
+            expected_source_hlc: Some(expected_source_hlc.to_proto()),
         },
     }
 }

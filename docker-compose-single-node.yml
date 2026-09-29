@@ -1,14 +1,22 @@
-# S4 Full Stack - Docker Compose Configuration
+# S4 single node + Web Console - Docker Compose Configuration
 #
-# Usage:
-#   Server only:     docker compose up s4-server
-#   With console:    docker compose up
-#   Build & run:     docker compose up --build
+# Builds the Community Edition server from this repository and runs it together
+# with the web admin console (s4core/s4console image).
 #
-# Environment variables:
-#   S4_ROOT_PASSWORD - Root admin password (required for IAM)
-#   S4_ACCESS_KEY_ID - S3 access key (optional, auto-generated if not set)
-#   S4_SECRET_ACCESS_KEY - S3 secret key (optional, auto-generated if not set)
+# Usage from the repository root:
+#   Full stack:      docker compose -f docker-compose-single-node.yml up -d --build
+#   Server only:     docker compose -f docker-compose-single-node.yml up -d --build s4core
+#   Stop / reset:    docker compose -f docker-compose-single-node.yml down [-v]
+#
+# After startup:
+#   S3 API:          http://localhost:9000
+#   Web Console:     http://localhost:3000 (log in as S4_ROOT_USERNAME / S4_ROOT_PASSWORD)
+#
+# Environment variables read from the shell (defaults in brackets):
+#   S4_ROOT_USERNAME - Root admin user name [root]
+#   S4_ROOT_PASSWORD - Root admin password; enables IAM, which the console needs to log in [password12345]
+#   S4_ACCESS_KEY_ID - S3 access key [my-access-key-one]
+#   S4_SECRET_ACCESS_KEY - S3 secret key [my-secret-key-one]
 
 services:
   # ============================================
@@ -23,16 +31,16 @@ services:
     environment:
       - S4_BIND=0.0.0.0:9000
       - S4_DATA_DIR=/data
-      - S4_ROOT_USERNAME=root
-      - S4_ROOT_PASSWORD=password12345
-      - S4_ACCESS_KEY_ID=my-access-key-one
-      - S4_SECRET_ACCESS_KEY=my-secret-key-one
+      - S4_ROOT_USERNAME=${S4_ROOT_USERNAME:-root}
+      - S4_ROOT_PASSWORD=${S4_ROOT_PASSWORD:-password12345}
+      - S4_ACCESS_KEY_ID=${S4_ACCESS_KEY_ID:-my-access-key-one}
+      - S4_SECRET_ACCESS_KEY=${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
       #- S4_JWT_SECRET=
       #- S4_MAX_UPLOAD_SIZE=5GB
       #- S4_LIFECYCLE_ENABLED=true
       #- S4_LIFECYCLE_INTERVAL_HOURS=24
       #- S4_METRICS_ENABLED=true
-      #- RUST_LOG="s4_api=info,s4_server=info"
+      #- RUST_LOG=s4_api=info,s4_server=info
     volumes:
       - s4-data:/data
     restart: unless-stopped
@@ -52,7 +60,8 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - S4_BACKEND_URL=http://s4-server:9000
+      # The console reaches the server by its compose service name.
+      - S4_BACKEND_URL=http://s4core:9000
       - NODE_ENV=production
     depends_on:
       s4core:

@@ -45,16 +45,21 @@ pub async fn admin_auth_middleware(
     mut request: Request,
     next: Next,
 ) -> Response {
+    // Every failure below is one and the same thing — the request carries no
+    // credentials this API accepts — so all of them answer 401. A malformed
+    // header is not a malformed request: 400 would tell the caller to fix its
+    // body when what it has to do is log in again.
+
     // Extract Authorization header
     let auth_header = match request.headers().get("authorization") {
         Some(header) => match header.to_str() {
             Ok(s) => s,
             Err(_) => {
-                return error_response(StatusCode::BAD_REQUEST, "Invalid Authorization header");
+                return unauthorized("Invalid Authorization header");
             }
         },
         None => {
-            return error_response(StatusCode::UNAUTHORIZED, "Missing Authorization header");
+            return unauthorized("Missing Authorization header");
         }
     };
 
@@ -62,10 +67,7 @@ pub async fn admin_auth_middleware(
     let token = match auth_header.strip_prefix("Bearer ") {
         Some(t) => t,
         None => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "Authorization header must be in format: Bearer <token>",
-            );
+            return unauthorized("Authorization header must be in format: Bearer <token>");
         }
     };
 
@@ -74,7 +76,7 @@ pub async fn admin_auth_middleware(
         Ok(claims) => claims,
         Err(e) => {
             warn!("JWT validation failed: {:?}", e);
-            return error_response(StatusCode::UNAUTHORIZED, "Invalid or expired token");
+            return unauthorized("Invalid or expired token");
         }
     };
 
@@ -84,11 +86,13 @@ pub async fn admin_auth_middleware(
     next.run(request).await
 }
 
-/// Helper to create error response.
-fn error_response(status: StatusCode, message: &str) -> Response {
+/// Builds a 401 in the same shape the admin handlers use, so a client can read
+/// `code` here exactly as it does on every other admin response.
+fn unauthorized(message: &str) -> Response {
     let body = Json(json!({
         "error": message,
+        "code": "Unauthorized",
     }));
 
-    (status, body).into_response()
+    (StatusCode::UNAUTHORIZED, body).into_response()
 }

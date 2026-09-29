@@ -13,6 +13,10 @@ path = "src/main.rs"
 [features]
 default = []
 enterprise = ["dep:s4-ee", "dep:s4-ee-license"]
+# ISA-L accelerated erasure coding. Enterprise-only, because the codec it
+# accelerates lives in the Enterprise crates; asking for `isal` therefore turns
+# `enterprise` on rather than failing to link.
+isal = ["enterprise", "s4-ee/isal"]
 
 [dependencies]
 # Workspace crates
@@ -54,6 +58,9 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3.10"
+# Only the test targets get the cluster test fakes; the binary build above keeps
+# `s4-cluster` on its default features.
+s4-cluster = { path = "../s4-cluster", features = ["test-util"] }
 
 [lints]
 workspace = true

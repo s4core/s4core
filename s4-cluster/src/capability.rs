@@ -65,6 +65,9 @@ pub struct ClusterLimits {
 
     /// Whether the audit log (EE) is allowed.
     pub allow_audit_log: bool,
+
+    /// Whether Enterprise erasure-coded pools are allowed.
+    pub allow_erasure_coding: bool,
 }
 
 impl ClusterLimits {
@@ -80,6 +83,7 @@ impl ClusterLimits {
             allow_external_auth: false,
             allow_webdav: false,
             allow_audit_log: false,
+            allow_erasure_coding: false,
         }
     }
 
@@ -98,6 +102,7 @@ impl ClusterLimits {
             allow_external_auth: true,
             allow_webdav: true,
             allow_audit_log: true,
+            allow_erasure_coding: true,
         }
     }
 
@@ -138,6 +143,7 @@ mod tests {
         assert!(!limits.allow_external_auth);
         assert!(!limits.allow_webdav);
         assert!(!limits.allow_audit_log);
+        assert!(!limits.allow_erasure_coding);
     }
 
     #[test]
@@ -152,6 +158,7 @@ mod tests {
         assert!(limits.allow_external_auth);
         assert!(limits.allow_webdav);
         assert!(limits.allow_audit_log);
+        assert!(limits.allow_erasure_coding);
     }
 
     #[test]

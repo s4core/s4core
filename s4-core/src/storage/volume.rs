@@ -31,6 +31,17 @@ pub struct VolumeWriter {
     current_offset: u64,
     max_volume_size: u64,
     volumes_dir: PathBuf,
+    /// Set while a blob is being written, cleared once it is whole.
+    ///
+    /// A write is a chain of awaits, and a caller can go away at any of them:
+    /// an RPC whose client hung up, an HTTP request whose client timed out.
+    /// Whatever the dropped write already handed to the file lands there, so
+    /// the file cursor ends up past `current_offset`. Found still set, it means
+    /// the bytes past `current_offset` belong to no blob, and they are cut off
+    /// before the next write. Without that, the next blob would be written at
+    /// the cursor while its offset is reported as `current_offset`, and every
+    /// index record from then on would point into the middle of other data.
+    unfinished_write: bool,
 }
 
 impl VolumeWriter {
@@ -50,10 +61,30 @@ impl VolumeWriter {
             current_offset: 0,
             max_volume_size,
             volumes_dir: volumes_dir.to_path_buf(),
+            unfinished_write: false,
         };
 
         writer.open_or_create_volume().await?;
         Ok(writer)
+    }
+
+    /// Cuts off what a write that never finished left past `current_offset`
+    /// and puts the cursor back there. See `unfinished_write`.
+    ///
+    /// Nothing points into those bytes: `current_offset` moves only after a
+    /// blob is whole, and an index record is written only after that.
+    async fn discard_unfinished_write(&mut self) -> Result<(), StorageError> {
+        if !self.unfinished_write {
+            return Ok(());
+        }
+        if let Some(file) = self.current_file.as_mut() {
+            file.set_len(self.current_offset).await.map_err(StorageError::Io)?;
+            file.seek(std::io::SeekFrom::Start(self.current_offset))
+                .await
+                .map_err(StorageError::Io)?;
+        }
+        self.unfinished_write = false;
+        Ok(())
     }
 
     /// Appends a blob to the current volume.
@@ -73,6 +104,8 @@ impl VolumeWriter {
         key: &str,
         data: &[u8],
     ) -> Result<(u32, u64), StorageError> {
+        self.discard_unfinished_write().await?;
+
         // Check if we need to rotate to a new volume
         let header_size = header.serialized_size().map_err(|e| {
             StorageError::Serialization(format!("Failed to calculate header size: {}", e))
@@ -92,6 +125,7 @@ impl VolumeWriter {
                 "Volume file not open",
             ))
         })?;
+        self.unfinished_write = true;
 
         // Write header
         let header_bytes =
@@ -108,6 +142,7 @@ impl VolumeWriter {
         file.flush().await?;
 
         self.current_offset += header_bytes.len() as u64 + key.len() as u64 + data.len() as u64;
+        self.unfinished_write = false;
 
         Ok((volume_id, offset))
     }
@@ -125,6 +160,8 @@ impl VolumeWriter {
         reader: R,
         buffer_size: usize,
     ) -> Result<(u32, u64, u32), StorageError> {
+        self.discard_unfinished_write().await?;
+
         // Build a placeholder header (crc will be overwritten after streaming)
         let placeholder_header = BlobHeader::new(key.len() as u32, content_length, 0);
         let header_size = placeholder_header.serialized_size().map_err(|e| {
@@ -145,6 +182,7 @@ impl VolumeWriter {
                 "Volume file not open",
             ))
         })?;
+        self.unfinished_write = true;
 
         // Seek to write position (defensive — should already be at end)
         file.seek(std::io::SeekFrom::Start(blob_offset))
@@ -236,6 +274,7 @@ impl VolumeWriter {
         file.flush().await?;
 
         self.current_offset = new_offset;
+        self.unfinished_write = false;
 
         Ok((volume_id, blob_offset, crc32))
     }
@@ -540,6 +579,121 @@ mod tests {
         assert_eq!(vol2, 1); // Should be in new volume
 
         assert_eq!(writer.current_volume_id(), 1);
+    }
+
+    fn header_for(key: &str, data: &[u8]) -> BlobHeader {
+        BlobHeader::new(key.len() as u32, data.len() as u64, crc32fast::hash(data))
+    }
+
+    /// Writes `count` blobs and reads each back from the location the writer
+    /// reported for it.
+    async fn assert_later_writes_read_back(writer: &mut VolumeWriter, dir: &Path, count: usize) {
+        let reader = VolumeReader::new(dir);
+        for index in 0..count {
+            let key = format!("after-{index}");
+            let data: Vec<u8> = (0..4096u32).map(|i| (i * 7 + index as u32) as u8).collect();
+            let (volume_id, offset) =
+                writer.write_blob(&header_for(&key, &data), &key, &data).await.unwrap();
+            let (_, read_key, read_data) = reader.read_blob(volume_id, offset).await.unwrap();
+            assert_eq!(
+                read_key, key,
+                "blob {index} is not where the writer said it put it"
+            );
+            assert_eq!(read_data, data);
+        }
+
+        // The volume is still one blob after another up to its end, which is
+        // what recovery from volumes and the compactor walk: nothing of the
+        // dropped write is left between the blobs.
+        let volume = std::fs::read(dir.join("volume_000000.dat")).unwrap();
+        let mut position = 0usize;
+        let mut keys = Vec::new();
+        while position < volume.len() {
+            let header: BlobHeader = bincode::deserialize(&volume[position..]).unwrap();
+            let header_len = header.serialized_size().unwrap();
+            let key_start = position + header_len;
+            let key_end = key_start + header.key_len as usize;
+            keys.push(String::from_utf8(volume[key_start..key_end].to_vec()).unwrap());
+            position = key_end + header.blob_len as usize;
+        }
+        assert_eq!(
+            position,
+            volume.len(),
+            "the last blob must end where the volume ends"
+        );
+        let expected: Vec<String> = (0..count).map(|index| format!("after-{index}")).collect();
+        assert_eq!(keys[keys.len() - count..], expected[..]);
+        assert!(
+            keys.iter().all(|key| key != "stalled"),
+            "the dropped upload is still in the volume: {keys:?}"
+        );
+    }
+
+    /// A write whose caller goes away is a write dropped at an await: an RPC
+    /// whose client hung up, an HTTP request whose client timed out. What it
+    /// already handed to the file lands there, and the blobs written after it
+    /// must still be found at the offsets the writer reports for them.
+    #[tokio::test]
+    async fn a_write_dropped_midway_does_not_move_later_blobs_away_from_their_offsets() {
+        use futures::FutureExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let mut writer = VolumeWriter::new(temp_dir.path(), 64 * 1024 * 1024).await.unwrap();
+        let key = "dropped";
+        let data = vec![0xE2u8; 256 * 1024];
+
+        let mut dropped = false;
+        for _ in 0..100 {
+            // Polled once and dropped when it is not finished by then.
+            if writer.write_blob(&header_for(key, &data), key, &data).now_or_never().is_none() {
+                dropped = true;
+                break;
+            }
+        }
+        assert!(dropped, "no write stayed pending long enough to be dropped");
+
+        assert_later_writes_read_back(&mut writer, temp_dir.path(), 3).await;
+    }
+
+    /// A source that yields some bytes and then never finishes, the way a
+    /// client that stalls mid-upload does.
+    struct StallingReader {
+        remaining: usize,
+    }
+
+    impl AsyncRead for StallingReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.remaining == 0 {
+                return std::task::Poll::Pending;
+            }
+            let n = self.remaining.min(buf.remaining());
+            buf.initialize_unfilled_to(n).fill(0xE2);
+            buf.advance(n);
+            self.remaining -= n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_streaming_write_dropped_midway_does_not_move_later_blobs_away_from_their_offsets() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut writer = VolumeWriter::new(temp_dir.path(), 64 * 1024 * 1024).await.unwrap();
+
+        // Runs until the source stalls with part of the body written, and is
+        // dropped there.
+        let source = StallingReader { remaining: 300_000 };
+        let stalled = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            writer.write_blob_streaming("stalled", 1024 * 1024, source, 64 * 1024),
+        )
+        .await;
+        assert!(stalled.is_err(), "a stalled upload must not complete");
+
+        assert_later_writes_read_back(&mut writer, temp_dir.path(), 3).await;
     }
 
     #[tokio::test]

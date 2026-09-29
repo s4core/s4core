@@ -148,6 +148,27 @@ pub enum ObjectLayout {
         /// Number of segments in the manifest.
         part_count: u32,
     },
+    /// The bytes live in an erasure-coded pool, not in local volume storage.
+    ///
+    /// The record stays in the object index so the object keeps its place in
+    /// the namespace — listings, lifecycle scans and bucket statistics all read
+    /// that index, and an object that disappears from it is invisible to S3
+    /// clients even while its data is perfectly intact. Only the *data* moved.
+    ///
+    /// `file_id` and `offset` are meaningless for such a record and are set to
+    /// [`EXTERNAL_DATA_FILE_ID`](crate::types::metadata::EXTERNAL_DATA_FILE_ID).
+    /// Reading the bytes goes through the EC runtime, which resolves the object
+    /// through its manifest.
+    ///
+    /// The two fields below are diagnostic: they say which erasure set owns the
+    /// object and under which topology it was placed, without dragging any
+    /// Enterprise type into this crate.
+    ErasureCoded {
+        /// Erasure set that owns the shard slots.
+        erasure_set_id: u64,
+        /// Topology epoch in force when the object was encoded.
+        topology_epoch: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------

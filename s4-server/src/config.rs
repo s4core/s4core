@@ -75,6 +75,25 @@ pub struct ClusterModeConfig {
     /// Stable node identifier (`S4_NODE_ID`). Auto-generated on first run if not set.
     pub node_id: Option<String>,
 
+    /// Cluster identity this data directory must belong to
+    /// (`S4_EXPECTED_NODE_IDENTITY`, a UUID).
+    ///
+    /// Not the same thing as [`Self::node_id`], which is only a display name.
+    /// This is the persistent identity in `<data dir>/node_id` that the pool
+    /// assigns erasure-coded slots to. Set during node replacement: an empty
+    /// data directory adopts it, and a directory holding a different identity
+    /// stops the start.
+    pub expected_node_identity: Option<String>,
+
+    /// Whether to refuse the start when a live pool member already answers for
+    /// this node's identity (`S4_NODE_IDENTITY_CONFLICT_CHECK`, default `true`).
+    ///
+    /// Two machines under one identity are two histories of the same slot
+    /// owner, and every outcome of that is worse than a refused start. The
+    /// switch exists so the check can be taken out of the way during a recovery
+    /// where the operator already knows what is running where.
+    pub identity_conflict_check: bool,
+
     /// gRPC address for inter-node communication (`S4_NODE_GRPC_ADDR`).
     pub grpc_addr: Option<String>,
 
@@ -89,6 +108,9 @@ pub struct ClusterModeConfig {
 
     /// Pool node definitions (`S4_POOL_NODES`, format: `id:addr,id:addr,...`).
     pub pool_nodes: Option<String>,
+
+    /// Pool storage type (`S4_POOL_TYPE`, default: `standard`; EE EC uses `ec`).
+    pub pool_type: String,
 
     /// Replication factor (`S4_REPLICATION_FACTOR`, default: 3).
     pub replication_factor: u8,
@@ -110,6 +132,17 @@ pub struct ClusterModeConfig {
 
     /// Scrubber full-scan interval in days (`S4_SCRUBBER_FULL_SCAN_DAYS`, default: 30).
     pub scrubber_full_scan_days: u32,
+
+    /// Delay before the scrubber's first cycle, in seconds
+    /// (`S4_SCRUBBER_START_DELAY_SECS`, default: 30).
+    ///
+    /// Healing a damaged blob means fetching a healthy copy from a peer, and a
+    /// node that has just started has not finished hearing about its peers.
+    pub scrubber_start_delay_secs: u64,
+
+    /// How soon the scrubber runs again after a cycle that left damage
+    /// unhealed, in seconds (`S4_SCRUBBER_UNHEALED_RETRY_SECS`, default: 300).
+    pub scrubber_unhealed_retry_secs: u64,
 
     /// Hinted handoff TTL in hours (`S4_HINT_TTL_HOURS`, default: 3).
     pub hint_ttl_hours: u32,
@@ -138,11 +171,19 @@ impl Default for ClusterModeConfig {
             cluster_name: std::env::var("S4_CLUSTER_NAME")
                 .unwrap_or_else(|_| "s4-cluster".to_string()),
             node_id: std::env::var("S4_NODE_ID").ok(),
+            expected_node_identity: std::env::var("S4_EXPECTED_NODE_IDENTITY")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
+            identity_conflict_check: std::env::var("S4_NODE_IDENTITY_CONFLICT_CHECK")
+                .map(|s| s.to_lowercase() == "true" || s == "1")
+                .unwrap_or(true),
             grpc_addr: std::env::var("S4_NODE_GRPC_ADDR").ok(),
             http_addr: std::env::var("S4_NODE_HTTP_ADDR").ok(),
             seeds,
             pool_name: std::env::var("S4_POOL_NAME").ok(),
             pool_nodes: std::env::var("S4_POOL_NODES").ok(),
+            pool_type: std::env::var("S4_POOL_TYPE").unwrap_or_else(|_| "standard".to_string()),
             replication_factor: std::env::var("S4_REPLICATION_FACTOR")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -171,6 +212,14 @@ impl Default for ClusterModeConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30),
+            scrubber_start_delay_secs: std::env::var("S4_SCRUBBER_START_DELAY_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30),
+            scrubber_unhealed_retry_secs: std::env::var("S4_SCRUBBER_UNHEALED_RETRY_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(300),
             hint_ttl_hours: std::env::var("S4_HINT_TTL_HOURS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -203,8 +252,15 @@ impl ClusterModeConfig {
     ///
     /// Returns an error if required fields are missing for cluster/gateway modes.
     pub fn validate(&self) -> Result<(), String> {
+        let pool_storage_class = self.pool_storage_class()?;
+
         match self.mode {
-            ServerMode::Single => Ok(()),
+            ServerMode::Single => {
+                if pool_storage_class.is_erasure_coded() {
+                    return Err("S4_POOL_TYPE=ec requires S4_MODE=cluster".to_string());
+                }
+                Ok(())
+            }
             ServerMode::Cluster => {
                 if self.seeds.is_empty() {
                     return Err("S4_SEEDS is required in cluster mode".to_string());
@@ -218,12 +274,25 @@ impl ClusterModeConfig {
                 Ok(())
             }
             ServerMode::Gateway => {
+                if pool_storage_class.is_erasure_coded() {
+                    return Err("S4_POOL_TYPE=ec requires S4_MODE=cluster".to_string());
+                }
                 if self.seeds.is_empty() {
                     return Err("S4_SEEDS is required in gateway mode".to_string());
                 }
                 Ok(())
             }
         }
+    }
+
+    /// Parsed S4 physical storage class for this pool.
+    pub fn pool_storage_class(&self) -> Result<s4_core::types::StorageClass, String> {
+        s4_core::types::StorageClass::from_pool_type(&self.pool_type).ok_or_else(|| {
+            format!(
+                "S4_POOL_TYPE must be 'standard' or 'ec', got '{}'",
+                self.pool_type
+            )
+        })
     }
 }
 
@@ -728,6 +797,34 @@ mod tests {
             mode: ServerMode::Single,
             ..ClusterModeConfig::default()
         };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn cluster_mode_validate_rejects_ec_pool_type_in_single_mode() {
+        let config = ClusterModeConfig {
+            mode: ServerMode::Single,
+            pool_type: "ec".into(),
+            ..ClusterModeConfig::default()
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("S4_POOL_TYPE=ec requires S4_MODE=cluster"));
+    }
+
+    #[test]
+    fn cluster_mode_parses_ec_pool_type() {
+        let config = ClusterModeConfig {
+            mode: ServerMode::Cluster,
+            seeds: vec!["10.0.1.1:9100".into()],
+            pool_name: Some("pool-1".into()),
+            pool_nodes: Some("node-1:10.0.1.1:9100".into()),
+            pool_type: "ec".into(),
+            ..ClusterModeConfig::default()
+        };
+        assert_eq!(
+            config.pool_storage_class().unwrap(),
+            s4_core::types::StorageClass::ErasureCoded
+        );
         assert!(config.validate().is_ok());
     }
 

@@ -47,6 +47,8 @@
 //! `put_object` or `put_object_versioned` means the data survives a process
 //! crash or power failure.
 
+use std::collections::HashMap;
+
 use crate::error::StorageError;
 use crate::storage::journal::JournalEntry;
 use crate::storage::placement::PlacementGroupId;
@@ -54,6 +56,40 @@ use crate::types::{DefaultRetention, IndexRecord, VersioningStatus};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
+
+// ============================================================================
+// Healing writes
+// ============================================================================
+
+/// Reserved metadata key that turns an ordinary write into a **healing write**.
+///
+/// An ordinary write of content the engine has seen before costs nothing: the
+/// deduplicator points the new record at the blob that already holds those
+/// bytes. That is the right answer while the blob is intact, and the wrong one
+/// for the caller that is writing precisely because it is not — a repair
+/// rebuilding a shard whose bytes rotted on disk, say. Answering such a write
+/// from the dedup index would report success and leave the damage where it was.
+///
+/// A write carrying this key with a truthy value therefore always puts its
+/// bytes into a volume of its own, and the dedup entry for that content is
+/// moved to the copy it just wrote, so the next writer of the same content
+/// lands on the healthy one. The key is stripped before the record is
+/// persisted: it describes the write, not the object.
+///
+/// Callers should use [`is_force_physical_write`] rather than reading the key
+/// by hand, so that every layer agrees on what a healing write looks like.
+pub const FORCE_PHYSICAL_WRITE_METADATA_KEY: &str = "_s4_force_physical_write";
+
+/// Whether `metadata` asks for a healing write.
+///
+/// See [`FORCE_PHYSICAL_WRITE_METADATA_KEY`]. Accepts the spellings an
+/// operator or an RPC hop is likely to produce for "yes", and treats anything
+/// else — including a missing key — as an ordinary write.
+pub fn is_force_physical_write(metadata: &HashMap<String, String>) -> bool {
+    metadata
+        .get(FORCE_PHYSICAL_WRITE_METADATA_KEY)
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+}
 
 // ============================================================================
 // Streaming Write Types
@@ -245,6 +281,153 @@ pub trait StorageEngine: Send + Sync {
     /// * `bucket` - Bucket name
     /// * `key` - Object key
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), StorageError>;
+
+    /// Deletes an object only when the current record matches the expected HLC generation.
+    ///
+    /// Returns `Ok(true)` when the matching record was removed and `Ok(false)` when the
+    /// object is absent or points at a different generation.
+    async fn delete_object_if_hlc(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected_hlc_timestamp: u64,
+        expected_hlc_logical: u32,
+        expected_origin_node_id: u128,
+    ) -> Result<bool, StorageError> {
+        let record = match self.head_object(bucket, key).await {
+            Ok(record) => record,
+            Err(StorageError::ObjectNotFound { .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        if record.hlc_timestamp != expected_hlc_timestamp
+            || record.hlc_logical != expected_hlc_logical
+            || record.origin_node_id != expected_origin_node_id
+        {
+            return Ok(false);
+        }
+
+        self.delete_object(bucket, key).await?;
+        Ok(true)
+    }
+
+    /// Releases an object's local data while keeping its namespace entry.
+    ///
+    /// This is what a storage-layout migration needs, and it is deliberately not
+    /// a delete. The bytes move elsewhere — today, to erasure-coded shards — but
+    /// the object itself does not go anywhere: it must keep appearing in
+    /// listings, lifecycle scans and bucket statistics, all of which read the
+    /// object index. Deleting the index entry is how an object becomes readable
+    /// by key yet invisible to every client that enumerates a bucket.
+    ///
+    /// The record is rewritten with [`crate::types::ObjectLayout::ErasureCoded`], keeping
+    /// size, ETag, content type, metadata, timestamps and the HLC generation,
+    /// and the local blob reference is released so compaction can reclaim the
+    /// space.
+    ///
+    /// Guarded by the same generation check as
+    /// [`delete_object_if_hlc`](Self::delete_object_if_hlc): a record that has
+    /// been overwritten since the migration started must not be touched.
+    ///
+    /// Returns `Ok(true)` when the matching record was converted, `Ok(false)`
+    /// when the object is absent or points at a different generation.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation returns [`StorageError::InvalidOperation`]:
+    /// releasing a blob reference cannot be expressed through the other trait
+    /// methods, so a backend that supports layout migration has to implement
+    /// this itself.
+    async fn detach_object_data_if_hlc(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _expected_hlc_timestamp: u64,
+        _expected_hlc_logical: u32,
+        _expected_origin_node_id: u128,
+        _layout: crate::types::ObjectLayout,
+    ) -> Result<bool, StorageError> {
+        Err(StorageError::InvalidOperation {
+            operation: "detach_object_data_if_hlc".to_string(),
+            reason: "this storage engine does not support erasure-coded layout migration"
+                .to_string(),
+        })
+    }
+
+    /// Brings the bytes of an erasure-coded object back into local storage.
+    ///
+    /// The mirror of [`detach_object_data_if_hlc`](Self::detach_object_data_if_hlc),
+    /// used by auto-tiering to promote an object that became hot again. `data`
+    /// is written to a volume and the namespace entry is rewritten with a local
+    /// layout, keeping size, ETag, content type, metadata, timestamps and the
+    /// HLC generation — a promotion moves bytes, it does not write a new object.
+    ///
+    /// Guarded by the same generation check as its mirror, and for a stronger
+    /// reason: a client PUT that landed while the promotion was decoding must
+    /// win, and overwriting it with the decoded bytes would silently roll the
+    /// object back.
+    ///
+    /// `data` must be the object's real content, already verified against the
+    /// EC manifest by the caller. This method checks the one fact it can check
+    /// on its own — that the byte count matches the record — and refuses
+    /// anything else, so a caller that mixed up two objects cannot quietly
+    /// corrupt one of them. The content-addressing hash is recomputed from the
+    /// bytes written, because the dedup index and the read-path checksum both
+    /// read it and both have to agree with what is on disk.
+    ///
+    /// Returns `Ok(true)` when the matching record was converted or already
+    /// carried local data, `Ok(false)` when the object is absent or points at a
+    /// different generation.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation returns [`StorageError::InvalidOperation`]:
+    /// like its mirror, writing a blob and rewriting the index entry in one
+    /// batch cannot be expressed through the other trait methods.
+    async fn attach_object_data_if_hlc(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _expected_hlc_timestamp: u64,
+        _expected_hlc_logical: u32,
+        _expected_origin_node_id: u128,
+        _data: &[u8],
+    ) -> Result<bool, StorageError> {
+        Err(StorageError::InvalidOperation {
+            operation: "attach_object_data_if_hlc".to_string(),
+            reason: "this storage engine does not support erasure-coded layout migration"
+                .to_string(),
+        })
+    }
+
+    /// Writes a namespace entry for an object whose data lives elsewhere.
+    ///
+    /// Reconciliation uses this to put back an entry that was lost — by a
+    /// cutover from before layout migration existed, or by a node that was
+    /// down when its peers converted theirs. `record` is rebuilt from the EC
+    /// manifest, which carries everything a client can see.
+    ///
+    /// Does nothing when a record already exists: the live index always wins
+    /// over a manifest, because an object may have been overwritten since.
+    ///
+    /// Returns `Ok(true)` when an entry was written.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation returns [`StorageError::InvalidOperation`],
+    /// like [`detach_object_data_if_hlc`](Self::detach_object_data_if_hlc), and
+    /// for the same reason.
+    async fn restore_erasure_coded_entry(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _record: IndexRecord,
+    ) -> Result<bool, StorageError> {
+        Err(StorageError::InvalidOperation {
+            operation: "restore_erasure_coded_entry".to_string(),
+            reason: "this storage engine does not support erasure-coded layout migration"
+                .to_string(),
+        })
+    }
 
     /// Gets object metadata without reading the data.
     ///
@@ -549,6 +732,44 @@ pub trait StorageEngine: Send + Sync {
         metadata: &std::collections::HashMap<String, String>,
         etag: &str,
     ) -> Result<StreamingPutResult, StorageError>;
+
+    /// Put the bytes of an object that is already indexed back on the disk.
+    ///
+    /// The repair primitive: a scrubber, or any path that has found a healthy
+    /// copy of an object whose local blob is damaged, hands those bytes here
+    /// and the engine writes them somewhere of its own. Only the location
+    /// changes — the record keeps its ETag, size, metadata, HLC, version and
+    /// content hash, because this is the same object, not a new write of it.
+    ///
+    /// `data` must hash to what the record already claims: the caller is
+    /// restoring this object, and bytes that are not this object's would be a
+    /// silent overwrite. Content that does not match is refused with
+    /// [`StorageError::ChecksumMismatch`].
+    ///
+    /// The blob is materialised rather than deduplicated — the copy the dedup
+    /// index names may be exactly the damaged one — and the dedup entry for
+    /// this content is moved onto it, so the next writer of the same content
+    /// lands on the healthy copy.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::ObjectNotFound`] when no record matches.
+    /// - [`StorageError::ChecksumMismatch`] when `data` is not this object's
+    ///   content.
+    /// - [`StorageError::InvalidData`] for objects this primitive does not
+    ///   cover: legacy inline objects, multipart composites and objects whose
+    ///   bytes live in an erasure-coded pool rather than in a local volume.
+    async fn heal_object_blob(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _version_id: Option<&str>,
+        _data: &[u8],
+    ) -> Result<(), StorageError> {
+        Err(StorageError::InvalidData(
+            "this storage engine cannot heal object bytes".to_string(),
+        ))
+    }
 }
 
 // ============================================================================

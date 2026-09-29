@@ -1,0 +1,39 @@
+[package]
+name = "s4-codec-isal"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "Elastic-2.0"
+description = "S4Core Enterprise Edition ISA-L accelerated erasure coding backend"
+
+[dependencies]
+bytes = { workspace = true }
+s4-codec = { path = "../s4-codec" }
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+# Measures both engines in one process, so the speed-up does not depend on two
+# separate runs happening under the same conditions. The portable baseline it is
+# compared against lives in `ee/s4-codec/benches/codec_bench.rs`.
+[[bench]]
+name = "isal_vs_pure"
+harness = false
+
+# This crate deliberately does NOT use `workspace = true`.
+#
+# The workspace sets `unsafe_code = "forbid"`, and `forbid` cannot be relaxed by
+# an attribute inside the crate: writing `#![allow(unsafe_code)]` under a
+# forbidding parent is a compile error, not an exemption. Calling a C library is
+# impossible without `unsafe`, so this crate has to opt out at the manifest
+# level instead.
+#
+# Every other workspace lint is repeated here on purpose, so opting out of one
+# rule does not quietly opt out of the rest. See decision EC2-001.
+[lints.rust]
+missing_docs = "warn"
+unused = { level = "warn", priority = -1 }

@@ -92,7 +92,7 @@ impl ReplicaReadHandler {
                     epoch_mismatch: false,
                 })
             }
-            Err(e) => Ok(proto::ReadBlobResponse {
+            Err(e @ s4_core::StorageError::ObjectNotFound { .. }) => Ok(proto::ReadBlobResponse {
                 success: false,
                 error: e.to_string(),
                 data: Vec::new(),
@@ -104,6 +104,7 @@ impl ReplicaReadHandler {
                 content_length: 0,
                 epoch_mismatch: false,
             }),
+            Err(error) => Err(ClusterError::Storage(error.to_string())),
         }
     }
 
@@ -176,19 +177,26 @@ impl ReplicaReadHandler {
                     "replica head completed"
                 );
 
+                // Told apart from a hot copy on purpose: the record describes
+                // the object, but this node stores none of its bytes, so a
+                // reader must go to the EC path, not to us.
+                let erasure_coded = record.is_erasure_coded();
+
                 Ok(proto::HeadObjectResponse {
                     exists: true,
                     error: String::new(),
                     content_type: record.content_type,
                     content_length: record.size,
+                    erasure_coded,
                     metadata: record.metadata,
                     hlc: Some(hlc.to_proto()),
                     version_id: record.version_id,
                     etag: record.etag,
                     epoch_mismatch: false,
+                    content_hash: record.content_hash.to_vec(),
                 })
             }
-            Err(_) => Ok(proto::HeadObjectResponse {
+            Err(s4_core::StorageError::ObjectNotFound { .. }) => Ok(proto::HeadObjectResponse {
                 exists: false,
                 error: String::new(),
                 content_type: String::new(),
@@ -197,8 +205,11 @@ impl ReplicaReadHandler {
                 hlc: None,
                 version_id: None,
                 etag: String::new(),
+                erasure_coded: false,
                 epoch_mismatch: false,
+                content_hash: Vec::new(),
             }),
+            Err(error) => Err(ClusterError::Storage(error.to_string())),
         }
     }
 
@@ -342,11 +353,13 @@ impl ReplicaReadHandler {
                 ),
                 content_type: String::new(),
                 content_length: 0,
+                erasure_coded: false,
                 metadata: Default::default(),
                 hlc: None,
                 version_id: None,
                 etag: String::new(),
                 epoch_mismatch: true,
+                content_hash: Vec::new(),
             });
         }
         None
@@ -415,6 +428,11 @@ mod tests {
             bucket: &str,
             key: &str,
         ) -> Result<(Vec<u8>, s4_core::IndexRecord), s4_core::StorageError> {
+            if key == "unreadable.txt" {
+                return Err(s4_core::StorageError::Database(
+                    "injected database failure".into(),
+                ));
+            }
             self.data.get(&format!("{bucket}/{key}")).cloned().ok_or(
                 s4_core::StorageError::ObjectNotFound {
                     key: key.to_string(),
@@ -429,6 +447,11 @@ mod tests {
             bucket: &str,
             key: &str,
         ) -> Result<s4_core::IndexRecord, s4_core::StorageError> {
+            if key == "unreadable.txt" {
+                return Err(s4_core::StorageError::Database(
+                    "injected database failure".into(),
+                ));
+            }
             self.data.get(&format!("{bucket}/{key}")).map(|(_, r)| r.clone()).ok_or(
                 s4_core::StorageError::ObjectNotFound {
                     key: key.to_string(),
@@ -663,6 +686,40 @@ mod tests {
 
         let resp = handler.handle_head(&req).await.unwrap();
         assert!(!resp.exists);
+    }
+
+    #[tokio::test]
+    async fn remote_head_storage_error_is_not_absence() {
+        let handler = ReplicaReadHandler::new(Arc::new(MockStorage::empty()), 1);
+        let result = handler
+            .handle_head(&proto::HeadObjectRequest {
+                bucket: "bucket".into(),
+                key: "unreadable.txt".into(),
+                version_id: None,
+                topology_epoch: 1,
+            })
+            .await;
+        assert!(
+            matches!(&result, Err(ClusterError::Storage(reason)) if reason.contains("injected database failure")),
+            "a failed HEAD must not assert absence: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_read_storage_error_is_not_absence() {
+        let handler = ReplicaReadHandler::new(Arc::new(MockStorage::empty()), 1);
+        let result = handler
+            .handle_read(&proto::ReadBlobRequest {
+                bucket: "bucket".into(),
+                key: "unreadable.txt".into(),
+                topology_epoch: 1,
+                ..Default::default()
+            })
+            .await;
+        assert!(
+            matches!(&result, Err(ClusterError::Storage(reason)) if reason.contains("injected database failure")),
+            "a failed read must not assert absence: {result:?}"
+        );
     }
 
     #[tokio::test]

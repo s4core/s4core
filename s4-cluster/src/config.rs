@@ -21,6 +21,7 @@
 
 use std::net::SocketAddr;
 
+use s4_core::types::StorageClass;
 use serde::{Deserialize, Serialize};
 
 use crate::capability::ClusterLimits;
@@ -172,6 +173,14 @@ impl ClusterConfig {
 
         // Check node count per pool.
         for pool in &self.pools {
+            if pool.storage_class.is_erasure_coded() && !limits.allow_erasure_coding {
+                return Err(ClusterError::EnterpriseRequired(format!(
+                    "pool '{}' uses erasure-coded storage; EC pools require \
+                     Enterprise Edition with an erasure coding license",
+                    pool.name,
+                )));
+            }
+
             if pool.nodes.len() as u32 > limits.max_nodes_per_pool {
                 let edition_hint = if limits.is_community() {
                     format!(
@@ -232,6 +241,14 @@ pub struct PoolConfig {
 
     /// Override the cluster-level read quorum for this pool.
     pub read_quorum: Option<u8>,
+
+    /// Physical storage class for this pool.
+    ///
+    /// `Standard` keeps the existing RF=3 quorum path. `ErasureCoded` is an
+    /// Enterprise-only pool type that is validated by EE startup code before
+    /// any EC-specific worker is allowed to run.
+    #[serde(default)]
+    pub storage_class: StorageClass,
 }
 
 impl PoolConfig {
@@ -371,6 +388,7 @@ mod tests {
             replication_factor: None,
             write_quorum: None,
             read_quorum: None,
+            storage_class: StorageClass::Standard,
         }
     }
 
@@ -520,6 +538,32 @@ mod tests {
         let err = config.validate_with_limits(&limits).unwrap_err();
         assert!(err.to_string().contains("license"));
         assert!(err.to_string().contains("node"));
+    }
+
+    #[test]
+    fn ce_limits_reject_erasure_coded_pool_even_if_node_count_fits() {
+        let mut pool = valid_pool(1, 3);
+        pool.storage_class = StorageClass::ErasureCoded;
+        let config = ClusterConfig {
+            pools: vec![pool],
+            ..Default::default()
+        };
+        let limits = ClusterLimits::community();
+        let err = config.validate_with_limits(&limits).unwrap_err();
+        assert!(err.to_string().contains("enterprise feature required"));
+        assert!(err.to_string().contains("erasure-coded"));
+    }
+
+    #[test]
+    fn ee_limits_accept_erasure_coded_pool_at_generic_config_layer() {
+        let mut pool = valid_pool(1, 6);
+        pool.storage_class = StorageClass::ErasureCoded;
+        let config = ClusterConfig {
+            pools: vec![pool],
+            ..Default::default()
+        };
+        let limits = ClusterLimits::unlimited();
+        assert!(config.validate_with_limits(&limits).is_ok());
     }
 
     #[test]

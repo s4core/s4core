@@ -674,6 +674,19 @@ impl IndexDb {
                                 let mut entry: DedupEntry = bincode::deserialize(&bytes)
                                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
                                 entry.ref_count += 1;
+                                // An entry that names no copy is one whose blob
+                                // a read found damaged (`make_quarantine_op`).
+                                // The bytes this write just put down are the
+                                // healthy copy of that content, so the entry
+                                // takes them: without this it would name
+                                // nothing forever, and the compactor decides
+                                // what is live by what the entries name.
+                                if entry.volume_id == crate::storage::dedup::NO_LOCATION_VOLUME_ID
+                                    && *volume_id != crate::storage::dedup::NO_LOCATION_VOLUME_ID
+                                {
+                                    entry.volume_id = *volume_id;
+                                    entry.offset = *offset;
+                                }
                                 entry
                             }
                             None => DedupEntry {
@@ -1122,6 +1135,15 @@ impl IndexDb {
                         .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
                     if record.is_delete_marker {
+                        continue;
+                    }
+
+                    // An erasure-coded record is a namespace entry whose bytes
+                    // live in a pool, not in a volume. Counting its content hash
+                    // as a live reference would pin the hot blob it no longer
+                    // owns, and compaction would never reclaim the space the
+                    // migration was performed to free.
+                    if record.is_erasure_coded() {
                         continue;
                     }
 

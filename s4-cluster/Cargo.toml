@@ -6,6 +6,15 @@ authors.workspace = true
 license.workspace = true
 description = "Cluster membership, gossip, and node identity for S4 distributed storage"
 
+# `test-util` exposes constructors and fakes that exist only to make other
+# crates' tests possible (`GossipHandle::new_for_testing`,
+# `MockClusterMembership`). It is off by default so a release build cannot
+# reach them: `MockClusterMembership` answers the EC v2 rolling-upgrade gate
+# with a constant, and a production binary must not be able to construct it.
+[features]
+default = []
+test-util = []
+
 [dependencies]
 # Workspace dependencies
 tokio = { workspace = true }
@@ -18,6 +27,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 dashmap = { workspace = true }
+rustix = { workspace = true }
 chrono = { workspace = true }
 
 # gRPC inter-node communication

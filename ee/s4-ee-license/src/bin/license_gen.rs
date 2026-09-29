@@ -70,6 +70,7 @@ Disable specific capabilities (default: all enabled):
   --no-saml                      Disable SAML/OIDC auth
   --no-webdav                    Disable WebDAV
   --no-audit-log                 Disable audit log
+  --no-erasure-coding            Disable erasure-coded storage pools
 
 Output:
   --output <PATH>                Write the license key to a file (default: stdout)
@@ -209,6 +210,7 @@ fn main() {
     let saml = !has_flag("--no-saml");
     let webdav = !has_flag("--no-webdav");
     let audit_log = !has_flag("--no-audit-log");
+    let erasure_coding = !has_flag("--no-erasure-coding");
 
     // Decode private key seed.
     let engine = base64::engine::general_purpose::STANDARD;
@@ -243,6 +245,7 @@ fn main() {
             saml,
             webdav,
             audit_log,
+            erasure_coding,
         },
     };
 

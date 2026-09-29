@@ -166,6 +166,11 @@ pub async fn create_bucket(
         .unwrap_or(false);
 
     let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
+    let mut bucket_meta = std::collections::HashMap::new();
+    bucket_meta.insert(
+        s4_core::types::S4_STORAGE_CLASS_METADATA_KEY.to_string(),
+        state.default_bucket_storage_class.as_metadata_value().to_string(),
+    );
     let empty_meta = std::collections::HashMap::new();
 
     // ── Cluster mode: replicate bucket metadata via quorum write ──
@@ -189,7 +194,7 @@ pub async fn create_bucket(
                 &bucket_marker_key,
                 b"1",
                 "application/octet-stream",
-                &empty_meta,
+                &bucket_meta,
             )
             .await
         {
@@ -261,7 +266,7 @@ pub async fn create_bucket(
                 &bucket_marker_key,
                 b"1",
                 "application/octet-stream",
-                &empty_meta,
+                &bucket_meta,
             )
             .await
         {
@@ -435,12 +440,24 @@ pub async fn list_buckets(State(state): State<AppState>) -> impl IntoResponse {
 
     let buckets: Vec<String> = if let Some(ref list_coord) = state.list_coordinator {
         // Cluster mode: distributed list of bucket markers across all nodes
-        match list_coord.list("__system__", "__s4_bucket_marker_", 1000, None).await {
+        match list_coord
+            .list(
+                "__system__",
+                s4_core::types::BUCKET_MARKER_KEY_PREFIX,
+                1000,
+                None,
+            )
+            .await
+        {
             Ok(result) => {
                 let mut names: Vec<String> = result
                     .entries
                     .iter()
-                    .filter_map(|e| e.key.strip_prefix("__s4_bucket_marker_").map(String::from))
+                    .filter_map(|e| {
+                        e.key
+                            .strip_prefix(s4_core::types::BUCKET_MARKER_KEY_PREFIX)
+                            .map(String::from)
+                    })
                     .collect();
                 // Deduplicate — scatter-gather may return the same marker from multiple nodes
                 names.sort();
@@ -455,12 +472,15 @@ pub async fn list_buckets(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         // Standalone mode: local storage
         let storage = state.storage.read().await;
-        let markers = storage.list_objects("__system__", "__s4_bucket_marker_", 1000).await;
+        let markers = storage
+            .list_objects("__system__", s4_core::types::BUCKET_MARKER_KEY_PREFIX, 1000)
+            .await;
         match markers {
             Ok(list) => list
                 .into_iter()
                 .filter_map(|(key, _)| {
-                    key.strip_prefix("__s4_bucket_marker_").map(|s| s.to_string())
+                    key.strip_prefix(s4_core::types::BUCKET_MARKER_KEY_PREFIX)
+                        .map(|s| s.to_string())
                 })
                 .collect(),
             Err(e) => {
@@ -1225,7 +1245,9 @@ fn strip_version_ids_from_keys(
 }
 
 /// Validates bucket name according to S3 rules .
-fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
+///
+/// Shared with the admin API so both entry points accept exactly the same names.
+pub(crate) fn validate_bucket_name(name: &str) -> Result<(), S3Error> {
     if name.len() < 3 || name.len() > 63 {
         return Err(S3Error::InvalidRequest(
             "Bucket name must be between 3 and 63 characters".to_string(),

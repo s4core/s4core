@@ -32,6 +32,30 @@ service S4Node {
     // Delete a blob from a replica node (tombstone).
     rpc DeleteBlob(DeleteBlobRequest) returns (DeleteBlobResponse);
 
+    // Release a replica's local copy of an object while keeping the object in
+    // the namespace. Used when data moves to erasure coding: the bytes become
+    // shards, but the object must stay listable.
+    //
+    // Deliberately a separate call rather than a flag on DeleteBlob: a node too
+    // old to know about it answers UNIMPLEMENTED, and the purge is simply
+    // deferred. A flag on the delete would be ignored by such a node, which
+    // would then drop the object out of its listing.
+    rpc DetachObjectData(DetachObjectDataRequest) returns (DetachObjectDataResponse);
+
+    // Bring an object's bytes back into a replica's local storage, undoing a
+    // DetachObjectData. Used when auto-tiering promotes an object that became
+    // hot again: the shards are decoded once by the coordinator and the same
+    // bytes are handed to every replica.
+    //
+    // A node too old to know this call answers UNIMPLEMENTED, and the promotion
+    // is left unfinished rather than half applied — the object keeps reading
+    // from erasure coding, which is exactly where it still is.
+    rpc AttachObjectData(AttachObjectDataRequest) returns (AttachObjectDataResponse);
+
+    // Put back a namespace entry for an erasure-coded object that lost one.
+    // Repair only: it never overwrites an entry the replica already has.
+    rpc RestoreNamespaceEntry(RestoreNamespaceEntryRequest) returns (RestoreNamespaceEntryResponse);
+
     // Create a native multipart upload session on a replica.
     rpc CreateMultipartUploadReplica(CreateMultipartUploadReplicaRequest) returns (CreateMultipartUploadReplicaResponse);
 
@@ -66,6 +90,42 @@ service S4Node {
 
     // List objects on a replica.
     rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+
+    // Read a node's local record of when an object was last used.
+    //
+    // Erasure-coding auto-tiering keeps this mark per node, because the node
+    // that served a read is the only one that saw it. A node deciding whether
+    // an object has gone cold therefore has to ask its peers, and takes the
+    // newest answer. A node too old to know the call answers UNIMPLEMENTED,
+    // which the caller reads as "no mark here" — the same as a node that has
+    // simply never served a read for the object.
+    rpc ReadObjectHeat(ReadObjectHeatRequest) returns (ReadObjectHeatResponse);
+
+    // Report this node's local EC manifests as content digests.
+    //
+    // A node's manifest store holds the objects it transcoded plus the ones its
+    // read path resolved, which in a pool wider than the manifest quorum is a
+    // fraction of the pool. Two objects with identical content can therefore
+    // sit on disjoint nodes, and neither of them sees the repeat. The dedup
+    // measurement asks every node of the pool and merges the answers, so the
+    // share it reports is the pool's and not one node's slice of it.
+    //
+    // A node too old to know the call answers UNIMPLEMENTED. That is not "no
+    // duplicates here": the caller counts the node as unread and marks the
+    // report incomplete.
+    rpc ScanEcContentDigests(ScanEcContentDigestsRequest) returns (ScanEcContentDigestsResponse);
+
+    // Ask one node whether it holds each of these deletes.
+    //
+    // The tombstone sweep has to know, per delete, which owners have seen it
+    // before it may release any shards. Asked one delete at a time that is a
+    // round trip per delete per owner; asked in a batch it is one per owner, and
+    // the answer is the same.
+    //
+    // A node too old to know the call answers UNIMPLEMENTED, and the caller
+    // falls back to asking about each delete on its own — which is the same
+    // question at the old price, not a weaker gate.
+    rpc ProbeEcTombstones(ProbeEcTombstonesRequest) returns (ProbeEcTombstonesResponse);
 
     // === Repair / Anti-entropy ===
 
@@ -171,12 +231,71 @@ message DeleteBlobRequest {
     bytes operation_id = 5;         // OperationId (16 bytes UUID)
     uint64 topology_epoch = 6;
     optional string version_id = 7;
+    HybridTimestamp expected_source_hlc = 8; // Optional generation guard for physical GC purges
 }
 
 message DeleteBlobResponse {
     bool success = 1;
     string error = 2;
     uint64 local_sequence = 3;
+    bool epoch_mismatch = 4;
+}
+
+message DetachObjectDataRequest {
+    string bucket = 1;
+    string key = 2;
+    bytes coordinator_id = 3;                // NodeId (16 bytes UUID)
+    bytes operation_id = 4;                  // OperationId (16 bytes UUID)
+    uint64 topology_epoch = 5;
+    HybridTimestamp expected_source_hlc = 6; // Generation guard, always required
+    uint64 erasure_set_id = 7;               // Set that owns the shards
+    uint64 ec_topology_epoch = 8;            // Topology the object was placed under
+}
+
+message AttachObjectDataRequest {
+    string bucket = 1;
+    string key = 2;
+    bytes coordinator_id = 3;                // NodeId (16 bytes UUID)
+    bytes operation_id = 4;                  // OperationId (16 bytes UUID)
+    uint64 topology_epoch = 5;
+    HybridTimestamp expected_source_hlc = 6; // Generation guard, always required
+    bytes data = 7;                          // Full object bytes, decoded from the shards
+}
+
+message AttachObjectDataResponse {
+    bool success = 1;
+    string error = 2;
+    // False when no record matched the expected generation. Not an error: the
+    // object was overwritten while the promotion was in flight.
+    bool attached = 3;
+    bool epoch_mismatch = 4;
+}
+
+message RestoreNamespaceEntryRequest {
+    string bucket = 1;
+    string key = 2;
+    // Serialized IndexRecord rebuilt from the EC manifest. The replica refuses
+    // it unless it carries an erasure-coded layout.
+    bytes record = 3;
+    bytes coordinator_id = 4;
+    bytes operation_id = 5;
+    uint64 topology_epoch = 6;
+}
+
+message RestoreNamespaceEntryResponse {
+    bool success = 1;
+    string error = 2;
+    // False when the replica already had an entry, which always wins.
+    bool restored = 3;
+    bool epoch_mismatch = 4;
+}
+
+message DetachObjectDataResponse {
+    bool success = 1;
+    string error = 2;
+    // False when no record matched the expected generation. Not an error: the
+    // object was overwritten while the migration was in flight.
+    bool detached = 3;
     bool epoch_mismatch = 4;
 }
 
@@ -373,6 +492,12 @@ message HeadObjectResponse {
     optional string version_id = 7;
     string etag = 8;
     bool epoch_mismatch = 9;
+    // The record describes an object whose bytes are erasure-coded shards, not
+    // a locally stored copy. Readers must not treat it as a hot replica.
+    bool erasure_coded = 10;
+    // SHA-256 of the object content, 32 bytes. Empty from a node too old to
+    // send it, which callers must read as "unknown", never as a mismatch.
+    bytes content_hash = 11;
 }
 
 message ListObjectsRequest {
@@ -391,6 +516,102 @@ message ListObjectsResponse {
     string next_continuation_token = 4;
     string error = 5;
     bool epoch_mismatch = 6;
+}
+
+message ReadObjectHeatRequest {
+    string bucket = 1;
+    string key = 2;
+    // Empty when the mark is about the current version, which is the only
+    // version auto-tiering migrates.
+    string version_id = 3;
+    bytes coordinator_id = 4;
+    // Width of the trailing window the caller wants the read count over. Zero
+    // means "whatever this node is configured for", which is what a caller
+    // from before bucket-level promotion windows sends.
+    uint64 window_nanos = 5;
+}
+
+message ReadObjectHeatResponse {
+    bool success = 1;
+    string error = 2;
+    // False when this node has never recorded an access for the object.
+    bool found = 3;
+    uint64 last_access_nanos = 4;
+    // Field 5 carried the start of a tumbling window. Reverse tiering counts
+    // reads over a sliding one, which has no single start, so the responder
+    // now evaluates the count itself and the caller only sums what it is told.
+    reserved 5;
+    // Reads this node served within the trailing window, as of its own clock.
+    uint32 window_access_count = 6;
+}
+
+message ScanEcContentDigestsRequest {
+    // Upper bound on manifests this node may walk. The responder clamps it to
+    // its own S4_EC_ADMIN_SCAN_LIMIT.
+    uint32 max_entries = 1;
+    bytes coordinator_id = 2;
+}
+
+message ScanEcContentDigestsResponse {
+    bool success = 1;
+    string error = 2;
+    repeated EcContentDigest digests = 3;
+    // Manifests read, including the ones filtered out of `digests` because they
+    // describe no stored EC bytes.
+    uint32 scanned = 4;
+    // True when the walk stopped at the limit rather than at the end of the
+    // store, so this node's contribution is a prefix and not its whole share.
+    bool truncated = 5;
+}
+
+message ProbeEcTombstonesRequest {
+    bytes coordinator_id = 1;
+    uint64 topology_epoch = 2;
+    repeated EcTombstoneProbe probes = 3;
+}
+
+message ProbeEcTombstonesResponse {
+    bool success = 1;
+    string error = 2;
+    // One answer per probe, in the order they were asked. A responder that
+    // cannot answer one of them says `false` for it: "not shown to hold this
+    // delete" is exactly what the gate asks, and it is the safe answer.
+    repeated bool held = 3;
+}
+
+// One delete, identified the way the sweep identifies it: same object, same
+// delete operation, same HLC. A tombstone carries no shards to check, so the
+// probe carries no placement either.
+message EcTombstoneProbe {
+    string bucket = 1;
+    string key = 2;
+    // Empty when the delete is of an unversioned object.
+    string version_id = 3;
+    bytes operation_id = 4;
+    uint64 hlc_wall_time = 5;
+    uint32 hlc_logical = 6;
+    bytes hlc_node_id = 7;
+}
+
+// One live EC object as the dedup measurement sees it.
+//
+// The object reference travels with the digest so the report can name examples
+// and tell apart a repeat across versions from one across buckets — the two
+// lead to different conclusions in the gap analysis.
+message EcContentDigest {
+    string bucket = 1;
+    string key = 2;
+    // Empty when the manifest describes an unversioned object.
+    string version_id = 3;
+    bytes content_hash_sha256 = 4;
+    uint64 original_size = 5;
+    // Dedup cannot cross a set boundary, so a repeat that spans two sets is not
+    // a saving. The merge keeps them apart by this field.
+    uint64 erasure_set_id = 6;
+    // True when the object's bytes live inside a packed segment. Those bytes
+    // are already shared with other objects' bytes in one encoded segment, so
+    // shard-level dedup has nothing to save on them.
+    bool packed = 7;
 }
 
 message ObjectInfo {
@@ -514,6 +735,7 @@ message HintRequest {
     optional string version_id = 8;
     map<string, string> metadata = 9;
     string content_type = 10;
+    HybridTimestamp expected_source_hlc = 11;
 }
 
 message HintResponse {

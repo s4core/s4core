@@ -25,6 +25,11 @@
 //! [`IdempotencyTracker`] before writing. If the operation was already
 //! applied, it returns success without re-writing.
 //!
+//! One kind of write is exempt: a **healing write**, which carries
+//! [`s4_core::FORCE_PHYSICAL_WRITE_METADATA_KEY`] and exists precisely because the
+//! bytes on this node are damaged or gone. It is never a retry of an earlier
+//! write, so "already applied" is not an answer it can be given.
+//!
 //! # Epoch Check
 //!
 //! Requests from a coordinator with a different topology epoch are
@@ -35,7 +40,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use s4_core::StorageEngine;
+use s4_core::{is_force_physical_write, StorageEngine};
 use tracing::{debug, warn};
 
 use crate::error::ClusterError;
@@ -96,12 +101,23 @@ impl ReplicaWriteHandler {
         let operation_id = parse_operation_id(&request.operation_id)?;
 
         // 3. Idempotency check
-        if self.idempotency.is_duplicate(operation_id, |_key| {
-            // In a full implementation, this would look up the journal keyspace.
-            // For now, we rely on the LRU cache + StorageEngine's own
-            // idempotency (same content_hash = same dedup entry).
-            false
-        }) {
+        //
+        // A healing write is exempt. The tracker answers one question — "has
+        // an operation with this id been applied here?" — and for a retry of
+        // the same write that answer is what saves the disk a second copy. A
+        // heal asks a different question: the bytes this node holds are gone
+        // or rotten, and they have to be written again. Answering it from the
+        // tracker would report success while the damage stays where it was,
+        // which is how a shard repaired once could never be repaired twice.
+        let heals_bytes = is_force_physical_write(&request.metadata);
+        if !heals_bytes
+            && self.idempotency.is_duplicate(operation_id, |_key| {
+                // In a full implementation, this would look up the journal keyspace.
+                // For now, we rely on the LRU cache + StorageEngine's own
+                // idempotency (same content_hash = same dedup entry).
+                false
+            })
+        {
             debug!(operation_id = %uuid::Uuid::from_u128(operation_id), "duplicate write, skipping");
             return Ok(proto::WriteBlobResponse {
                 success: true,
@@ -214,24 +230,36 @@ impl ReplicaWriteHandler {
         }
 
         // 4. Capture content_hash before delete for Merkle tree update
-        let content_hash = self
-            .storage
-            .head_object(&request.bucket, &request.key)
-            .await
-            .map(|r| r.content_hash)
-            .ok();
+        let head = self.storage.head_object(&request.bucket, &request.key).await.ok();
+        let content_hash = head.as_ref().map(|record| record.content_hash);
 
         // 5. Delete from local storage engine
-        self.storage
-            .delete_object(&request.bucket, &request.key)
-            .await
-            .map_err(|e| ClusterError::Storage(e.to_string()))?;
+        let deleted = if let Some(expected) =
+            request.expected_source_hlc.as_ref().map(crate::hlc::HlcTimestamp::from_proto)
+        {
+            self.storage
+                .delete_object_if_hlc(
+                    &request.bucket,
+                    &request.key,
+                    expected.wall_time,
+                    expected.logical,
+                    expected.node_id,
+                )
+                .await
+                .map_err(|e| ClusterError::Storage(e.to_string()))?
+        } else {
+            self.storage
+                .delete_object(&request.bucket, &request.key)
+                .await
+                .map_err(|e| ClusterError::Storage(e.to_string()))?;
+            true
+        };
 
         // 6. Record in idempotency cache
         self.idempotency.record(operation_id);
 
         // 7. Update anti-entropy Merkle tree + key registry
-        if let (Some(ae), Some(hash)) = (&self.anti_entropy, content_hash) {
+        if let (true, Some(ae), Some(hash)) = (deleted, &self.anti_entropy, content_hash) {
             ae.unregister_key(&request.bucket, &request.key, hash).await;
         }
 
@@ -246,6 +274,248 @@ impl ReplicaWriteHandler {
             success: true,
             error: String::new(),
             local_sequence: 0,
+            epoch_mismatch: false,
+        })
+    }
+
+    /// Handle a `DetachObjectDataRequest` from the coordinator.
+    ///
+    /// Releases this replica's copy of the bytes and leaves the object in the
+    /// namespace with an erasure-coded layout. The object stays listable; only
+    /// its data moved.
+    pub async fn handle_detach_object_data(
+        &self,
+        request: &proto::DetachObjectDataRequest,
+    ) -> Result<proto::DetachObjectDataResponse, ClusterError> {
+        if request.topology_epoch != 0 && request.topology_epoch != self.topology_epoch {
+            warn!(
+                local_epoch = self.topology_epoch,
+                request_epoch = request.topology_epoch,
+                "epoch mismatch on replica detach"
+            );
+            return Ok(proto::DetachObjectDataResponse {
+                success: false,
+                error: format!(
+                    "epoch mismatch: local={}, request={}",
+                    self.topology_epoch, request.topology_epoch
+                ),
+                detached: false,
+                epoch_mismatch: true,
+            });
+        }
+
+        let operation_id = parse_operation_id(&request.operation_id)?;
+
+        // The generation guard is what makes this safe against a concurrent
+        // overwrite, so a request without one is malformed rather than lenient.
+        let Some(expected) =
+            request.expected_source_hlc.as_ref().map(crate::hlc::HlcTimestamp::from_proto)
+        else {
+            return Ok(proto::DetachObjectDataResponse {
+                success: false,
+                error: "detach requires expected_source_hlc".to_string(),
+                detached: false,
+                epoch_mismatch: false,
+            });
+        };
+
+        // Captured before the change: anti-entropy tracks locally stored bytes,
+        // and after the detach this replica no longer stores any.
+        let content_hash = self
+            .storage
+            .head_object(&request.bucket, &request.key)
+            .await
+            .ok()
+            .map(|record| record.content_hash);
+
+        let detached = self
+            .storage
+            .detach_object_data_if_hlc(
+                &request.bucket,
+                &request.key,
+                expected.wall_time,
+                expected.logical,
+                expected.node_id,
+                s4_core::types::ObjectLayout::ErasureCoded {
+                    erasure_set_id: request.erasure_set_id,
+                    topology_epoch: request.ec_topology_epoch,
+                },
+            )
+            .await
+            .map_err(|e| ClusterError::Storage(e.to_string()))?;
+
+        if detached {
+            self.idempotency.record(operation_id);
+        }
+
+        // Hot anti-entropy must stop expecting these bytes here. Integrity of an
+        // erasure-coded object is the EC scrubber's job, and leaving the key
+        // registered would have the hot repair path chase a copy that no node
+        // holds any more.
+        if let (true, Some(ae), Some(hash)) = (detached, &self.anti_entropy, content_hash) {
+            ae.unregister_key(&request.bucket, &request.key, hash).await;
+        }
+
+        debug!(
+            bucket = %request.bucket,
+            key = %request.key,
+            detached,
+            operation_id = %uuid::Uuid::from_u128(operation_id),
+            "replica detach completed"
+        );
+
+        Ok(proto::DetachObjectDataResponse {
+            success: true,
+            error: String::new(),
+            detached,
+            epoch_mismatch: false,
+        })
+    }
+
+    /// Handle an `AttachObjectDataRequest` from the coordinator.
+    ///
+    /// Writes this replica's copy of the bytes back and takes the object out of
+    /// the erasure-coded layout. The reverse of
+    /// [`handle_detach_object_data`](Self::handle_detach_object_data), used when
+    /// auto-tiering promotes an object that became hot again.
+    pub async fn handle_attach_object_data(
+        &self,
+        request: &proto::AttachObjectDataRequest,
+    ) -> Result<proto::AttachObjectDataResponse, ClusterError> {
+        if request.topology_epoch != 0 && request.topology_epoch != self.topology_epoch {
+            warn!(
+                local_epoch = self.topology_epoch,
+                request_epoch = request.topology_epoch,
+                "epoch mismatch on replica attach"
+            );
+            return Ok(proto::AttachObjectDataResponse {
+                success: false,
+                error: format!(
+                    "epoch mismatch: local={}, request={}",
+                    self.topology_epoch, request.topology_epoch
+                ),
+                attached: false,
+                epoch_mismatch: true,
+            });
+        }
+
+        let operation_id = parse_operation_id(&request.operation_id)?;
+
+        // Same reasoning as the detach: without a generation guard the request
+        // could overwrite a client's newer write with decoded stale bytes, so a
+        // request that omits it is malformed rather than lenient.
+        let Some(expected) =
+            request.expected_source_hlc.as_ref().map(crate::hlc::HlcTimestamp::from_proto)
+        else {
+            return Ok(proto::AttachObjectDataResponse {
+                success: false,
+                error: "attach requires expected_source_hlc".to_string(),
+                attached: false,
+                epoch_mismatch: false,
+            });
+        };
+
+        let attached = self
+            .storage
+            .attach_object_data_if_hlc(
+                &request.bucket,
+                &request.key,
+                expected.wall_time,
+                expected.logical,
+                expected.node_id,
+                &request.data,
+            )
+            .await
+            .map_err(|e| ClusterError::Storage(e.to_string()))?;
+
+        if attached {
+            self.idempotency.record(operation_id);
+        }
+
+        // Hot anti-entropy has to expect these bytes here again. Read after the
+        // change, not before: the hash is the one the storage engine settled on
+        // for the blob it wrote, and registering anything else would have the
+        // repair path chase a copy nobody holds.
+        if attached {
+            if let Some(ae) = &self.anti_entropy {
+                match self.storage.head_object(&request.bucket, &request.key).await {
+                    Ok(record) => {
+                        ae.register_key(&request.bucket, &request.key, record.content_hash).await;
+                    }
+                    Err(error) => warn!(
+                        bucket = %request.bucket,
+                        key = %request.key,
+                        error = %error,
+                        "attached object could not be re-registered with anti-entropy"
+                    ),
+                }
+            }
+        }
+
+        debug!(
+            bucket = %request.bucket,
+            key = %request.key,
+            attached,
+            operation_id = %uuid::Uuid::from_u128(operation_id),
+            "replica attach completed"
+        );
+
+        Ok(proto::AttachObjectDataResponse {
+            success: true,
+            error: String::new(),
+            attached,
+            epoch_mismatch: false,
+        })
+    }
+
+    /// Handle a `RestoreNamespaceEntryRequest` from the coordinator.
+    ///
+    /// Repair path: writes back the namespace entry of an erasure-coded object
+    /// that lost one. An entry the replica already holds always wins, because
+    /// the index is live truth and the manifest it was rebuilt from may be old.
+    pub async fn handle_restore_namespace_entry(
+        &self,
+        request: &proto::RestoreNamespaceEntryRequest,
+    ) -> Result<proto::RestoreNamespaceEntryResponse, ClusterError> {
+        if request.topology_epoch != 0 && request.topology_epoch != self.topology_epoch {
+            warn!(
+                local_epoch = self.topology_epoch,
+                request_epoch = request.topology_epoch,
+                "epoch mismatch on replica namespace restore"
+            );
+            return Ok(proto::RestoreNamespaceEntryResponse {
+                success: false,
+                error: format!(
+                    "epoch mismatch: local={}, request={}",
+                    self.topology_epoch, request.topology_epoch
+                ),
+                restored: false,
+                epoch_mismatch: true,
+            });
+        }
+
+        let record: s4_core::types::IndexRecord =
+            bincode::deserialize(&request.record).map_err(|error| {
+                ClusterError::Storage(format!("namespace entry is not a valid record: {error}"))
+            })?;
+
+        let restored = self
+            .storage
+            .restore_erasure_coded_entry(&request.bucket, &request.key, record)
+            .await
+            .map_err(|e| ClusterError::Storage(e.to_string()))?;
+
+        debug!(
+            bucket = %request.bucket,
+            key = %request.key,
+            restored,
+            "replica namespace restore completed"
+        );
+
+        Ok(proto::RestoreNamespaceEntryResponse {
+            success: true,
+            error: String::new(),
+            restored,
             epoch_mismatch: false,
         })
     }
@@ -306,6 +576,8 @@ fn parse_operation_id(bytes: &[u8]) -> Result<u128, ClusterError> {
 mod tests {
     use super::*;
 
+    use s4_core::FORCE_PHYSICAL_WRITE_METADATA_KEY;
+
     #[test]
     fn parse_operation_id_valid() {
         let id: u128 = 42;
@@ -318,10 +590,79 @@ mod tests {
         assert!(parse_operation_id(&[1, 2, 3]).is_err());
     }
 
+    fn write_request(
+        operation_id: u128,
+        metadata: HashMap<String, String>,
+    ) -> proto::WriteBlobRequest {
+        proto::WriteBlobRequest {
+            bucket: "__system__".to_string(),
+            key: "shard".to_string(),
+            data: b"shard bytes".to_vec(),
+            content_hash: vec![0u8; 32],
+            content_type: "application/octet-stream".to_string(),
+            metadata,
+            hlc: None,
+            version_id: None,
+            coordinator_id: Vec::new(),
+            operation_id: operation_id.to_be_bytes().to_vec(),
+            topology_epoch: 0,
+        }
+    }
+
+    /// The contract the tracker exists for: a coordinator that resends the
+    /// same write after a timeout must not cost a second copy on disk.
+    #[tokio::test]
+    async fn a_resent_write_is_applied_once() {
+        let storage = Arc::new(MockStorage::default());
+        let handler = ReplicaWriteHandler::new(
+            Arc::clone(&storage) as Arc<dyn StorageEngine>,
+            Arc::new(IdempotencyTracker::new()),
+            0,
+        );
+        let request = write_request(7, HashMap::new());
+
+        for _ in 0..2 {
+            let response = handler.handle_write(&request).await.unwrap();
+            assert!(response.success);
+        }
+
+        assert_eq!(storage.puts(), 1, "a retry of one write wrote twice");
+    }
+
+    /// And the exception that keeps a repair honest: a shard rebuilt a second
+    /// time carries the same work to the same node, and the tracker must not
+    /// answer for the disk. Without this, a shard that rots twice is repaired
+    /// once and reported as repaired twice.
+    #[tokio::test]
+    async fn a_healing_write_is_applied_even_when_its_operation_id_is_known() {
+        let storage = Arc::new(MockStorage::default());
+        let handler = ReplicaWriteHandler::new(
+            Arc::clone(&storage) as Arc<dyn StorageEngine>,
+            Arc::new(IdempotencyTracker::new()),
+            0,
+        );
+        let healing = HashMap::from([(
+            FORCE_PHYSICAL_WRITE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        )]);
+        let request = write_request(7, healing);
+
+        for _ in 0..2 {
+            let response = handler.handle_write(&request).await.unwrap();
+            assert!(response.success);
+        }
+
+        assert_eq!(
+            storage.puts(),
+            2,
+            "the second heal was answered from the idempotency tracker instead of the disk"
+        );
+    }
+
     #[test]
     fn epoch_check_passes_for_matching_epoch() {
         let handler = ReplicaWriteHandler::new(
-            Arc::new(MockStorage),
+            Arc::new(MockStorage::default()),
             Arc::new(IdempotencyTracker::new()),
             5,
         );
@@ -332,7 +673,7 @@ mod tests {
     #[test]
     fn epoch_check_fails_for_mismatched_epoch() {
         let handler = ReplicaWriteHandler::new(
-            Arc::new(MockStorage),
+            Arc::new(MockStorage::default()),
             Arc::new(IdempotencyTracker::new()),
             5,
         );
@@ -342,7 +683,20 @@ mod tests {
     }
 
     /// Minimal mock for unit tests that don't need actual storage.
-    struct MockStorage;
+    ///
+    /// Counts the writes that reached the engine, because that is the question
+    /// the idempotency tests ask: not what the handler answered, but what it
+    /// actually wrote.
+    #[derive(Default)]
+    struct MockStorage {
+        puts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MockStorage {
+        fn puts(&self) -> usize {
+            self.puts.load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
 
     #[async_trait::async_trait]
     impl StorageEngine for MockStorage {
@@ -354,6 +708,7 @@ mod tests {
             _content_type: &str,
             _metadata: &HashMap<String, String>,
         ) -> Result<String, s4_core::StorageError> {
+            self.puts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok("\"mock-etag\"".into())
         }
         async fn get_object(

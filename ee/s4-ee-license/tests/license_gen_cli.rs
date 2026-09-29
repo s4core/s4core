@@ -298,6 +298,7 @@ fn sign_and_verify_round_trip_inline_key() {
     assert_eq!(payload["capabilities"]["saml"], true);
     assert_eq!(payload["capabilities"]["webdav"], true);
     assert_eq!(payload["capabilities"]["audit_log"], true);
+    assert_eq!(payload["capabilities"]["erasure_coding"], true);
 }
 
 #[test]
@@ -368,6 +369,7 @@ fn no_flags_disable_capabilities() {
         "--no-saml",
         "--no-webdav",
         "--no-audit-log",
+        "--no-erasure-coding",
     ]);
     assert!(output.status.success());
 
@@ -380,6 +382,7 @@ fn no_flags_disable_capabilities() {
     assert_eq!(payload["capabilities"]["saml"], false);
     assert_eq!(payload["capabilities"]["webdav"], false);
     assert_eq!(payload["capabilities"]["audit_log"], false);
+    assert_eq!(payload["capabilities"]["erasure_coding"], false);
     // Still enabled by default:
     assert_eq!(payload["capabilities"]["deep_scrubber"], true);
     assert_eq!(payload["capabilities"]["rolling_upgrades"], true);
@@ -396,6 +399,7 @@ fn defaults_produce_unlimited_caps() {
 
     assert_eq!(payload["capabilities"]["max_pools"], u32::MAX);
     assert_eq!(payload["capabilities"]["max_nodes_per_pool"], u32::MAX);
+    assert_eq!(payload["capabilities"]["erasure_coding"], true);
 }
 
 // ---------------------------------------------------------------------------

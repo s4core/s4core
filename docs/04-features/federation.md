@@ -20,6 +20,11 @@ Cluster
   +-- Pool 2: [Node D, Node E, Node F]   (added later for capacity)
 ```
 
+Standard pools use quorum replication. Enterprise Edition also has an
+erasure-coded pool type (`S4_POOL_TYPE=ec`) with fixed-width erasure sets; see
+[Federation Erasure Coding](erasure-coding.md) for status, setup, and
+configuration.
+
 **Rules:**
 - Pool membership is **immutable** after creation — nodes are never added or removed from existing pools
 - Horizontal scaling = adding new pools (not new nodes to existing pools)
@@ -209,6 +214,7 @@ Background scrubber verifies data integrity and auto-heals from replicas.
 | `S4_SEEDS` | Comma-separated seed node gRPC addresses | — |
 | `S4_POOL_NAME` | Pool this node belongs to | — |
 | `S4_POOL_NODES` | Pool members: `id:addr,id:addr,...` | — |
+| `S4_POOL_TYPE` | Pool storage type: `standard` or Enterprise `ec` | `standard` |
 | `S4_REPLICATION_FACTOR` | Replication factor (N) | `3` |
 | `S4_WRITE_QUORUM` | Write quorum (W) | `2` |
 | `S4_READ_QUORUM` | Read quorum (R) | `2` |

@@ -100,21 +100,23 @@ docker run -d \
 
 ### Docker Compose
 
-The project includes a `docker-compose.yml` that runs S4 server together with the web admin console.
+The project includes `docker-compose-single-node.yml`, which runs the S4 server together with the web admin console.
 
 ```bash
 # Run full stack (server + web console)
-docker compose up --build
+docker compose -f docker-compose-single-node.yml up --build
 
 # Run in background
-docker compose up -d --build
+docker compose -f docker-compose-single-node.yml up -d --build
 
 # Run only the server
-docker compose up s4-server --build
+docker compose -f docker-compose-single-node.yml up -d --build s4core
 
 # Stop everything
-docker compose down
+docker compose -f docker-compose-single-node.yml down
 ```
+
+For a three-node cluster behind HAProxy, see [Cluster Deployment](../08-deployment/clustering.md#docker-compose).
 
 After startup:
 

@@ -69,6 +69,20 @@ struct ObjectDigest {
     content_type: String,
     version_id: Option<String>,
     metadata: HashMap<String, String>,
+    /// The replica holds a namespace entry for an erasure-coded object, not a
+    /// copy of its bytes.
+    erasure_coded: bool,
+    /// SHA-256 of the object content, absent when the replica did not report
+    /// one. A node from before the field existed reports none.
+    content_hash: Option<[u8; 32]>,
+}
+
+/// Read a 32-byte content hash out of a wire field.
+///
+/// Anything other than exactly 32 bytes means the peer did not send one, which
+/// is the honest answer from a node that predates the field.
+fn content_hash_from_bytes(bytes: &[u8]) -> Option<[u8; 32]> {
+    <[u8; 32]>::try_from(bytes).ok()
 }
 
 impl ObjectDigest {
@@ -118,6 +132,17 @@ pub struct QuorumHeadResult {
     pub hlc: HlcTimestamp,
     /// Version ID.
     pub version_id: Option<String>,
+    /// SHA-256 of the object content, when the winning replica reported one.
+    ///
+    /// A node too old to send it leaves this empty, so a caller comparing
+    /// hashes must treat `None` as "unknown", never as a mismatch.
+    pub content_hash_sha256: Option<[u8; 32]>,
+    /// True when the winning record describes an erasure-coded object.
+    ///
+    /// Such a record carries the object's metadata but none of its bytes: the
+    /// data lives as shards in the pool. A caller must not read it as a hot
+    /// replica, and must not mistake it for a newer overwrite of one.
+    pub erasure_coded: bool,
     /// Number of replicas that responded.
     pub replicas_responded: u8,
 }
@@ -343,6 +368,7 @@ impl QuorumReadCoordinator {
         // replicas that reported the same HLC (e.g. bit-rot on one node).
         let (data, full_metadata) = {
             let candidates = candidate_order(&digests, winner_idx, self.local_node_id);
+            let byteless = digests.len() - candidates.len();
 
             let mut last_err = None;
             let mut result = None;
@@ -364,7 +390,26 @@ impl QuorumReadCoordinator {
                     }
                 }
             }
-            result.ok_or_else(|| last_err.unwrap())?
+            match result {
+                Some(fetched) => fetched,
+                // Every replica answered the HEAD and none of them holds the
+                // bytes: the object lives in an erasure-coded pool and has to
+                // be read through the EC runtime. Reported as itself, because
+                // the alternatives — "not found" or a panic on an empty
+                // candidate list — both describe an object that is intact.
+                None if byteless > 0 && last_err.is_none() => {
+                    return Err(ClusterError::Storage(format!(
+                        "{bucket}/{key} is erasure coded on all {byteless} replica(s) that \
+                         answered; its bytes must be read through the EC runtime"
+                    )))
+                }
+                None => {
+                    return Err(last_err.unwrap_or_else(|| ClusterError::ObjectNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    }))
+                }
+            }
         };
 
         // Phase 3: Trigger async read repair for stale replicas
@@ -443,6 +488,7 @@ impl QuorumReadCoordinator {
 
         let candidates = candidate_order(&digests, winner_idx, self.local_node_id);
 
+        let skipped_erasure_coded = digests.len() - candidates.len();
         let mut last_err = None;
         let mut skipped_quarantined = false;
         for idx in candidates {
@@ -503,11 +549,35 @@ impl QuorumReadCoordinator {
                 "all candidate stream sources are temporarily quarantined for {bucket}/{key}"
             )));
         }
+        // Every replica holds a namespace entry and none of them the bytes:
+        // the object lives in an erasure-coded pool and has to be read through
+        // the EC runtime. Saying so beats the "not found" below, which would
+        // send the caller looking for an object that is perfectly intact.
+        if skipped_erasure_coded > 0 && last_err.is_none() {
+            return Err(ClusterError::Storage(format!(
+                "{bucket}/{key} is erasure coded on all {skipped_erasure_coded} replica(s) that \
+                 answered; its bytes must be read through the EC runtime"
+            )));
+        }
 
         Err(last_err.unwrap_or_else(|| ClusterError::ObjectNotFound {
             bucket: bucket.to_string(),
             key: key.to_string(),
         }))
+    }
+
+    /// The nodes that hold this object's replicas, without reading anything.
+    ///
+    /// The same placement decision every read makes, exposed on its own so that
+    /// a caller looking for metadata written beside an object can address the
+    /// nodes that hold it instead of asking the whole pool. Answering "who has
+    /// this object" is a computation over the ring, not an I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterError::Placement`] when the bucket belongs to no pool.
+    pub fn replica_nodes(&self, bucket: &str, key: &str) -> Result<Vec<NodeId>, ClusterError> {
+        Ok(self.router.route(bucket, key)?.replicas)
     }
 
     /// Execute a quorum HEAD (metadata only, no data transfer).
@@ -543,6 +613,8 @@ impl QuorumReadCoordinator {
             metadata: latest.metadata.clone(),
             hlc: latest.hlc,
             version_id: latest.version_id.clone(),
+            content_hash_sha256: latest.content_hash,
+            erasure_coded: latest.erasure_coded,
             replicas_responded: digests.len() as u8,
         })
     }
@@ -623,10 +695,13 @@ impl QuorumReadCoordinator {
             }
         };
 
+        let erasure_coded = record.is_erasure_coded();
         Ok(QuorumHeadResult {
+            content_hash_sha256: Some(record.content_hash),
             etag: record.etag,
             content_type: record.content_type,
             size: record.size,
+            erasure_coded,
             metadata: record.metadata,
             hlc,
             version_id: record.version_id,
@@ -641,23 +716,35 @@ impl QuorumReadCoordinator {
         key: &str,
         replicas: &[NodeId],
     ) -> Result<Vec<ObjectDigest>, ClusterError> {
-        let mut handles = Vec::with_capacity(replicas.len());
+        debug!(
+            coordinator = %self.local_node_id,
+            epoch = self.topology_epoch,
+            bucket,
+            key,
+            ?replicas,
+            needed = self.read_quorum,
+            "digest collection started"
+        );
+        // Own the actual replica futures. Wrapping already-spawned JoinHandles
+        // would detach those tasks when this quorum read is cancelled.
+        let mut set = tokio::task::JoinSet::new();
 
         for &node_id in replicas {
-            let handle = if node_id == self.local_node_id {
+            if node_id == self.local_node_id {
                 let storage = self.storage.clone();
                 let bucket = bucket.to_string();
                 let key = key.to_string();
                 let local_id = self.local_node_id;
                 let timeout_dur = self.timeouts.replica_read_timeout;
 
-                tokio::spawn(async move {
+                set.spawn(async move {
                     let result =
                         tokio::time::timeout(timeout_dur, storage.head_object(&bucket, &key)).await;
 
                     match result {
                         Ok(Ok(record)) => DigestResult::Success(ObjectDigest {
                             node_id: local_id,
+                            erasure_coded: record.is_erasure_coded(),
                             hlc: if record.hlc_timestamp > 0 {
                                 HlcTimestamp {
                                     wall_time: record.hlc_timestamp,
@@ -671,16 +758,20 @@ impl QuorumReadCoordinator {
                                     node_id: local_id.0,
                                 }
                             },
+                            content_hash: Some(record.content_hash),
                             etag: record.etag,
                             size: record.size,
                             content_type: record.content_type,
                             version_id: record.version_id,
                             metadata: record.metadata,
                         }),
-                        Ok(Err(e)) => DigestResult::NotFound(local_id, e.to_string()),
+                        Ok(Err(e @ s4_core::StorageError::ObjectNotFound { .. })) => {
+                            DigestResult::NotFound(local_id, e.to_string())
+                        }
+                        Ok(Err(e)) => DigestResult::Error(local_id, e.to_string()),
                         Err(_) => DigestResult::Timeout(local_id),
                     }
-                })
+                });
             } else {
                 let client = self.rpc_client.clone();
                 let request = proto::HeadObjectRequest {
@@ -691,7 +782,7 @@ impl QuorumReadCoordinator {
                 };
                 let timeout_dur = self.timeouts.replica_read_timeout;
 
-                tokio::spawn(async move {
+                set.spawn(async move {
                     let result =
                         tokio::time::timeout(timeout_dur, client.send_head(node_id, request)).await;
 
@@ -709,7 +800,9 @@ impl QuorumReadCoordinator {
                                 size: resp.content_length,
                                 content_type: resp.content_type,
                                 version_id: resp.version_id,
+                                erasure_coded: resp.erasure_coded,
                                 metadata: resp.metadata,
+                                content_hash: content_hash_from_bytes(&resp.content_hash),
                             })
                         }
                         Ok(Ok(resp)) if resp.epoch_mismatch => DigestResult::EpochMismatch(node_id),
@@ -717,74 +810,74 @@ impl QuorumReadCoordinator {
                         Ok(Err(e)) => DigestResult::Error(node_id, e.to_string()),
                         Err(_) => DigestResult::Timeout(node_id),
                     }
-                })
-            };
-
-            handles.push(handle);
+                });
+            }
         }
 
         // Wait for R responses with timeout
         let mut digests = Vec::new();
         let mut not_found_count = 0u8;
-        let mut set = tokio::task::JoinSet::new();
-        for handle in handles {
-            set.spawn(handle);
-        }
-
         let deadline = tokio::time::Instant::now() + self.timeouts.quorum_timeout;
 
         loop {
             tokio::select! {
                 maybe_result = set.join_next() => {
                     match maybe_result {
-                        Some(Ok(Ok(DigestResult::Success(digest)))) => {
+                        Some(Ok(DigestResult::Success(digest))) => {
+                            debug!(
+                                bucket, key, node_id = %digest.node_id,
+                                hlc = ?digest.hlc, content_hash = ?digest.content_hash,
+                                "digest replica returned present"
+                            );
                             digests.push(digest);
                             if digests.len() as u8 >= self.read_quorum {
                                 // Quorum met — drain remaining responses briefly
                                 // to improve LWW conflict resolution accuracy
                                 // when concurrent writes are in flight.
-                                let drain_until = tokio::time::Instant::now()
-                                    + std::time::Duration::from_millis(50);
+                                let drain_until = digest_drain_deadline(deadline);
                                 while let Ok(Some(result)) = tokio::time::timeout_at(
                                     drain_until,
                                     set.join_next(),
                                 )
                                 .await
                                 {
-                                    if let Ok(Ok(DigestResult::Success(extra))) = result {
+                                    if let Ok(DigestResult::Success(extra)) = result {
+                                        debug!(
+                                            bucket, key, node_id = %extra.node_id,
+                                            hlc = ?extra.hlc, content_hash = ?extra.content_hash,
+                                            "digest replica returned present during drain"
+                                        );
                                         digests.push(extra);
                                     }
                                 }
                                 break;
                             }
                         }
-                        Some(Ok(Ok(DigestResult::NotFound(node_id, _)))) => {
+                        Some(Ok(DigestResult::NotFound(node_id, reason))) => {
                             not_found_count += 1;
                             debug!(
-                                %node_id,
+                                bucket, key, %node_id, %reason,
                                 "object not found on replica during digest collection"
                             );
                         }
-                        Some(Ok(Ok(DigestResult::Timeout(node_id)))) => {
-                            warn!(%node_id, "digest request timed out");
+                        Some(Ok(DigestResult::Timeout(node_id))) => {
+                            warn!(bucket, key, %node_id, "digest request timed out");
                         }
-                        Some(Ok(Ok(DigestResult::Error(node_id, err)))) => {
-                            warn!(%node_id, error = %err, "digest request failed");
+                        Some(Ok(DigestResult::Error(node_id, err))) => {
+                            warn!(bucket, key, %node_id, error = %err, "digest request failed");
                         }
-                        Some(Ok(Ok(DigestResult::EpochMismatch(node_id)))) => {
-                            warn!(%node_id, "epoch mismatch during digest collection");
-                        }
-                        Some(Ok(Err(e))) => {
-                            error!(error = %e, "digest task panicked");
+                        Some(Ok(DigestResult::EpochMismatch(node_id))) => {
+                            warn!(bucket, key, %node_id, "epoch mismatch during digest collection");
                         }
                         Some(Err(e)) => {
-                            error!(error = %e, "join error in digest collection");
+                            error!(bucket, key, error = %e, "join error in digest collection");
                         }
                         None => break,
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     warn!(
+                        bucket, key,
                         got = digests.len(),
                         needed = self.read_quorum,
                         "digest collection timed out"
@@ -794,6 +887,14 @@ impl QuorumReadCoordinator {
             }
         }
 
+        debug!(
+            bucket,
+            key,
+            present = digests.len(),
+            not_found = not_found_count,
+            needed = self.read_quorum,
+            "digest collection completed"
+        );
         // If all replicas said "not found" and we have quorum of not-found,
         // return ObjectNotFound instead of QuorumNotMet.
         if digests.is_empty() && not_found_count >= self.read_quorum {
@@ -1015,7 +1116,14 @@ fn candidate_order(
     local_node_id: NodeId,
 ) -> Vec<usize> {
     let latest = &digests[winner_idx];
-    let mut candidates: Vec<usize> = (0..digests.len()).collect();
+    // A replica whose record is a namespace entry for an erasure-coded object
+    // holds no bytes to hand over. It answers the HEAD, so it looks like a
+    // source, and the stream it opens fails on its first item — past the point
+    // where another replica can be tried. It is dropped here rather than in
+    // either caller, because "which replicas can serve these bytes" is the
+    // question this function exists to answer.
+    let mut candidates: Vec<usize> =
+        (0..digests.len()).filter(|&idx| !digests[idx].erasure_coded).collect();
 
     candidates.sort_by(|&a, &b| {
         let rank_a = candidate_rank(&digests[a], a, winner_idx, latest, local_node_id);
@@ -1062,6 +1170,11 @@ fn is_integrity_error(error: &ClusterError) -> bool {
         ClusterError::Io(err) => err.kind() == io::ErrorKind::InvalidData,
         _ => false,
     }
+}
+
+/// Short grace period for late digests after reaching the read quorum.
+fn digest_drain_deadline(quorum_deadline: tokio::time::Instant) -> tokio::time::Instant {
+    quorum_deadline.min(tokio::time::Instant::now() + Duration::from_millis(50))
 }
 
 /// Internal result type for digest collection.
@@ -1143,6 +1256,69 @@ mod tests {
         assert!(matches!(err, ClusterError::ObjectNotFound { .. }));
     }
 
+    #[tokio::test]
+    async fn local_digest_storage_error_is_not_absence() {
+        let (mut coordinator, _tmp) = setup_single_node();
+        coordinator.read_quorum = 1;
+        let replicas = [coordinator.local_node_id];
+        let missing = coordinator.collect_digests("bucket", "missing.txt", &replicas).await;
+        assert!(matches!(missing, Err(ClusterError::ObjectNotFound { .. })));
+
+        let failed = coordinator.collect_digests("bucket", "unreadable.txt", &replicas).await;
+        assert!(
+            matches!(&failed, Ok(digests) if digests.is_empty()),
+            "a failed storage read must not count toward an absence quorum: {failed:?}"
+        );
+    }
+
+    async fn assert_pending_digest_is_cancelled(cancel_caller: bool) {
+        let (mut coordinator, _tmp) = setup_single_node();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let dropped = Arc::new(tokio::sync::Notify::new());
+        coordinator.storage = Arc::new(MockStorage {
+            pending_head: Some((started.clone(), dropped.clone())),
+        });
+        coordinator.read_quorum = 1;
+        coordinator.timeouts.quorum_timeout = Duration::from_millis(200);
+        coordinator.timeouts.replica_read_timeout = Duration::from_secs(10);
+        let read = tokio::spawn(async move {
+            coordinator.collect_digests("bucket", "pending.txt", &[NodeId(1)]).await
+        });
+        started.notified().await;
+        if cancel_caller {
+            read.abort();
+            assert!(read.await.unwrap_err().is_cancelled());
+        } else {
+            assert!(read.await.unwrap().unwrap().is_empty());
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), dropped.notified()).await.is_ok(),
+            "the in-flight replica read outlived its quorum operation"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_digest_collection_cancels_replica_tasks() {
+        assert_pending_digest_is_cancelled(true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn digest_deadline_cancels_replica_tasks() {
+        assert_pending_digest_is_cancelled(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn digest_drain_never_extends_the_quorum_deadline() {
+        let now = tokio::time::Instant::now();
+        let deadline = now + Duration::from_millis(10);
+        assert_eq!(digest_drain_deadline(deadline), deadline);
+        assert_eq!(
+            digest_drain_deadline(now + Duration::from_secs(5)),
+            now + Duration::from_millis(50)
+        );
+        assert_eq!(digest_drain_deadline(now), now);
+    }
+
     #[test]
     fn read_timeouts_default() {
         let t = ReadTimeouts::default();
@@ -1164,6 +1340,8 @@ mod tests {
             content_type: "text/plain".into(),
             version_id: None,
             metadata: HashMap::new(),
+            content_hash: None,
+            erasure_coded: false,
         };
         let d2 = ObjectDigest {
             node_id: NodeId(2),
@@ -1177,12 +1355,54 @@ mod tests {
             content_type: "text/plain".into(),
             version_id: None,
             metadata: HashMap::new(),
+            content_hash: None,
+            erasure_coded: false,
         };
 
         let digests = [d1, d2];
         let hlc_list: Vec<HlcTimestamp> = digests.iter().map(|d| d.hlc).collect();
         let winner_idx = crate::conflict::select_winner(&hlc_list).unwrap();
         assert_eq!(digests[winner_idx].etag, "\"b\"");
+    }
+
+    /// A replica that holds only a namespace entry is not a source of bytes.
+    ///
+    /// It answers the HEAD like any other replica, so it looks like one. The
+    /// stream it opens then fails on its first item, past the point where
+    /// another replica can be tried — which is why it has to be dropped before
+    /// the choice is made rather than after it fails.
+    #[test]
+    fn candidate_order_drops_replicas_that_hold_no_bytes() {
+        let hlc = HlcTimestamp {
+            wall_time: 2000,
+            logical: 0,
+            node_id: 1,
+        };
+        let digest = |node: u128, erasure_coded: bool| ObjectDigest {
+            node_id: NodeId(node),
+            hlc,
+            etag: "\"same\"".into(),
+            size: 64,
+            content_type: "application/octet-stream".into(),
+            version_id: None,
+            metadata: HashMap::new(),
+            content_hash: None,
+            erasure_coded,
+        };
+
+        let digests = [digest(1, true), digest(2, false), digest(3, true)];
+        let order = candidate_order(&digests, 0, NodeId(1));
+
+        assert_eq!(
+            order,
+            vec![1],
+            "only the replica that still holds the bytes may be streamed from"
+        );
+
+        // Every replica erasure coded: nothing to choose, and the caller has to
+        // say so rather than report the object missing.
+        let all_coded = [digest(1, true), digest(2, true)];
+        assert!(candidate_order(&all_coded, 0, NodeId(1)).is_empty());
     }
 
     #[test]
@@ -1206,6 +1426,8 @@ mod tests {
                 content_type: "application/octet-stream".into(),
                 version_id: None,
                 metadata: HashMap::new(),
+                content_hash: None,
+                erasure_coded: false,
             },
             ObjectDigest {
                 node_id: NodeId(2),
@@ -1215,6 +1437,8 @@ mod tests {
                 content_type: "application/octet-stream".into(),
                 version_id: None,
                 metadata: HashMap::new(),
+                content_hash: None,
+                erasure_coded: false,
             },
             ObjectDigest {
                 node_id: NodeId(3),
@@ -1224,6 +1448,8 @@ mod tests {
                 content_type: "application/octet-stream".into(),
                 version_id: None,
                 metadata: HashMap::new(),
+                content_hash: None,
+                erasure_coded: false,
             },
         ];
 
@@ -1246,11 +1472,21 @@ mod tests {
         assert!(tracker.is_quarantined(source.node_id, &source.bucket, &source.key));
     }
 
-    struct MockStorage;
+    struct MockStorage {
+        pending_head: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    }
+
+    struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
 
     impl MockStorage {
         fn with_data() -> Self {
-            MockStorage
+            MockStorage { pending_head: None }
         }
     }
 
@@ -1309,6 +1545,16 @@ mod tests {
             _b: &str,
             k: &str,
         ) -> Result<s4_core::IndexRecord, s4_core::StorageError> {
+            if let Some((started, dropped)) = &self.pending_head {
+                let _notify = NotifyOnDrop(dropped.clone());
+                started.notify_one();
+                std::future::pending::<()>().await;
+            }
+            if k == "unreadable.txt" {
+                return Err(s4_core::StorageError::Database(
+                    "injected database failure".into(),
+                ));
+            }
             if k == "hello.txt" {
                 Ok(s4_core::IndexRecord {
                     file_id: 1,

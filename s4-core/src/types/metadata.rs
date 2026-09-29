@@ -15,12 +15,23 @@
 //! Metadata record structure for the index database.
 
 use crate::types::composite::{BlobId, ObjectLayout};
+use crate::types::storage_class::{StorageClass, S4_STORAGE_CLASS_METADATA_KEY};
 use crate::types::RetentionMode;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Sentinel value for delete markers (no actual data storage).
 pub const DELETE_MARKER_FILE_ID: u32 = u32::MAX;
+
+/// Sentinel volume id for records whose bytes are not in local volume storage.
+///
+/// Used by erasure-coded records, whose data lives as shards across a pool. It
+/// is deliberately distinct from [`DELETE_MARKER_FILE_ID`]: that value also
+/// marks legacy inline objects, and a migration pass keyed on it would try to
+/// move bytes that are not there. Being an id no volume file ever has, it turns
+/// a missed layout check into a loud "volume not found" instead of a silent
+/// read of volume 0.
+pub const EXTERNAL_DATA_FILE_ID: u32 = u32::MAX - 1;
 
 /// Record stored in the fast index database (fjall).
 ///
@@ -115,7 +126,30 @@ pub struct IndexRecord {
     pub operation_id: u128,
 }
 
+/// Reserved metadata key holding an object's S3 tags as a JSON object.
+///
+/// Tags are stored as one blob rather than as separate metadata entries, which
+/// makes the key a cross-crate contract: the S3 tagging API writes it and EC
+/// auto-tiering reads it to apply tag exclusions. Naming it once means a change
+/// to the format cannot silently break the reader.
+pub const OBJECT_TAGS_METADATA_KEY: &str = "_tags";
+
+/// Key prefix of the marker object that records a bucket's existence.
+///
+/// Buckets have no catalog of their own: each one is a hidden object in
+/// `__system__`, and listing the buckets means listing this prefix. The prefix
+/// is therefore a cross-crate contract, read by ListBuckets and by the EC
+/// tiering sweep, and named once so the two cannot drift apart.
+pub const BUCKET_MARKER_KEY_PREFIX: &str = "__s4_bucket_marker_";
+
 impl IndexRecord {
+    fn default_metadata() -> HashMap<String, String> {
+        HashMap::from([(
+            S4_STORAGE_CLASS_METADATA_KEY.to_string(),
+            StorageClass::Standard.as_metadata_value().to_string(),
+        )])
+    }
+
     /// Creates a new index record.
     pub fn new(
         file_id: u32,
@@ -132,7 +166,7 @@ impl IndexRecord {
             size,
             etag,
             content_type,
-            metadata: HashMap::new(),
+            metadata: Self::default_metadata(),
             content_hash,
             created_at: now,
             modified_at: now,
@@ -165,7 +199,7 @@ impl IndexRecord {
             size: 0,
             etag: String::new(),
             content_type: String::new(),
-            metadata: HashMap::new(),
+            metadata: Self::default_metadata(),
             content_hash: [0u8; 32],
             created_at: now,
             modified_at: now,
@@ -188,6 +222,25 @@ impl IndexRecord {
     /// Checks if this record represents actual object data (not a delete marker).
     pub fn is_data_record(&self) -> bool {
         !self.is_delete_marker
+    }
+
+    /// Returns the durable S4 physical storage class.
+    ///
+    /// Missing or unrecognized values fall back to `Standard` for
+    /// backward compatibility with records written before this marker existed.
+    pub fn storage_class(&self) -> StorageClass {
+        self.metadata
+            .get(S4_STORAGE_CLASS_METADATA_KEY)
+            .and_then(|value| StorageClass::from_metadata_value(value))
+            .unwrap_or_default()
+    }
+
+    /// Persist the S4 physical storage class in this record's metadata.
+    pub fn set_storage_class(&mut self, storage_class: StorageClass) {
+        self.metadata.insert(
+            S4_STORAGE_CLASS_METADATA_KEY.to_string(),
+            storage_class.as_metadata_value().to_string(),
+        );
     }
 
     /// Checks if this record references the same content as another record.
@@ -223,6 +276,57 @@ impl IndexRecord {
             _ => None,
         }
     }
+
+    /// Returns true when the object's bytes live in an erasure-coded pool
+    /// rather than in local volume storage.
+    ///
+    /// Such a record is a namespace entry and nothing more: it carries the size,
+    /// ETag, content type and metadata a listing needs, but `file_id`/`offset`
+    /// point at no blob. Every code path that resolves a record to bytes, or
+    /// that counts a record as a live reference to a blob, has to check this
+    /// first.
+    pub fn is_erasure_coded(&self) -> bool {
+        matches!(self.layout, Some(ObjectLayout::ErasureCoded { .. }))
+    }
+
+    /// Turns this record into a namespace entry for an erasure-coded object.
+    ///
+    /// Everything a client can observe — size, ETag, content type, user
+    /// metadata, timestamps, version and the HLC generation — is preserved: the
+    /// object did not change, only the place its bytes are stored did. The
+    /// local blob coordinates are replaced by
+    /// [`EXTERNAL_DATA_FILE_ID`] so that a caller which forgets to check
+    /// [`is_erasure_coded`](Self::is_erasure_coded) fails on a volume that does
+    /// not exist instead of silently reading volume 0.
+    pub fn into_erasure_coded(mut self, erasure_set_id: u64, topology_epoch: u64) -> Self {
+        self.layout = Some(ObjectLayout::ErasureCoded {
+            erasure_set_id,
+            topology_epoch,
+        });
+        self.file_id = EXTERNAL_DATA_FILE_ID;
+        self.offset = 0;
+        self
+    }
+
+    /// Turns an erasure-coded namespace entry back into a local-blob record.
+    ///
+    /// The mirror of [`into_erasure_coded`](Self::into_erasure_coded), used
+    /// when auto-tiering brings a hot object back from the pool. It preserves
+    /// exactly what that method preserves, and for the same reason: a promotion
+    /// moves bytes, it does not write a new object, so the ETag, the size, the
+    /// timestamps, the user metadata and the HLC generation all have to survive
+    /// it. Only the coordinates of the bytes change.
+    ///
+    /// The layout is cleared rather than set to
+    /// [`ObjectLayout::SingleBlob`], which is how every ordinary write leaves
+    /// it: a promoted record must be indistinguishable from one the hot write
+    /// path produced, or the difference would eventually be read as meaningful.
+    pub fn into_locally_stored(mut self, file_id: u32, offset: u64) -> Self {
+        self.layout = None;
+        self.file_id = file_id;
+        self.offset = offset;
+        self
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +354,7 @@ mod tests {
         assert_eq!(decoded.hlc_timestamp, 0);
         assert_eq!(decoded.origin_node_id, 0);
         assert_eq!(decoded.operation_id, 0);
+        assert_eq!(decoded.storage_class(), StorageClass::Standard);
     }
 
     /// Simulate deserializing an old record that was serialized BEFORE the
@@ -334,6 +439,7 @@ mod tests {
         assert_eq!(record.hlc_logical, 0);
         assert_eq!(record.origin_node_id, 0);
         assert_eq!(record.operation_id, 0);
+        assert_eq!(record.storage_class(), StorageClass::Standard);
     }
 
     #[test]
@@ -341,5 +447,25 @@ mod tests {
         let marker = IndexRecord::new_delete_marker("v1".to_string());
         assert!(!marker.is_composite());
         assert!(marker.layout.is_none());
+        assert_eq!(marker.storage_class(), StorageClass::Standard);
+    }
+
+    #[test]
+    fn index_record_storage_class_is_reserved_metadata() {
+        let mut record = IndexRecord::new(
+            1,
+            0,
+            100,
+            [0; 32],
+            "e".to_string(),
+            "text/plain".to_string(),
+        );
+        record.set_storage_class(StorageClass::ErasureCoded);
+
+        assert_eq!(record.storage_class(), StorageClass::ErasureCoded);
+        assert_eq!(
+            record.metadata.get(S4_STORAGE_CLASS_METADATA_KEY),
+            Some(&"erasure_coded".to_string())
+        );
     }
 }

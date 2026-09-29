@@ -35,11 +35,11 @@ pub mod tls;
 
 /// Generated protobuf types and gRPC service definitions.
 pub mod proto {
-    #![allow(missing_docs, clippy::large_enum_variant)]
+    #![allow(missing_docs, clippy::large_enum_variant, clippy::result_large_err)]
     tonic::include_proto!("s4.cluster");
 }
 
-pub use client::{NodeClient, NodeClientConfig};
+pub use client::{probe_node_identity, NodeClient, NodeClientConfig};
 pub use server::{NodeRpcServer, RpcServerConfig};
 pub use tls::TlsConfig;
 

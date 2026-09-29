@@ -1,6 +1,6 @@
 # Cluster Deployment
 
-> Last updated: 2026-04-25
+> Last updated: 2026-09-26
 
 This guide covers deploying S4 in distributed (cluster) mode. For architecture and internals, see [Federation](../04-features/federation.md).
 
@@ -41,6 +41,11 @@ Each node needs these variables:
 | `S4_POOL_NODES` | Pool members: `name:host:port,name:host:port,...` |
 | `S4_ACCESS_KEY_ID` | S3 access key (must match across all nodes) |
 | `S4_SECRET_ACCESS_KEY` | S3 secret key (must match across all nodes) |
+
+Start order does not matter. A node announces itself to its seeds over UDP, and
+keeps announcing for as long as it knows no peer, so a node that comes up before
+its seeds still joins once they are listening. This makes starting a whole
+cluster at once, and rolling restarts, safe to do without staggering.
 
 ### Bare Metal / VM
 
@@ -90,13 +95,42 @@ S4_SECRET_ACCESS_KEY=mysecretkey \
 
 ### Docker Compose
 
+The repository ships two compose files for a three-node Community Edition
+cluster. Both put HAProxy (`haproxy.cfg`, round-robin, no sticky sessions) in
+front of the nodes and keep each node's data in a named volume:
+
+| File | Image | Published ports |
+|------|-------|-----------------|
+| `docker-compose-cluster.yml` | `s4core/s4core:latest`, the released CE image | `9000` S3 API through HAProxy, `8404` HAProxy stats |
+| `docker-compose-cluster-dev.yml` | built from the local sources (`build: .`) | the same, plus every node directly on `9001`, `9002`, `9003` |
+
+The HAProxy service and the first node of `docker-compose-cluster.yml`;
+`s4-node2` and `s4-node3` differ only in `S4_NODE_ID`, their addresses and
+their volume:
+
 ```yaml
 services:
+  haproxy:
+    image: haproxy:3.1-alpine
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "9000:9000"   # S3 API, round-robin over the nodes
+      - "8404:8404"   # HAProxy stats page
+    depends_on:       # HAProxy starts once every node reports healthy
+      s4-node1:
+        condition: service_healthy
+      s4-node2:
+        condition: service_healthy
+      s4-node3:
+        condition: service_healthy
+
   s4-node1:
-    image: s4core:latest
+    image: s4core/s4core:latest
     environment:
       S4_MODE: cluster
-      S4_CLUSTER_NAME: dev
+      S4_BIND: "0.0.0.0:9000"
+      S4_CLUSTER_NAME: production
       S4_NODE_ID: node-1
       S4_NODE_GRPC_ADDR: s4-node1:9100
       S4_NODE_HTTP_ADDR: s4-node1:9000
@@ -104,50 +138,16 @@ services:
       S4_POOL_NAME: pool-1
       S4_POOL_NODES: "node-1:s4-node1:9100,node-2:s4-node2:9100,node-3:s4-node3:9100"
       S4_DATA_DIR: /data
-      S4_ACCESS_KEY_ID: minioadmin
-      S4_SECRET_ACCESS_KEY: minioadmin
+      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
+      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
     volumes:
       - s4-data-1:/data
-    ports:
-      - "9001:9000"
-
-  s4-node2:
-    image: s4core:latest
-    environment:
-      S4_MODE: cluster
-      S4_CLUSTER_NAME: dev
-      S4_NODE_ID: node-2
-      S4_NODE_GRPC_ADDR: s4-node2:9100
-      S4_NODE_HTTP_ADDR: s4-node2:9000
-      S4_SEEDS: s4-node1:9100,s4-node2:9100,s4-node3:9100
-      S4_POOL_NAME: pool-1
-      S4_POOL_NODES: "node-1:s4-node1:9100,node-2:s4-node2:9100,node-3:s4-node3:9100"
-      S4_DATA_DIR: /data
-      S4_ACCESS_KEY_ID: minioadmin
-      S4_SECRET_ACCESS_KEY: minioadmin
-    volumes:
-      - s4-data-2:/data
-    ports:
-      - "9002:9000"
-
-  s4-node3:
-    image: s4core:latest
-    environment:
-      S4_MODE: cluster
-      S4_CLUSTER_NAME: dev
-      S4_NODE_ID: node-3
-      S4_NODE_GRPC_ADDR: s4-node3:9100
-      S4_NODE_HTTP_ADDR: s4-node3:9000
-      S4_SEEDS: s4-node1:9100,s4-node2:9100,s4-node3:9100
-      S4_POOL_NAME: pool-1
-      S4_POOL_NODES: "node-1:s4-node1:9100,node-2:s4-node2:9100,node-3:s4-node3:9100"
-      S4_DATA_DIR: /data
-      S4_ACCESS_KEY_ID: minioadmin
-      S4_SECRET_ACCESS_KEY: minioadmin
-    volumes:
-      - s4-data-3:/data
-    ports:
-      - "9003:9000"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
+      interval: 5s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
 
 volumes:
   s4-data-1:
@@ -156,10 +156,30 @@ volumes:
 ```
 
 ```bash
+# Released image
 docker compose -f docker-compose-cluster.yml up -d
+
+# Or build the image from the local sources
+docker compose -f docker-compose-cluster-dev.yml up -d --build
+
+curl http://localhost:9000/health     # S3 endpoint, through HAProxy
+curl http://localhost:8404/           # HAProxy stats
+
+# Stop and delete the data volumes
+docker compose -f docker-compose-cluster.yml down -v
 ```
 
-After startup, any node's HTTP port accepts S3 requests. Place a load balancer in front for production use.
+S3 clients connect to `http://localhost:9000` with the access key
+`my-access-key-one` and the secret key `my-secret-key-one`; set
+`S4_ACCESS_KEY_ID` and `S4_SECRET_ACCESS_KEY` in the shell before `up` to use
+others. `docker-compose-cluster.yml` does not publish the nodes' own ports, so
+every request goes through HAProxy; to reach a node directly, use
+`docker-compose-cluster-dev.yml` and ports `9001`–`9003`.
+
+Enterprise Edition has its own development clusters, which need an Enterprise
+license: `ee/docker-compose-dev.yml` runs six nodes in one erasure-coded pool and
+`ee/docker-compose-dev-no-ec.yml` six nodes in one replicated pool. See
+[Erasure Coding → Docker Compose Dev Cluster](../04-features/erasure-coding.md#docker-compose-dev-cluster).
 
 ## Load Balancer
 
@@ -221,7 +241,9 @@ server {
 | `S4_WRITE_QUORUM` | `2` | Minimum write acknowledgements |
 | `S4_READ_QUORUM` | `2` | Minimum read acknowledgements |
 | `S4_GC_GRACE_DAYS` | `7` | How long tombstones are kept before purge |
-| `S4_MAX_REJOIN_DOWNTIME_DAYS` | `3` | Max days a node can be offline and rejoin incrementally |
+| `S4_MAX_REJOIN_DOWNTIME_DAYS` | `3` | Lower bound on `S4_GC_GRACE_DAYS`; see [Long Downtime](#long-downtime--s4_max_rejoin_downtime_days) |
+| `S4_EXPECTED_NODE_IDENTITY` | unset | Identity (UUID) this data directory must belong to; node replacement tool |
+| `S4_NODE_IDENTITY_CONFLICT_CHECK` | `true` | Refuse the start when a live pool member already answers for this node's identity |
 | `S4_ANTI_ENTROPY_INTERVAL_SECS` | `600` | Merkle tree sync interval (seconds) |
 | `S4_SCRUBBER_FULL_SCAN_DAYS` | `30` | Full CRC32 integrity scan cycle (days) |
 | `S4_HINT_TTL_HOURS` | `3` | Hinted handoff TTL for offline replicas |
@@ -304,13 +326,54 @@ No manual intervention needed.
 
 ### Long Downtime (> `S4_MAX_REJOIN_DOWNTIME_DAYS`)
 
-If a node was offline longer than the max rejoin downtime (default: 3 days), it must perform a full bootstrap to avoid zombie resurrection:
+A node offline longer than the max rejoin downtime (default: 3 days) may hold
+objects the cluster deleted while it was away, and whose tombstones have since
+been purged. Bringing its old data back could resurrect them.
+
+`S4_MAX_REJOIN_DOWNTIME_DAYS` does two things. It constrains the tombstone GC
+invariant — `gc_grace` must exceed it — on every pool, and on an
+erasure-coded pool it is also the limit a returning node's own downtime is
+measured against: a node back after longer than that does not serve
+erasure-coded reads until its shards are rebuilt and an operator says its return
+is acceptable. `S4_EC_LONG_OFFLINE_REJOIN_POLICY` decides which of the two forms
+that takes. See
+[Erasure Coding → Coming back to the pool](../04-features/erasure-coding.md#coming-back-to-the-pool).
+
+On a replicated pool nothing is enforced automatically, so bring such a node
+back the same way you replace a dead one: clear its data directory and let it
+rebuild from its peers.
+
+### Replacing a node that will not come back
+
+A node's identity is a UUID in `<S4_DATA_DIR>/volumes/node_id`, not its hostname
+and not `S4_NODE_ID`. Replacement means giving a machine an **empty** data
+directory and the identity of the node it replaces:
 
 ```bash
-curl -X POST http://node-address:9000/admin/node/bootstrap
+S4_EXPECTED_NODE_IDENTITY=<uuid of the dead node> \
+S4_DATA_DIR=/var/lib/s4 \
+  s4-server
 ```
 
-This triggers a full data sync from healthy replicas.
+An empty data directory adopts that identity; a directory holding a *different*
+identity stops the start and names both. Leaving the variable unset keeps the
+old behaviour exactly.
+
+On an erasure-coded pool the identity of every node and the slots it holds are
+readable from any surviving node, and the rebuild is driven from the admin API —
+see [Erasure Coding → Replacing a node](../04-features/erasure-coding.md#replacing-a-node).
+
+Do **not** bring the replacement up with a fresh identity. It joins the cluster
+and looks healthy, but the pool goes on assigning the dead node's data to an
+identity that no longer exists.
+
+Bringing it up as a *second* copy of a node that is still running is stopped for
+you: before joining gossip, a starting node asks every address in
+`S4_POOL_NODES` who it is, and a peer answering with this node's identity
+refuses the start and names that peer's address. An address that does not answer
+proves nothing and never refuses a start, so a pool whose peers are down comes
+up as it always did. `S4_NODE_IDENTITY_CONFLICT_CHECK=false` switches the check
+off.
 
 ## Graceful Shutdown
 

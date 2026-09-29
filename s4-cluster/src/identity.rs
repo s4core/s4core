@@ -65,6 +65,19 @@ impl NodeId {
     }
 }
 
+impl std::str::FromStr for NodeId {
+    type Err = ClusterError;
+
+    /// Parse the display form, which is the form every admin surface uses.
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let trimmed = raw.trim();
+        let uuid = uuid::Uuid::parse_str(trimmed).map_err(|error| {
+            ClusterError::Identity(format!("node id '{trimmed}' is not a UUID: {error}"))
+        })?;
+        Ok(Self(uuid.as_u128()))
+    }
+}
+
 impl fmt::Debug for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "NodeId({})", uuid::Uuid::from_u128(self.0))
@@ -269,27 +282,151 @@ impl foca::Identity for GossipIdentity {
 
 const NODE_ID_FILENAME: &str = "node_id";
 
+/// Where the identity this start runs under came from.
+///
+/// The three cases are not cosmetic: they are the only local evidence a node
+/// has about whether the pool has met it before. An identity read from disk
+/// belongs to a node that has run here; a generated one cannot be an identity
+/// any pool remembers, because it was invented a moment ago; an adopted one is
+/// the operator saying this machine takes over a node that is gone
+/// (`EC2-NREP-02-002`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NodeIdentityOrigin {
+    /// Read from the identity file this data directory already had.
+    Existing,
+    /// Freshly generated, because the data directory held no identity.
+    Generated,
+    /// Taken from `S4_EXPECTED_NODE_IDENTITY` into a blank data directory.
+    Adopted,
+}
+
+impl NodeIdentityOrigin {
+    /// Whether this start took over an identity whose storage it does not have.
+    pub fn is_adopted(self) -> bool {
+        matches!(self, Self::Adopted)
+    }
+
+    /// A short label for logs and admin responses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Existing => "existing",
+            Self::Generated => "generated",
+            Self::Adopted => "adopted",
+        }
+    }
+}
+
+/// The identity this node starts under, and where it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeIdentity {
+    /// The persistent identity the pool addresses this node by.
+    pub node_id: NodeId,
+    /// How this start arrived at it.
+    pub origin: NodeIdentityOrigin,
+}
+
+/// Where a data directory keeps the identity of the node that owns it.
+pub fn node_identity_path(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join(NODE_ID_FILENAME)
+}
+
 /// Load or generate the persistent node ID.
 ///
 /// On first startup a new UUID v4 is generated and written to
 /// `<data_dir>/node_id`.  Subsequent starts read the existing file,
 /// ensuring the node retains its identity across restarts.
 pub fn get_or_create_node_id(data_dir: &Path) -> Result<NodeId, ClusterError> {
-    let id_path = data_dir.join(NODE_ID_FILENAME);
+    load_or_adopt_node_id(data_dir, None)
+}
+
+/// Load the persistent node ID, optionally checking it against the identity the
+/// operator says this data directory belongs to.
+///
+/// Without an expectation this behaves exactly like
+/// [`get_or_create_node_id`]: an existing file is honoured, a blank directory
+/// gets a fresh UUID.
+///
+/// With an expectation it becomes the node replacement tool:
+///
+/// * a blank data directory **adopts** the expected identity instead of
+///   generating one, which is how a replacement machine takes over the slots of
+///   the node it replaces;
+/// * a data directory that already holds a *different* identity is refused, and
+///   the node does not start.
+///
+/// The refusal is the point. Two identities are involved in every replacement —
+/// the one the operator means and the one on disk — and a silent disagreement
+/// means the operator brought the replacement up for the wrong node. Nothing
+/// downstream notices: the pool keeps assigning the dead node's slots to an
+/// identity nobody holds, the objects go on reading through the surviving
+/// shards, and the only symptom is a rebuild that never finishes.
+pub fn load_or_adopt_node_id(
+    data_dir: &Path,
+    expected: Option<NodeId>,
+) -> Result<NodeId, ClusterError> {
+    load_node_identity(data_dir, expected).map(|identity| identity.node_id)
+}
+
+/// [`load_or_adopt_node_id`], keeping where the identity came from.
+///
+/// The identity itself is all most callers need. Node replacement needs one
+/// thing more: whether this start read an identity that was already here,
+/// invented one, or took over one it was handed. A blank data directory looks
+/// the same to every other check, and only this distinction separates a brand
+/// new node from a machine standing in for a dead one.
+pub fn load_node_identity(
+    data_dir: &Path,
+    expected: Option<NodeId>,
+) -> Result<NodeIdentity, ClusterError> {
+    let id_path = node_identity_path(data_dir);
 
     if id_path.exists() {
         let bytes = std::fs::read(&id_path)?;
-        NodeId::from_bytes(&bytes)
-    } else {
-        let id = NodeId::generate();
-        // Ensure the parent directory exists.
-        if let Some(parent) = id_path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let found = NodeId::from_bytes(&bytes)?;
+        if let Some(expected) = expected {
+            if expected != found {
+                return Err(ClusterError::Identity(format!(
+                    "this node is configured to be {expected}, but its data directory belongs to \
+                     {found} ({}). A node's identity is the pool's only name for the shards it \
+                     holds, so serving another node's data under this one's name is refused. \
+                     Either point this node at the data directory of {expected}, or clear \
+                     {} to bring it up as a replacement that rebuilds from its peers",
+                    id_path.display(),
+                    data_dir.display()
+                )));
+            }
         }
-        std::fs::write(&id_path, id.to_bytes())?;
-        tracing::info!(%id, "generated new node identity");
-        Ok(id)
+        return Ok(NodeIdentity {
+            node_id: found,
+            origin: NodeIdentityOrigin::Existing,
+        });
     }
+
+    let origin = if expected.is_some() {
+        NodeIdentityOrigin::Adopted
+    } else {
+        NodeIdentityOrigin::Generated
+    };
+    let id = expected.unwrap_or_else(NodeId::generate);
+    // Ensure the parent directory exists.
+    if let Some(parent) = id_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&id_path, id.to_bytes())?;
+    if origin.is_adopted() {
+        tracing::warn!(
+            %id,
+            path = %id_path.display(),
+            "empty data directory adopted the configured node identity; this node now answers for \
+             that identity's shards and must rebuild them from its peers"
+        );
+    } else {
+        tracing::info!(%id, "generated new node identity");
+    }
+    Ok(NodeIdentity {
+        node_id: id,
+        origin,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +476,85 @@ mod tests {
         let id2 = get_or_create_node_id(dir.path()).unwrap();
 
         assert_eq!(id1, id2, "must return same ID across calls");
+    }
+
+    #[test]
+    fn node_id_parses_its_own_display_form() {
+        let id = NodeId::generate();
+        assert_eq!(id.to_string().parse::<NodeId>().unwrap(), id);
+        // Surrounding whitespace comes from shells and config files, not from
+        // the operator meaning a different node.
+        assert_eq!(format!("  {id}\n").parse::<NodeId>().unwrap(), id);
+        assert!("not-a-uuid".parse::<NodeId>().is_err());
+    }
+
+    #[test]
+    fn expected_identity_matching_the_directory_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = get_or_create_node_id(dir.path()).unwrap();
+
+        assert_eq!(load_or_adopt_node_id(dir.path(), Some(id)).unwrap(), id);
+    }
+
+    #[test]
+    fn expected_identity_differing_from_the_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let on_disk = get_or_create_node_id(dir.path()).unwrap();
+        let expected = NodeId::generate();
+
+        let error = load_or_adopt_node_id(dir.path(), Some(expected)).unwrap_err().to_string();
+
+        // Both identities have to be in the message: the operator is holding
+        // two of them and needs to know which one this directory is.
+        assert!(error.contains(&expected.to_string()), "{error}");
+        assert!(error.contains(&on_disk.to_string()), "{error}");
+        // The directory is left exactly as it was; a refused start writes nothing.
+        assert_eq!(get_or_create_node_id(dir.path()).unwrap(), on_disk);
+    }
+
+    #[test]
+    fn empty_directory_adopts_the_expected_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let expected = NodeId::generate();
+
+        assert_eq!(
+            load_or_adopt_node_id(dir.path(), Some(expected)).unwrap(),
+            expected
+        );
+        // Written down, so the next start needs no environment variable.
+        assert_eq!(get_or_create_node_id(dir.path()).unwrap(), expected);
+    }
+
+    #[test]
+    fn no_expectation_leaves_the_generated_identity_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let generated = get_or_create_node_id(dir.path()).unwrap();
+
+        assert_eq!(load_or_adopt_node_id(dir.path(), None).unwrap(), generated);
+    }
+
+    #[test]
+    fn identity_origin_separates_the_three_ways_a_node_gets_its_name() {
+        // A blank directory and no expectation: an identity no pool can know.
+        let fresh = tempfile::tempdir().unwrap();
+        let generated = load_node_identity(fresh.path(), None).unwrap();
+        assert_eq!(generated.origin, NodeIdentityOrigin::Generated);
+
+        // The same directory a second time: the identity was already here.
+        let reread = load_node_identity(fresh.path(), None).unwrap();
+        assert_eq!(reread.origin, NodeIdentityOrigin::Existing);
+        assert_eq!(reread.node_id, generated.node_id);
+
+        // A blank directory taking over the identity of a node that is gone.
+        let replacement = tempfile::tempdir().unwrap();
+        let adopted = load_node_identity(replacement.path(), Some(generated.node_id)).unwrap();
+        assert_eq!(adopted.origin, NodeIdentityOrigin::Adopted);
+        assert_eq!(adopted.node_id, generated.node_id);
+
+        // Adoption happens once: the next start reads what it wrote.
+        let after_adoption =
+            load_node_identity(replacement.path(), Some(generated.node_id)).unwrap();
+        assert_eq!(after_adoption.origin, NodeIdentityOrigin::Existing);
     }
 
     #[test]

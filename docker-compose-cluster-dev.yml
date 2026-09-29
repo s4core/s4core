@@ -1,3 +1,20 @@
+# S4 Community Edition — 3-node development cluster built from this repository.
+#
+# Three CE nodes in one replicated pool (RF=3, W=2, R=2) behind HAProxy
+# round-robin. Unlike docker-compose-cluster.yml, the image is built from the
+# local sources and every node's HTTP port is published as well.
+#
+# Usage from the repository root:
+#   docker compose -f docker-compose-cluster-dev.yml up -d --build
+#   docker compose -f docker-compose-cluster-dev.yml down -v   # reset: drops the data volumes
+#
+# Endpoints: HAProxy http://localhost:9000, HAProxy stats http://localhost:8404,
+# nodes http://localhost:9001, :9002, :9003.
+#
+# Data lives in named volumes: the server runs as the unprivileged user s4
+# (uid 1000), and a host directory that Docker creates for a bind mount belongs
+# to root, so the node could not write to it.
+
 services:
   haproxy:
     image: haproxy:3.1-alpine
@@ -34,7 +51,7 @@ services:
       S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
       RUST_LOG: ${RUST_LOG:-s4_api=info,s4_server=info,s4_cluster=info}
     volumes:
-      - ./s4-data-1:/data
+      - s4-data-1:/data
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
       interval: 5s
@@ -62,7 +79,7 @@ services:
       S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
       RUST_LOG: ${RUST_LOG:-s4_api=info,s4_server=info,s4_cluster=info}
     volumes:
-      - ./s4-data-2:/data
+      - s4-data-2:/data
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
       interval: 5s
@@ -90,7 +107,7 @@ services:
       S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
       RUST_LOG: ${RUST_LOG:-s4_api=info,s4_server=info,s4_cluster=info}
     volumes:
-      - ./s4-data-3:/data
+      - s4-data-3:/data
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
       interval: 5s

@@ -1,6 +1,6 @@
 # Docker Deployment
 
-S4 provides Docker images for easy deployment. The project includes both a `Dockerfile` for the server and a `docker-compose.yml` for the full stack.
+S4 provides Docker images for easy deployment. The project includes a `Dockerfile` for the server and `docker-compose-single-node.yml`, which runs the server together with the web admin console.
 
 ## Single Container
 
@@ -59,42 +59,55 @@ docker run -d \
 
 ## Docker Compose (Full Stack)
 
-The `docker-compose.yml` runs both the S4 server and the web admin console:
+`docker-compose-single-node.yml` builds the Community Edition server from the
+repository and runs it together with the web admin console:
 
 ```yaml
 services:
-  s4-server:
-    build: .
+  s4core:
+    build:
+      context: .
+      dockerfile: Dockerfile
     ports:
       - "9000:9000"
+    environment:
+      - S4_BIND=0.0.0.0:9000
+      - S4_DATA_DIR=/data
+      - S4_ROOT_USERNAME=${S4_ROOT_USERNAME:-root}
+      - S4_ROOT_PASSWORD=${S4_ROOT_PASSWORD:-password12345}
+      - S4_ACCESS_KEY_ID=${S4_ACCESS_KEY_ID:-my-access-key-one}
+      - S4_SECRET_ACCESS_KEY=${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
     volumes:
       - s4-data:/data
-    environment:
-      - S4_ROOT_PASSWORD=${S4_ROOT_PASSWORD:-}
-      - S4_ACCESS_KEY_ID=${S4_ACCESS_KEY_ID:-}
-      - S4_SECRET_ACCESS_KEY=${S4_SECRET_ACCESS_KEY:-}
 
-  s4-console:
-    build: ./frontend/s4-console
+  s4console:
+    image: s4core/s4console:latest
     ports:
       - "3000:3000"
     environment:
-      - S4_BACKEND_URL=http://s4-server:9000
+      # The console reaches the server by its compose service name.
+      - S4_BACKEND_URL=http://s4core:9000
     depends_on:
-      - s4-server
+      s4core:
+        condition: service_healthy
 
 volumes:
   s4-data:
 ```
 
+The excerpt leaves out the health check and restart policy. The root credentials
+and the S3 keys are read from the shell, with the defaults above as placeholders:
+set `S4_ROOT_PASSWORD`, `S4_ACCESS_KEY_ID` and `S4_SECRET_ACCESS_KEY` before
+exposing the server.
+
 ### Start
 
 ```bash
-# With IAM enabled
-S4_ROOT_PASSWORD=password12345 docker compose up -d --build
+# Full stack: server + web console
+docker compose -f docker-compose-single-node.yml up -d --build
 
-# Basic mode
-docker compose up -d --build
+# Server only
+docker compose -f docker-compose-single-node.yml up -d --build s4core
 ```
 
 ### Access Points
@@ -102,28 +115,31 @@ docker compose up -d --build
 | Service | URL |
 |---------|-----|
 | S4 API | http://localhost:9000 |
-| Web Console | http://localhost:3000 |
+| Web Console | http://localhost:3000 (log in as `root` / `S4_ROOT_PASSWORD`) |
+
+The console needs IAM, which `S4_ROOT_PASSWORD` turns on.
 
 ### Rebuild After Changes
 
 ```bash
-docker compose up -d --build
+docker compose -f docker-compose-single-node.yml up -d --build
 ```
 
 ### Stop
 
 ```bash
-docker compose down
+docker compose -f docker-compose-single-node.yml down      # keep the data volume
+docker compose -f docker-compose-single-node.yml down -v   # delete it as well
 ```
 
 ### View Logs
 
 ```bash
 # All services
-docker compose logs -f
+docker compose -f docker-compose-single-node.yml logs -f
 
 # Server only
-docker compose logs -f s4-server
+docker compose -f docker-compose-single-node.yml logs -f s4core
 ```
 
 ## Volume Management
@@ -137,6 +153,11 @@ S4 stores all data in the `/data` directory inside the container. Always use a D
 # Bind mount
 -v /var/lib/s4:/data
 ```
+
+The server runs as the unprivileged user `s4` (uid 1000), so a bind-mounted
+directory has to be writable by that uid: `sudo chown 1000:1000 /var/lib/s4`.
+A directory Docker creates for a missing bind source belongs to root, and the
+server cannot write to it.
 
 **Warning:** Without a volume, all data is lost when the container is removed.
 

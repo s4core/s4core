@@ -28,9 +28,9 @@ pub mod volume;
 pub use bitcask::BitcaskStorageEngine;
 pub use dedup::{DedupEntry, Deduplicator};
 pub use engine::{
-    DeleteMarkerEntry, DeleteResult, KeyspaceSnapshot, ListVersionsResult, ObjectStream,
-    ObjectVersion, ReadOptions, Snapshot, StateMachine, StorageEngine, StreamingPutResult,
-    VolumeFileInfo,
+    is_force_physical_write, DeleteMarkerEntry, DeleteResult, KeyspaceSnapshot, ListVersionsResult,
+    ObjectStream, ObjectVersion, ReadOptions, Snapshot, StateMachine, StorageEngine,
+    StreamingPutResult, VolumeFileInfo, FORCE_PHYSICAL_WRITE_METADATA_KEY,
 };
 pub use index::{BatchAction, BatchOp, IndexDb, KeyspaceId};
 pub use journal::{JournalEntry, JournalEventType, MetadataJournal};

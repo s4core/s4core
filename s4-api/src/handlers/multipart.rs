@@ -34,6 +34,7 @@ use s4_core::{ReadOptions, StorageEngine};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io;
+use tokio::io::AsyncReadExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info};
 use uuid::Uuid;
@@ -685,6 +686,49 @@ async fn collect_body(body: Body) -> Result<Bytes, String> {
     Ok(Bytes::from(result))
 }
 
+struct ClusterObjectDigest {
+    size: u64,
+    content_type: String,
+    metadata: HashMap<String, String>,
+    content_hash_sha256: [u8; 32],
+}
+
+async fn hash_cluster_object_stream(
+    read_coord: &s4_cluster::QuorumReadCoordinator,
+    bucket: &str,
+    key: &str,
+) -> Result<ClusterObjectDigest, s4_cluster::ClusterError> {
+    use sha2::{Digest, Sha256};
+
+    let mut stream = read_coord.read_stream(bucket, key, None).await?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+
+    loop {
+        let read = stream.body.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size = size.saturating_add(read as u64);
+    }
+
+    if size != stream.total_size {
+        return Err(s4_cluster::ClusterError::Storage(format!(
+            "streamed object length {} does not match metadata size {}",
+            size, stream.total_size
+        )));
+    }
+
+    Ok(ClusterObjectDigest {
+        size,
+        content_type: stream.content_type,
+        metadata: stream.metadata,
+        content_hash_sha256: hasher.finalize().into(),
+    })
+}
+
 /// Completes a multipart upload — native metadata-only completion.
 ///
 /// S3 API: POST /{bucket}/{key}?uploadId=X
@@ -775,6 +819,44 @@ pub async fn complete_multipart_upload(
                     result.replicas_acked,
                     result.replicas_total
                 );
+                if super::is_ec_cluster_pool(&state) {
+                    let Some(read_coord) = state.read_coordinator.clone() else {
+                        return S3Error::InternalError(
+                            "Cluster read coordinator is not configured".to_string(),
+                        )
+                        .into_response();
+                    };
+                    let digest = match hash_cluster_object_stream(&read_coord, &bucket, &key).await
+                    {
+                        Ok(digest) => digest,
+                        Err(e) => {
+                            error!("Failed to hash completed multipart object: {:?}", e);
+                            return super::cluster_error_to_response(&e);
+                        }
+                    };
+                    if digest.size != result.total_size {
+                        return S3Error::InternalError(format!(
+                            "Completed multipart size mismatch: expected {}, read {}",
+                            result.total_size, digest.size
+                        ))
+                        .into_response();
+                    }
+                    let ec_commit = super::EcPutCommitInput {
+                        bucket: bucket.clone(),
+                        key: key.clone(),
+                        version_id: None,
+                        etag: result.s3_etag.clone(),
+                        size: result.total_size,
+                        content_type: digest.content_type,
+                        metadata: digest.metadata,
+                        hot_replica_nodes: result.replica_nodes.clone(),
+                        content_hash_sha256: digest.content_hash_sha256,
+                        source_hlc: result.hlc,
+                    };
+                    if let Err(resp) = super::record_ec_put_commit(&state, ec_commit).await {
+                        return resp;
+                    }
+                }
                 let xml = format!(
                     r#"<?xml version="1.0" encoding="UTF-8"?>
 <CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
@@ -1146,24 +1228,40 @@ pub async fn list_parts(
         bucket, key, upload_id, max_parts, part_number_marker
     );
 
-    let storage = state.storage.read().await;
+    let all_parts = if let Some(write_coord) = state.write_coordinator.clone() {
+        match write_coord.list_multipart_parts(&bucket, &key, &upload_id).await {
+            Ok(result) => {
+                debug!(
+                    "ListParts(cluster): uploadId={}, responded={}/{}",
+                    upload_id, result.replicas_responded, result.replicas_total
+                );
+                result.parts
+            }
+            Err(e) => {
+                error!("Cluster ListParts failed: {:?}", e);
+                return super::cluster_error_to_response(&e);
+            }
+        }
+    } else {
+        let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
-    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
-        return resp;
-    }
+        // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+        if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
+            return resp;
+        }
 
-    // Verify multipart upload session exists
-    if storage.get_multipart_session(&upload_id).await.is_err() {
-        return S3Error::NoSuchUpload.into_response();
-    }
+        // Verify multipart upload session exists
+        if storage.get_multipart_session(&upload_id).await.is_err() {
+            return S3Error::NoSuchUpload.into_response();
+        }
 
-    // Get parts from durable storage (metadata only — no data reads)
-    let all_parts = match storage.list_multipart_parts(&upload_id) {
-        Ok(parts) => parts,
-        Err(e) => {
-            error!("ListParts: failed to list parts: {:?}", e);
-            return S3Error::InternalError("Failed to list parts".to_string()).into_response();
+        // Get parts from durable storage (metadata only — no data reads)
+        match storage.list_multipart_parts(&upload_id) {
+            Ok(parts) => parts,
+            Err(e) => {
+                error!("ListParts: failed to list parts: {:?}", e);
+                return S3Error::InternalError("Failed to list parts".to_string()).into_response();
+            }
         }
     };
 

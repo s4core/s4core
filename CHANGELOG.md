@@ -1,3 +1,57 @@
+# v1.1.0-erasure-coding
+
+# Federation Erasure Coding (Enterprise), Bit-Rot Healing & Cluster Resilience
+
+**Release Overview**
+This release (83 commits) brings erasure coding to S4 Federation as an Enterprise Edition pool type. Objects are stored as data and parity shards across a fixed-width erasure set, at 1.375x–1.75x of their size instead of the 3x of RF=3 replication. It ships with an ISA-L accelerated codec, repair, anti-entropy, scrubbing and garbage collection, and the full EC v2 feature set: auto-tiering between RF=3 and erasure coding, multi-set pools, packed segments for small objects, topology-aware LRC placement, node replacement, damage-ordered repair and minimal reads. Every cluster, Community Edition included, gets bit-rot healing that actually rewrites the damaged bytes, restarts that no longer need every node up, and a fix for a storage-engine defect in which an interrupted write could make later objects unreadable.
+
+## 🚀 New Features (Enterprise Edition)
+* **Erasure-coded pools (`S4_POOL_TYPE=ec`):** Licensed by the `erasure_coding` capability. Six built-in profiles — RS(4,2), RS(6,3), RS(8,3), LRC(4,2,1), LRC(6,2,2), LRC(10,2,2) — plus custom RS and LRC. A write is acknowledged on its RF=3 replicas and moved into erasure coding in the background: the object is encoded, its manifest is committed through the metadata quorum, the object is read back from the shards and checked against its SHA-256, and only then are the hot copies released, after a grace period. Objects below `S4_EC_MIN_OBJECT_SIZE` (1 MiB) stay replicated. Clients see no difference: body, ETag, size, Content-Type, Last-Modified and storage class are preserved.
+* **ISA-L accelerated codec:** `cargo build --release --features isal` (x86_64, nasm 2.14 or newer), selected with `S4_EC_CODEC_ENGINE=auto|isal|pure`. On `ec-rs-standard`, one core, 6 MiB chunks: encode 8.2x, degraded read 10.9x and shard repair 7.8x faster than the portable engine. Both engines produce byte-identical shards, so nodes can mix engines and switch with a restart. The x86_64 EE Docker image is built with it.
+* **Self-healing pools:** Repair worker, manifest anti-entropy, shard scrubbing and tombstone and orphan shard GC. The repair queue is ordered by damage: the chunk missing the most shards is rebuilt first. A scrub pass that keeps failing on the medium reports the disk as suspect instead of declaring its shards corrupt.
+* **LRC recovery:** Local XOR, global Reed-Solomon and a unified solver that recovers every loss pattern the code can recover; the decoder takes the cheapest route. `GET /api/admin/ec/pools/{pool}/failure-matrix` lists the failure patterns of a pool and the recovery path each one takes.
+* **Minimal reads (on by default):** A read pulls only the `k` data shards it assembles from, and a range read only the shards the range covers. Parity is read only for a shard that is missing or fails its hash.
+* **Auto-tiering (off by default):** Cold objects move from RF=3 into erasure coding and objects that become hot come back. Bucket policies with prefix and tag exclusions, a dry run, admission and rate limits, and a pause between migrations of one object that grows with each migration. `POST /api/admin/ec/tiering/{bucket}/promote` brings objects back to RF=3 on demand, with auto-tiering switched off too.
+* **Multi-set pools (off by default):** Grow a pool by whole erasure sets, place new objects `round_robin` or by `free_space`, and stop a set taking new objects once it fills.
+* **Packed segments for small objects (off by default):** Small objects are gathered into large segments that are erasure coded as a whole, with repacking to reclaim the space of deleted objects and an unpacker to roll back.
+* **Topology-aware placement:** Zone, rack and host labels (`S4_EC_NODE_TOPOLOGY`), LRC local groups spread over a failure domain (`S4_EC_LRC_GROUP_DOMAIN`), a recorded layout per erasure set with drift detection, and repair bandwidth limits per zone.
+* **Node replacement:** A new machine takes over a dead node's identity (`S4_EXPECTED_NODE_IDENTITY`) and is refilled by repair. A start is refused while a live node already answers for the same identity, and a node that was away longer than `S4_MAX_REJOIN_DOWNTIME_DAYS` serves no erasure-coded reads until its shards are rebuilt.
+* **Admin API and metrics:** Pool health with release gates, repair status, erasure sets, verification, repair, GC, tiering and packed-segment routes under `/api/admin/ec/*`, a read-only duplicate content report, and Prometheus metrics for every worker.
+
+## 🛡️ Reliability (All Editions)
+* **Bit-rot healing that heals:** The scrubber now writes the healthy copy it fetches from a replica back to disk. Before, it fetched the copy and counted the blob as healed while the damaged bytes stayed where they were. A cycle that could not heal something runs again after `S4_SCRUBBER_UNHEALED_RETRY_SECS` (default 5 minutes) instead of waiting out the full scan period, and the first cycle waits `S4_SCRUBBER_START_DELAY_SECS` for membership to settle.
+* **Damaged blobs leave deduplication:** A blob that fails its hash on read is no longer handed to new writes of the same content, and a healing write always stores a fresh copy instead of pointing back at the damage.
+* **Restarts with a node down:** A cluster node no longer refuses to start until every pool member is visible. Members it cannot see are named from what it recorded the last time they answered, so a rolling restart works with one node dead.
+* **Start order no longer matters:** A node keeps announcing itself to its seeds until it finds a peer, so a whole cluster can be started at once.
+
+## 🐛 Bug Fixes
+* **Interrupted writes corrupted later objects:** A write cancelled mid-flight — a client disconnecting during an upload, or a replica write timing out — left the volume file position ahead of the writer's recorded offset. Objects written afterwards were stored away from the offset their index entry recorded and failed to read. The writer now discards an unfinished write before the next one.
+* **CopyObject in cluster mode:** The source is now read and the copy written through the quorum coordinators. Before, both went to the local storage of the node that took the request: the copy was not replicated, and a node that held no replica of the source answered `NoSuchKey`.
+* **Admin login no longer reveals which accounts exist:** An unknown account and a wrong password now both answer `401 InvalidCredentials`.
+* **Admin API errors:** Every failure is JSON with a human-readable `error` and a stable `code`; anything the caller can correct is `4xx`, and `500` means a server fault only. A write the cluster has no room for answers `507 InsufficientStorage` instead of `500`.
+* **Quorum reads:** A cancelled quorum read no longer leaves its replica reads running in the background.
+
+## 🏗️ Build & Deployment
+* **No OpenSSL:** TLS is rustls end to end and OpenSSL is no longer a build dependency; the workspace cross-compiles to aarch64. ISA-L is x86_64 only, and the aarch64 build uses the portable codec.
+* **Docker Compose:** Three-node cluster files behind HAProxy with health checks — `docker-compose-cluster.yml` for the released image, `docker-compose-cluster-dev.yml` built from source. `docker-compose-single-node.yml` reads its credentials from the shell. The README and docs referred to a `docker-compose.yml` that does not exist; they now name the real files.
+* **Documentation:** One complete configuration reference in `docs/01-getting-started/configuration.md`; erasure coding documented in `docs/04-features/erasure-coding.md`.
+* **CI:** ISA-L and aarch64 builds, the EC v1 and EC v2 acceptance suites, and CE and EE cluster crash-recovery and bit-rot durability tests.
+
+## ⚠️ Upgrade Notes
+* **Data format:** Unchanged for existing data. Index records written by v1.0.0-beta-federation are read as before. New records carry a reserved `_s4_storage_class` metadata key that is never returned to clients.
+* **Cluster protocol:** Version 3, compatible down to version 1, so nodes of this release and of v1.0.0-beta-federation can run side by side during a rolling upgrade. EC v2 features that need every node — auto-tiering, adding erasure sets — stay blocked until every pool member runs this release.
+* **Restarting with a node down** works from the second start of each node on this release: the record of peer identities it relies on is written by the first.
+* **Admin API status codes:** Deleting a non-empty bucket answers `409 BucketNotEmpty` (was `400`); a login with an unknown account answers `401 InvalidCredentials` (was `404`). Clients should branch on the `code` field rather than on the status code or the message text.
+* **EC production readiness:** Pool health reports `production_ready=true` only for an EE build attested with `S4_EC_V1_CI_ACCEPTANCE_PASSED=true`.
+
+## Known Limitations
+* Hot RF=3 replicas are placed by the hash ring, which does not know about zones. In a pool spread over three zones, losing one zone makes writes unavailable for the keys that had two of their three replicas in it.
+* One generation of an object is erasure coded at most once: an object brought back to RF=3 stays there until a client writes it again.
+* Auto-tiering does not migrate objects assembled from multipart parts; such objects written into an EC pool are still encoded on their way in.
+* Adding an erasure set does not rebalance existing objects.
+* Deduplication across erasure-coded content is not implemented; a read-only report measures how much it would save.
+
+
 # v1.0.0-beta-federation
 
 # S4-Federation, Cluster Recovery & Compaction

@@ -74,6 +74,14 @@ pub struct DedupEntry {
 // Deduplicator
 // ============================================================================
 
+/// Volume id of a dedup entry that names no reusable copy.
+///
+/// Two situations produce it: a legacy inline object, which was never in a
+/// volume, and a blob a read found damaged ([`Deduplicator::make_quarantine_op`]).
+/// Both mean the same thing to a writer — there are no bytes here to point a
+/// new object at — so both are handled by the one check.
+pub const NO_LOCATION_VOLUME_ID: u32 = u32::MAX;
+
 /// Disk-backed content-addressable deduplication engine.
 ///
 /// Replaces the previous in-memory `HashMap<[u8; 32], (u32, u64, u32)>` with
@@ -256,6 +264,29 @@ impl Deduplicator {
                 key: self.make_key(&content_hash),
                 volume_id,
                 offset,
+            },
+        }
+    }
+
+    /// Creates a [`BatchOp`] that takes the blob at this content hash out of use.
+    ///
+    /// Called when a read has found that the bytes at the entry's location do
+    /// not hash to the content the entry claims — bit rot, in other words. The
+    /// entry keeps its reference count, because the objects that point at those
+    /// bytes still exist and still have to be able to release them; it loses
+    /// only its location, and a location of [`NO_LOCATION_VOLUME_ID`] is what
+    /// the write path refuses to hand to a new object.
+    ///
+    /// The next write of this content writes bytes of its own and takes the
+    /// entry with it (`BatchAction::IncrementDedupRef`), so the entry names a
+    /// healthy copy again as soon as one exists.
+    pub fn make_quarantine_op(&self, content_hash: &[u8; 32]) -> BatchOp {
+        BatchOp {
+            keyspace: KeyspaceId::Dedup,
+            action: BatchAction::UpdateDedupLocation {
+                key: self.make_key(content_hash),
+                new_volume_id: NO_LOCATION_VOLUME_ID,
+                new_offset: 0,
             },
         }
     }

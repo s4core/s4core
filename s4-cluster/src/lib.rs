@@ -45,16 +45,19 @@
 //! use s4_cluster::{GossipService, GossipConfig, GossipIdentity, NodeId, NodeMeta};
 //!
 //! let node_id = get_or_create_node_id(data_dir)?;
-//! let (handle, events) = GossipService::start(config, identity, meta).await?;
+//! let (handle, events) = GossipService::start(config, identity, meta, None).await?;
 //! ```
 
 pub mod capability;
+pub mod capacity;
 pub mod clock;
 pub mod cluster_metrics;
 pub mod config;
 pub mod conflict;
 pub mod coordinator;
 pub mod dedup;
+pub mod ec_admin;
+pub mod ec_object;
 pub mod error;
 pub mod gc;
 pub mod gossip;
@@ -62,6 +65,7 @@ pub mod hints;
 pub mod idempotency;
 pub mod identity;
 pub mod lifecycle;
+pub mod peers;
 pub mod placement;
 pub mod protocol;
 pub mod repair;
@@ -80,29 +84,53 @@ pub mod hlc {
 
 // Re-export key types for convenience.
 pub use capability::ClusterLimits;
+pub use capacity::{FilesystemCapacity, NodeCapacityProvider};
 pub use clock::hlc::{HlcTimestamp, HybridClock};
 pub use config::AntiEntropyConfig;
 pub use config::{ClusterConfig, PoolConfig};
 pub use conflict::{resolve_conflict, ConflictResolution};
 pub use coordinator::{
     DistributedListCoordinator, DistributedListResult, ListEntry, ListTimeouts, QuorumHeadResult,
-    QuorumMultipartCompleteResult, QuorumMultipartCreateResult, QuorumMultipartPartResult,
-    QuorumReadCoordinator, QuorumReadResult, QuorumReadStreamResult, QuorumWriteCoordinator,
-    ReadTimeouts, WriteTimeouts,
+    QuorumMultipartCompleteResult, QuorumMultipartCreateResult, QuorumMultipartListPartsResult,
+    QuorumMultipartPartResult, QuorumReadCoordinator, QuorumReadResult, QuorumReadStreamResult,
+    QuorumWriteCoordinator, ReadTimeouts, WriteTimeouts,
 };
 pub use dedup::{DedupGcConfig, DistributedDedupGc, SweepStats};
+pub use ec_admin::{
+    EcAdminAddSetRequest, EcAdminApplyTopologyRequest, EcAdminApproveRejoinRequest,
+    EcAdminCodecHookRequest, EcAdminDeactivateSetRequest, EcAdminDedupReportRequest,
+    EcAdminObjectRef, EcAdminOrphanGcRequest, EcAdminRepairRequest, EcAdminRepairStatusRequest,
+    EcAdminService, EcAdminTestHookRequest, EcAdminTieringDryRunRequest,
+    EcAdminTieringPolicyRequest, EcAdminTieringPromoteRequest, EcAdminTombstoneGcRequest,
+    EcAdminTranscodePauseRequest, EcAdminUnpackSegmentsRequest, NoopEcAdminService,
+    DEFAULT_EC_ADMIN_REPAIR_MAX_TASKS, MIN_TIERING_COLD_AFTER_SECS,
+};
+pub use ec_object::{
+    EcContentDigest, EcContentDigestPage, EcContentDigestScan, EcHeatQuery, EcObjectByteRange,
+    EcObjectDeleteCommit, EcObjectHeadRequest, EcObjectHeadResult, EcObjectHeatMark,
+    EcObjectPutCommit, EcObjectPutDisposition, EcObjectReadError, EcObjectReadLayout,
+    EcObjectReadRequest, EcObjectReadResult, EcObjectRuntime, EcTombstoneProbe,
+    EcTombstoneProbeService, NoopEcObjectRuntime,
+};
 pub use error::ClusterError;
 pub use gc::{
     can_purge_tombstone, DistributedGcService, GcConfig, RejoinDecision, TombstonePolicy,
     ZombieGuard,
 };
-pub use gossip::{ClusterEvent, GossipConfig, GossipHandle, GossipService, NodeState};
+#[cfg(any(test, feature = "test-util"))]
+pub use gossip::MockClusterMembership;
+pub use gossip::{
+    ClusterEvent, ClusterMembershipQuery, GossipConfig, GossipHandle, GossipService,
+    NodeCapacityReport, NodeState,
+};
 pub use hints::{HintedHandoffConfig, HintedHandoffManager};
 pub use idempotency::IdempotencyTracker;
 pub use identity::{
-    get_or_create_node_id, Edition, GossipIdentity, NodeAddr, NodeCapacity, NodeId, NodeMeta,
+    get_or_create_node_id, load_node_identity, load_or_adopt_node_id, node_identity_path, Edition,
+    GossipIdentity, NodeAddr, NodeCapacity, NodeId, NodeIdentity, NodeIdentityOrigin, NodeMeta,
     NodeStatus, PoolId,
 };
+pub use peers::{pool_peers_path, PoolPeer, PoolPeerRecord, POOL_PEERS_FORMAT_VERSION};
 pub use placement::{
     BucketPlacement, ConsistentHashRing, PlacementDecision, PlacementRouter, PlacementStrategy,
 };
@@ -113,7 +141,9 @@ pub use repair::{
 pub use replica::{
     MultipartReplicaStorage, ReplicaMultipartHandler, ReplicaReadHandler, ReplicaWriteHandler,
 };
-pub use rpc::{NodeClient, NodeClientConfig, NodeRpcServer, RpcServerConfig, TlsConfig};
+pub use rpc::{
+    probe_node_identity, NodeClient, NodeClientConfig, NodeRpcServer, RpcServerConfig, TlsConfig,
+};
 pub use scrubber::{
     deep_verify::{deep_verify_object, VerifyResult},
     metrics::{ScrubberMetrics, ScrubberMetricsSnapshot},
@@ -131,5 +161,6 @@ pub use lifecycle::{
     GOSSIP_PROPAGATION_DELAY,
 };
 pub use protocol::{
-    check_compatibility, is_compatible, MIN_COMPATIBLE_VERSION, PROTOCOL_VERSION, S4_VERSION,
+    check_compatibility, is_compatible, EC_SET_LAYOUT_MIN_PROTOCOL_VERSION,
+    EC_V2_MIN_PROTOCOL_VERSION, MIN_COMPATIBLE_VERSION, PROTOCOL_VERSION, S4_VERSION,
 };

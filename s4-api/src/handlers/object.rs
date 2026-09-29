@@ -28,7 +28,12 @@ use axum::{
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use s4_cluster::ClusterError;
+use s4_cluster::{
+    ClusterError, EcObjectByteRange, EcObjectHeadRequest, EcObjectHeadResult, EcObjectReadError,
+    EcObjectReadLayout, EcObjectReadRequest, EcObjectReadResult, QuorumReadStreamResult,
+    QuorumWriteCoordinator,
+};
+use s4_core::types::OBJECT_TAGS_METADATA_KEY;
 use s4_core::{ReadOptions, StorageEngine};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -46,6 +51,13 @@ pub struct ObjectVersionQuery {
     /// Version ID for version-specific operations.
     #[serde(rename = "versionId")]
     pub version_id: Option<String>,
+}
+
+struct ObjectWriteOutcome {
+    etag: String,
+    version_id: Option<String>,
+    source_hlc: Option<s4_cluster::HlcTimestamp>,
+    hot_replica_nodes: Vec<s4_cluster::NodeId>,
 }
 
 /// Uploads an object to a bucket.
@@ -190,7 +202,7 @@ pub async fn put_object(
         }
         if !tags.is_empty() {
             if let Ok(tags_json) = serde_json::to_string(&tags) {
-                metadata.insert("_tags".to_string(), tags_json);
+                metadata.insert(OBJECT_TAGS_METADATA_KEY.to_string(), tags_json);
             }
         }
     }
@@ -233,7 +245,7 @@ pub async fn put_object(
         });
 
     // Branch: cluster mode (quorum write) vs standalone (local storage)
-    let write_result: Result<(String, Option<String>), Response> =
+    let write_result: Result<ObjectWriteOutcome, Response> =
         if let Some(ref write_coord) = state.write_coordinator {
             // Cluster mode: quorum write to W replicas
             drop(storage); // Release read lock before coordinator call
@@ -243,7 +255,12 @@ pub async fn put_object(
                         "Quorum write: bucket={}, key={}, etag={}, acked={}/{}",
                         bucket, key, result.etag, result.replicas_acked, result.replicas_total
                     );
-                    Ok((result.etag, None))
+                    Ok(ObjectWriteOutcome {
+                        etag: result.etag,
+                        version_id: None,
+                        source_hlc: Some(result.hlc),
+                        hot_replica_nodes: result.replica_nodes,
+                    })
                 }
                 Err(e) => {
                     error!("Quorum write failed: {:?}", e);
@@ -264,7 +281,12 @@ pub async fn put_object(
                 )
                 .await
             {
-                Ok((etag, version_id)) => Ok((etag, version_id)),
+                Ok((etag, version_id)) => Ok(ObjectWriteOutcome {
+                    etag,
+                    version_id,
+                    source_hlc: None,
+                    hot_replica_nodes: Vec::new(),
+                }),
                 Err(e) => {
                     error!("Failed to store object: {:?}", e);
                     Err((
@@ -276,10 +298,33 @@ pub async fn put_object(
             }
         };
 
-    let (etag, version_id) = match write_result {
+    let ObjectWriteOutcome {
+        etag,
+        version_id,
+        source_hlc,
+        hot_replica_nodes,
+    } = match write_result {
         Ok(r) => r,
         Err(resp) => return resp,
     };
+
+    if let Some(source_hlc) = source_hlc.filter(|_| super::is_ec_cluster_pool(&state)) {
+        let ec_commit = super::EcPutCommitInput {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: version_id.clone(),
+            etag: etag.clone(),
+            size: body.len() as u64,
+            content_type: content_type.to_string(),
+            metadata: metadata.clone(),
+            hot_replica_nodes,
+            content_hash_sha256: super::sha256_bytes(&body),
+            source_hlc,
+        };
+        if let Err(resp) = super::record_ec_put_commit(&state, ec_commit).await {
+            return resp;
+        }
+    }
 
     info!(
         "Object stored: bucket={}, key={}, etag={}, version_id={:?}",
@@ -403,6 +448,27 @@ pub async fn copy_object(
         return resp;
     }
 
+    if let Some(write_coord) = state.write_coordinator.clone() {
+        let Some(read_coord) = state.read_coordinator.clone() else {
+            return S3Error::InternalError(
+                "Cluster read coordinator is not configured".to_string(),
+            )
+            .into_response();
+        };
+        drop(storage);
+        return copy_object_cluster(
+            &state,
+            &read_coord,
+            &write_coord,
+            &src_bucket,
+            &src_key,
+            &bucket,
+            &key,
+            &headers,
+        )
+        .await;
+    }
+
     // Get the source object
     let (src_data, src_record) = match storage.get_object(&src_bucket, &src_key).await {
         Ok(data) => data,
@@ -517,6 +583,112 @@ pub async fn copy_object(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn copy_object_cluster(
+    state: &AppState,
+    read_coord: &s4_cluster::QuorumReadCoordinator,
+    write_coord: &s4_cluster::QuorumWriteCoordinator,
+    src_bucket: &str,
+    src_key: &str,
+    bucket: &str,
+    key: &str,
+    headers: &HeaderMap,
+) -> Response {
+    let src = match read_coord.read(src_bucket, src_key).await {
+        Ok(result) => result,
+        Err(ClusterError::ObjectNotFound { .. }) => return S3Error::NoSuchKey.into_response(),
+        Err(e) => {
+            error!("Quorum read failed for CopyObject source: {:?}", e);
+            return cluster_error_to_response(&e);
+        }
+    };
+
+    let metadata_directive = headers
+        .get("x-amz-metadata-directive")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("COPY");
+
+    let req_storage_class = headers
+        .get("x-amz-storage-class")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    if src_bucket == bucket
+        && src_key == key
+        && !metadata_directive.eq_ignore_ascii_case("REPLACE")
+        && req_storage_class.is_none()
+    {
+        return S3Error::InvalidArgument(
+            "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.".to_string()
+        ).into_response();
+    }
+
+    let (content_type, mut metadata) = if metadata_directive.eq_ignore_ascii_case("REPLACE") {
+        let ct = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("binary/octet-stream")
+            .to_string();
+        let mut meta = HashMap::new();
+        for (name, value) in headers.iter() {
+            let name_str = name.as_str().to_lowercase();
+            if name_str.starts_with("x-amz-meta-") {
+                if let Ok(v) = value.to_str() {
+                    let meta_key = name_str.strip_prefix("x-amz-meta-").unwrap().to_string();
+                    meta.insert(meta_key, v.to_string());
+                }
+            }
+        }
+        (ct, meta)
+    } else {
+        (src.content_type.clone(), src.metadata.clone())
+    };
+
+    if let Some(sc) = req_storage_class {
+        metadata.insert("_storage_class".to_string(), sc);
+    }
+
+    match write_coord.write(bucket, key, &src.data, &content_type, &metadata).await {
+        Ok(result) => {
+            if super::is_ec_cluster_pool(state) {
+                let ec_commit = super::EcPutCommitInput {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    version_id: None,
+                    etag: result.etag.clone(),
+                    size: src.data.len() as u64,
+                    content_type,
+                    metadata,
+                    hot_replica_nodes: result.replica_nodes,
+                    content_hash_sha256: super::sha256_bytes(&src.data),
+                    source_hlc: result.hlc,
+                };
+                if let Err(resp) = super::record_ec_put_commit(state, ec_commit).await {
+                    return resp;
+                }
+            }
+
+            info!(
+                "Object copied via quorum: src={}/{} -> dst={}/{}, etag={}",
+                src_bucket, src_key, bucket, key, result.etag
+            );
+
+            let last_modified = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+            let xml = crate::s3::xml::copy_object_response(&result.etag, &last_modified);
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", "application/xml")
+                .body(Body::from(xml))
+                .unwrap()
+        }
+        Err(e) => {
+            error!("Quorum copy write failed: {:?}", e);
+            cluster_error_to_response(&e)
+        }
+    }
+}
+
 /// Downloads an object from a bucket.
 ///
 /// S3 API: GET /{bucket}/{key}[?versionId=...]
@@ -544,6 +716,10 @@ pub async fn get_object(
         "GetObject: bucket={}, key={}, version_id={:?}",
         bucket, key, query.version_id
     );
+
+    if super::is_ec_cluster_pool(&state) && query.version_id.is_none() {
+        return get_ec_object_response(&state, bucket, key, &headers, &query).await;
+    }
 
     // Cluster mode: use quorum streaming read with range support.
     if let (Some(read_coord), None) = (&state.read_coordinator, &query.version_id) {
@@ -759,6 +935,231 @@ pub async fn get_object(
     }
 }
 
+async fn get_ec_object_response(
+    state: &AppState,
+    bucket: String,
+    key: String,
+    headers: &HeaderMap,
+    query: &ObjectVersionQuery,
+) -> Response {
+    let head = match state
+        .ec_object_runtime
+        .head_object(EcObjectHeadRequest {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: query.version_id.clone(),
+        })
+        .await
+    {
+        Ok(head) => head,
+        Err(error) => return ec_read_error_to_response(error, query),
+    };
+
+    let range = match parse_optional_range(headers, head.size) {
+        Ok(range) => range,
+        Err(total_size) => return range_not_satisfiable(total_size),
+    };
+
+    if matches!(head.layout, EcObjectReadLayout::HotReplicated) {
+        let Some(read_coord) = state.read_coordinator.as_ref() else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "EC hot replicated read path requires a cluster read coordinator",
+            )
+                .into_response();
+        };
+        return match read_coord.read_stream(&bucket, &key, range.map(ec_range_tuple)).await {
+            Ok(result) => build_quorum_stream_response(result),
+            Err(ClusterError::ObjectNotFound { .. }) => S3Error::NoSuchKey.into_response(),
+            Err(error) => {
+                error!("EC hot replicated quorum read failed: {:?}", error);
+                cluster_error_to_response(&error)
+            }
+        };
+    }
+
+    match state
+        .ec_object_runtime
+        .read_object(EcObjectReadRequest {
+            bucket,
+            key,
+            version_id: query.version_id.clone(),
+            range,
+        })
+        .await
+    {
+        Ok(result) => build_ec_read_response(result),
+        Err(error) => ec_read_error_to_response(error, query),
+    }
+}
+
+async fn head_ec_object_response(
+    state: &AppState,
+    bucket: String,
+    key: String,
+    query: &ObjectVersionQuery,
+) -> Response {
+    match state
+        .ec_object_runtime
+        .head_object(EcObjectHeadRequest {
+            bucket,
+            key,
+            version_id: query.version_id.clone(),
+        })
+        .await
+    {
+        Ok(head) => build_ec_head_response(head),
+        Err(error) => ec_read_error_to_response(error, query),
+    }
+}
+
+fn parse_optional_range(
+    headers: &HeaderMap,
+    total_size: u64,
+) -> Result<Option<EcObjectByteRange>, u64> {
+    let Some(range_header) = headers.get(header::RANGE) else {
+        return Ok(None);
+    };
+    let range_header = range_header.to_str().unwrap_or("");
+    match parse_range_header_u64(range_header, total_size) {
+        Some((start, end)) => Ok(Some(EcObjectByteRange::new(start, end))),
+        None => Err(total_size),
+    }
+}
+
+fn ec_range_tuple(range: EcObjectByteRange) -> (u64, u64) {
+    (range.start, range.end)
+}
+
+fn build_ec_read_response(result: EcObjectReadResult) -> Response {
+    let status = if result.content_range.is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    let mut builder = object_response_builder(&result.head, status)
+        .header(header::CONTENT_LENGTH, result.content_length)
+        .header(header::ACCEPT_RANGES, "bytes");
+
+    if let Some((start, end, total)) = result.content_range {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, end, total),
+        );
+    }
+
+    finish_response(builder, Body::from(result.body))
+}
+
+fn build_ec_head_response(head: EcObjectHeadResult) -> Response {
+    let builder =
+        object_response_builder(&head, StatusCode::OK).header(header::CONTENT_LENGTH, head.size);
+    finish_response(builder, Body::empty())
+}
+
+fn build_quorum_stream_response(result: QuorumReadStreamResult) -> Response {
+    let status = if result.content_range.is_some() {
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        StatusCode::OK
+    };
+    let head = EcObjectHeadResult {
+        etag: result.etag.clone(),
+        content_type: result.content_type.clone(),
+        size: result.total_size,
+        metadata: result.metadata.clone(),
+        hlc: result.hlc,
+        version_id: result.version_id.clone(),
+        layout: EcObjectReadLayout::HotReplicated,
+    };
+    let mut builder = object_response_builder(&head, status)
+        .header(header::CONTENT_LENGTH, result.content_length)
+        .header(header::ACCEPT_RANGES, "bytes");
+
+    if let Some((start, end, total)) = result.content_range {
+        builder = builder.header(
+            header::CONTENT_RANGE,
+            format!("bytes {}-{}/{}", start, end, total),
+        );
+    }
+
+    let reader_stream = ReaderStream::new(result.body);
+    finish_response(builder, Body::from_stream(reader_stream))
+}
+
+fn object_response_builder(
+    head: &EcObjectHeadResult,
+    status: StatusCode,
+) -> axum::http::response::Builder {
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, &head.content_type)
+        .header("ETag", format!("\"{}\"", head.etag))
+        .header(
+            header::LAST_MODIFIED,
+            format_last_modified(head.hlc.wall_time.saturating_mul(1_000_000)),
+        );
+
+    if let Some(ref vid) = head.version_id {
+        builder = builder.header("x-amz-version-id", vid.clone());
+    }
+    for (meta_key, value) in &head.metadata {
+        if !meta_key.starts_with('_') {
+            builder = builder.header(format!("x-amz-meta-{}", meta_key), value);
+        }
+    }
+    builder
+}
+
+fn ec_read_error_to_response(error: EcObjectReadError, query: &ObjectVersionQuery) -> Response {
+    match error {
+        EcObjectReadError::NotFound { .. } => S3Error::NoSuchKey.into_response(),
+        EcObjectReadError::Deleted { version_id, .. } => {
+            if query.version_id.is_some() {
+                S3Error::MethodNotAllowed.into_response()
+            } else {
+                let mut builder = Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .header("x-amz-delete-marker", "true");
+                if let Some(version_id) = version_id {
+                    builder = builder.header("x-amz-version-id", version_id);
+                }
+                finish_response(builder, Body::empty())
+            }
+        }
+        EcObjectReadError::InvalidRange { total, .. } => range_not_satisfiable(total),
+        EcObjectReadError::Unavailable { reason } => {
+            (StatusCode::SERVICE_UNAVAILABLE, reason).into_response()
+        }
+        EcObjectReadError::EnterpriseRequired(message) => {
+            (StatusCode::FORBIDDEN, message).into_response()
+        }
+        EcObjectReadError::Internal { reason } => {
+            error!("EC object read failed: {}", reason);
+            (StatusCode::INTERNAL_SERVER_ERROR, reason).into_response()
+        }
+    }
+}
+
+fn range_not_satisfiable(total_size: u64) -> Response {
+    finish_response(
+        Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .header(header::CONTENT_RANGE, format!("bytes */{}", total_size)),
+        Body::empty(),
+    )
+}
+
+fn finish_response(builder: axum::http::response::Builder, body: Body) -> Response {
+    builder.body(body).unwrap_or_else(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to build response: {error}"),
+        )
+            .into_response()
+    })
+}
+
 /// Builds the appropriate response for a delete marker.
 fn build_delete_marker_response(query: &ObjectVersionQuery, version_id: &str) -> Response {
     if query.version_id.is_some() {
@@ -772,6 +1173,70 @@ fn build_delete_marker_response(query: &ObjectVersionQuery, version_id: &str) ->
             .header("x-amz-version-id", version_id)
             .body(Body::empty())
             .unwrap()
+    }
+}
+
+async fn try_delete_cold_ec_object_after_hot_delete_failure(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    query: &ObjectVersionQuery,
+    write_coord: &QuorumWriteCoordinator,
+) -> Option<Response> {
+    if !super::is_ec_cluster_pool(state) || query.version_id.is_some() {
+        return None;
+    }
+
+    let head = match state
+        .ec_object_runtime
+        .head_object(EcObjectHeadRequest {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version_id: None,
+        })
+        .await
+    {
+        Ok(head) => head,
+        Err(EcObjectReadError::Deleted { .. }) => {
+            return Some(
+                Response::builder().status(StatusCode::NO_CONTENT).body(Body::empty()).unwrap(),
+            );
+        }
+        Err(EcObjectReadError::NotFound { .. } | EcObjectReadError::EnterpriseRequired(_)) => {
+            return None;
+        }
+        Err(error) => return Some(ec_read_error_to_response(error, query)),
+    };
+
+    match head.layout {
+        EcObjectReadLayout::HotReplicated => return None,
+        EcObjectReadLayout::ReplicatedSmall { .. }
+        | EcObjectReadLayout::PackedSegment { .. }
+        | EcObjectReadLayout::ErasureCoded { .. } => {}
+    }
+
+    let delete_hlc = write_coord.next_delete_hlc();
+    let operation_id = uuid::Uuid::new_v4();
+    match super::record_ec_delete_commit(
+        state,
+        bucket.to_string(),
+        key.to_string(),
+        None,
+        delete_hlc,
+        operation_id,
+    )
+    .await
+    {
+        Ok(()) => {
+            info!(
+                bucket = %bucket,
+                key = %key,
+                operation_id = %operation_id,
+                "recorded EC delete tombstone after hot delete path failed"
+            );
+            Some(Response::builder().status(StatusCode::NO_CONTENT).body(Body::empty()).unwrap())
+        }
+        Err(response) => Some(response),
     }
 }
 
@@ -817,9 +1282,32 @@ pub async fn delete_object(
                     "Quorum delete: bucket={}, key={}, acked={}/{}",
                     bucket, key, result.replicas_acked, result.replicas_total
                 );
+                if let Err(resp) = super::record_ec_delete_commit(
+                    &state,
+                    bucket.clone(),
+                    key.clone(),
+                    None,
+                    result.hlc,
+                    result.operation_id,
+                )
+                .await
+                {
+                    return resp;
+                }
                 Response::builder().status(StatusCode::NO_CONTENT).body(Body::empty()).unwrap()
             }
             Err(e) => {
+                if let Some(response) = try_delete_cold_ec_object_after_hot_delete_failure(
+                    &state,
+                    &bucket,
+                    &key,
+                    &query,
+                    write_coord,
+                )
+                .await
+                {
+                    return response;
+                }
                 error!("Quorum delete failed: {:?}", e);
                 cluster_error_to_response(&e)
             }
@@ -1019,6 +1507,10 @@ pub async fn head_object(
         "HeadObject: bucket={}, key={}, version_id={:?}",
         bucket, key, query.version_id
     );
+
+    if super::is_ec_cluster_pool(&state) && query.version_id.is_none() {
+        return head_ec_object_response(&state, bucket, key, &query).await;
+    }
 
     // Cluster mode: use quorum HEAD
     if let (Some(read_coord), None) = (&state.read_coordinator, &query.version_id) {
@@ -1281,7 +1773,7 @@ pub async fn get_object_tagging(
     // Extract tags from metadata
     let tags: HashMap<String, String> = record
         .metadata
-        .get("_tags")
+        .get(OBJECT_TAGS_METADATA_KEY)
         .and_then(|json| serde_json::from_str(json).ok())
         .unwrap_or_default();
 
@@ -1372,11 +1864,11 @@ pub async fn put_object_tagging(
 
     // Store tags as JSON in metadata
     if tags.is_empty() {
-        record.metadata.remove("_tags");
+        record.metadata.remove(OBJECT_TAGS_METADATA_KEY);
     } else {
         match serde_json::to_string(&tags) {
             Ok(json) => {
-                record.metadata.insert("_tags".to_string(), json);
+                record.metadata.insert(OBJECT_TAGS_METADATA_KEY.to_string(), json);
             }
             Err(_) => {
                 return S3Error::InternalError("Failed to serialize tags".to_string())
@@ -1434,7 +1926,7 @@ pub async fn delete_object_tagging(
     }
 
     // Remove tags from metadata
-    record.metadata.remove("_tags");
+    record.metadata.remove(OBJECT_TAGS_METADATA_KEY);
 
     let version_id = record.version_id.clone().unwrap_or_default();
     if let Err(e) = storage.update_object_metadata(&bucket, &key, &version_id, record).await {
@@ -1642,6 +2134,51 @@ pub async fn post_object(
     }
 
     let metadata = std::collections::HashMap::new();
+    if let Some(write_coord) = state.write_coordinator.clone() {
+        drop(storage);
+        let result =
+            match write_coord.write(&bucket, &key, &file_content, &content_type, &metadata).await {
+                Ok(result) => result,
+                Err(e) => {
+                    error!("POST Object quorum write failed: {:?}", e);
+                    return cluster_error_to_response(&e);
+                }
+            };
+
+        if super::is_ec_cluster_pool(&state) {
+            let ec_commit = super::EcPutCommitInput {
+                bucket: bucket.clone(),
+                key: key.clone(),
+                version_id: None,
+                etag: result.etag.clone(),
+                size: file_content.len() as u64,
+                content_type: content_type.clone(),
+                metadata: metadata.clone(),
+                hot_replica_nodes: result.replica_nodes,
+                content_hash_sha256: super::sha256_bytes(&file_content),
+                source_hlc: result.hlc,
+            };
+            if let Err(resp) = super::record_ec_put_commit(&state, ec_commit).await {
+                return resp;
+            }
+        }
+
+        info!(
+            "POST Object uploaded via quorum: bucket={}, key={}, size={}",
+            bucket,
+            key,
+            file_content.len()
+        );
+        return post_object_success_response(
+            &bucket,
+            &key,
+            &result.etag,
+            None,
+            &success_action_status,
+            &success_action_redirect,
+        );
+    }
+
     let result = match versioning_status {
         s4_core::types::VersioningStatus::Enabled | s4_core::types::VersioningStatus::Suspended => {
             storage
@@ -1672,36 +2209,54 @@ pub async fn post_object(
                 file_content.len()
             );
 
-            let mut builder = Response::builder().header("etag", format!("\"{}\"", etag));
-
-            if let Some(vid) = version_id {
-                builder = builder.header("x-amz-version-id", vid);
-            }
-
-            if !success_action_redirect.is_empty() {
-                builder
-                    .status(StatusCode::SEE_OTHER)
-                    .header("location", success_action_redirect)
-                    .body(Body::from(String::new()))
-                    .unwrap()
-            } else if success_action_status == "201" {
-                let xml = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<PostResponse><Bucket>{}</Bucket><Key>{}</Key><ETag>\"{}\"</ETag></PostResponse>",
-                    bucket, key, etag
-                );
-                builder
-                    .status(StatusCode::CREATED)
-                    .header("content-type", "application/xml")
-                    .body(Body::from(xml))
-                    .unwrap()
-            } else {
-                builder.status(StatusCode::NO_CONTENT).body(Body::from(String::new())).unwrap()
-            }
+            post_object_success_response(
+                &bucket,
+                &key,
+                &etag,
+                version_id,
+                &success_action_status,
+                &success_action_redirect,
+            )
         }
         Err(e) => {
             error!("POST Object failed: {:?}", e);
             S3Error::InternalError("Failed to store object".to_string()).into_response()
         }
+    }
+}
+
+fn post_object_success_response(
+    bucket: &str,
+    key: &str,
+    etag: &str,
+    version_id: Option<String>,
+    success_action_status: &str,
+    success_action_redirect: &str,
+) -> Response {
+    let mut builder = Response::builder().header("etag", format!("\"{}\"", etag));
+
+    if let Some(vid) = version_id {
+        builder = builder.header("x-amz-version-id", vid);
+    }
+
+    if !success_action_redirect.is_empty() {
+        builder
+            .status(StatusCode::SEE_OTHER)
+            .header("location", success_action_redirect)
+            .body(Body::from(String::new()))
+            .unwrap()
+    } else if success_action_status == "201" {
+        let xml = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<PostResponse><Bucket>{}</Bucket><Key>{}</Key><ETag>\"{}\"</ETag></PostResponse>",
+            bucket, key, etag
+        );
+        builder
+            .status(StatusCode::CREATED)
+            .header("content-type", "application/xml")
+            .body(Body::from(xml))
+            .unwrap()
+    } else {
+        builder.status(StatusCode::NO_CONTENT).body(Body::from(String::new())).unwrap()
     }
 }
 

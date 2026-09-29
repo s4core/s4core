@@ -4,6 +4,18 @@
 
 - Rust 1.70 or later (install via [rustup](https://rustup.rs))
 - Git
+- `protoc` (protobuf compiler) for the cluster gRPC code generation
+- `nasm` 2.14 or newer, on x86_64 only
+
+`nasm` assembles the vendored Intel ISA-L sources in `ee/s4-codec-isal`, which
+back the accelerated erasure coding codec. Any command that covers the whole
+workspace builds that crate, so `nasm` is needed even without the `isal`
+feature. On aarch64 the crate compiles to nothing and `nasm` is not used.
+
+```bash
+# Debian / Ubuntu
+apt-get install -y nasm protobuf-compiler
+```
 
 ## Build Commands
 
@@ -16,9 +28,29 @@ cargo build --workspace
 
 # Build release binary (optimized)
 cargo build --release
+
+# Enterprise Edition
+cargo build --release --features enterprise
+
+# Enterprise Edition with ISA-L accelerated erasure coding (x86_64 only).
+# `isal` implies `enterprise`.
+cargo build --release --features isal
 ```
 
 The release binary is at `target/release/s4-server`.
+
+## Benchmarks
+
+```bash
+# Portable codec baseline, all six EC profiles
+cargo bench -p s4-codec
+
+# Portable engine against ISA-L, in one process
+cargo bench -p s4-codec-isal
+```
+
+Recorded results live next to the plan that produced them, in
+`plans/S4-FEDERATION/ALGORITHM-S4-FEDERATION/ERASURE-CODING/EC-v2/adr/`.
 
 ## Running Tests
 

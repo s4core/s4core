@@ -43,6 +43,10 @@ pub enum ClusterError {
     #[error("RPC error: {0}")]
     Rpc(String),
 
+    /// The peer explicitly does not implement this RPC (not a network failure).
+    #[error("RPC is not implemented by peer: {0}")]
+    RpcUnimplemented(String),
+
     /// TLS configuration error.
     #[error("TLS error: {0}")]
     Tls(String),
@@ -58,6 +62,14 @@ pub enum ClusterError {
     /// Data placement error (routing, hash ring, bucket assignment).
     #[error("placement error: {0}")]
     Placement(String),
+
+    /// EC pool has no erasure set left that can take a new object.
+    ///
+    /// Distinct from `Placement`: the cluster is healthy and routing works,
+    /// the pool is simply out of space. The operator action differs — add a
+    /// set or free space, rather than repair the cluster.
+    #[error("insufficient storage capacity: {0}")]
+    InsufficientCapacity(String),
 
     /// Quorum write did not reach the required number of replicas.
     #[error("quorum not met: needed {needed}, got {achieved}")]
@@ -84,6 +96,16 @@ pub enum ClusterError {
     /// A quorum read operation timed out waiting for replica responses.
     #[error("read timeout after {0:?}")]
     ReadTimeout(std::time::Duration),
+
+    /// The cluster cannot answer right now, and nothing is broken.
+    ///
+    /// Kept apart from [`ClusterError::Storage`] because the two mean opposite
+    /// things to a caller: a storage error is a fault to investigate, while
+    /// this is a healthy cluster that is missing too many replicas to answer
+    /// safely. HTTP says the same with 503 rather than 500, and answering 500
+    /// here would send an operator looking for a bug that is not there.
+    #[error("{0}")]
+    Unavailable(String),
 
     /// Object not found on any replica.
     #[error("object not found: {bucket}/{key}")]

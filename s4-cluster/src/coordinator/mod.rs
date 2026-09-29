@@ -31,6 +31,6 @@ pub use read::{
     QuorumHeadResult, QuorumReadCoordinator, QuorumReadResult, QuorumReadStreamResult, ReadTimeouts,
 };
 pub use write::{
-    QuorumMultipartCompleteResult, QuorumMultipartCreateResult, QuorumMultipartPartResult,
-    QuorumWriteCoordinator, WriteTimeouts,
+    QuorumMultipartCompleteResult, QuorumMultipartCreateResult, QuorumMultipartListPartsResult,
+    QuorumMultipartPartResult, QuorumWriteCoordinator, WriteTimeouts,
 };

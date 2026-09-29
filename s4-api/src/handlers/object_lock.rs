@@ -199,6 +199,7 @@ pub struct ObjectVersionQuery {
 /// latest version by calling `head_object` and extracting its `version_id`.
 /// For unversioned objects (where `version_id` is `None`), returns `"null"`
 /// which is the S3-standard sentinel for the current version.
+#[allow(clippy::result_large_err)]
 async fn resolve_version_id(
     storage: &dyn s4_core::StorageEngine,
     bucket: &str,

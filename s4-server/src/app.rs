@@ -248,7 +248,10 @@ impl App {
             self.config.server.max_upload_size,
             &self.config.storage.data_path,
         )
-        .await;
+        .await
+        .with_default_bucket_storage_class(
+            self.config.cluster.pool_storage_class().map_err(|e| anyhow::anyhow!(e))?,
+        );
         if let Some(handle) = prometheus_handle {
             state = state.with_prometheus_handle(handle);
         }
@@ -270,6 +273,12 @@ impl App {
                 cs.read_coordinator.clone(),
                 cs.list_coordinator.clone(),
             );
+            if let Some(ec_admin_service) = cs.ec_admin_service.clone() {
+                state = state.with_ec_admin_service(ec_admin_service);
+            }
+            if let Some(ec_object_runtime) = cs.ec_object_runtime.clone() {
+                state = state.with_ec_object_runtime(ec_object_runtime);
+            }
 
             Some(cs)
         } else {

@@ -220,6 +220,15 @@ impl LifecycleWorker {
                 continue;
             }
 
+            // Erasure-coded objects are listed here — their namespace entry
+            // survives the move to EC — but expiring one means deleting shards
+            // across a pool, not a local blob. Doing that from this worker would
+            // drop the entry on one node and leave the shards behind, so it is
+            // left to the EC runtime's own delete path.
+            if record.is_erasure_coded() {
+                continue;
+            }
+
             // Evaluate all rules against this object
             for rule in rules {
                 let result =

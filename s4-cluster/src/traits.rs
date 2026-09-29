@@ -273,6 +273,7 @@ mod tests {
             replication_factor: None,
             write_quorum: None,
             read_quorum: None,
+            storage_class: s4_core::types::StorageClass::Standard,
         };
         let err = replacer
             .replace_node(&pool, NodeId::generate(), NodeId::generate())

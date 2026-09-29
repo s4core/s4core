@@ -1,0 +1,172 @@
+# S4Core Enterprise Edition — development cluster WITHOUT erasure coding.
+#
+# What starts: one ordinary replicated pool (S4_POOL_TYPE=standard) of six nodes
+# with RF=3, W=2, R=2, and HAProxy round-robin in front of them. Every object is
+# kept as three full copies on three of the six nodes. Six nodes in one pool is
+# above the Community Edition limit of three, so the nodes need a valid
+# Enterprise license; without one they refuse the topology and do not start.
+# For an Enterprise cluster with erasure coding use ee/docker-compose-dev.yml.
+#
+# License: the license file is not part of the repository: it is issued by the
+# S4Core sales team — contact support@s4core.com. Save it as ee/license-key.txt,
+# or point S4_LICENSE_HOST_FILE at it:
+#   S4_LICENSE_HOST_FILE=/absolute/path/to/license.key docker compose -f ee/docker-compose-dev-no-ec.yml up -d
+# Without the file compose refuses to start the nodes.
+#
+# Image: s4core/s4core:ee by default; S4_EE_IMAGE selects another one, e.g. an
+# image built from this repository:
+#   docker build --build-arg EDITION=ee -t s4core-ee:local .
+#   S4_EE_IMAGE=s4core-ee:local docker compose -f ee/docker-compose-dev-no-ec.yml up -d
+#
+# Usage from the repository root:
+#   docker compose -f ee/docker-compose-dev-no-ec.yml up -d
+#   docker compose -f ee/docker-compose-dev-no-ec.yml down -v   # reset: drops the data volumes
+
+name: s4-ee-dev
+
+x-s4-node-env: &s4-node-env
+  S4_MODE: cluster
+  S4_BIND: "0.0.0.0:9000"
+  S4_CLUSTER_NAME: ee-dev
+  S4_SEEDS: "s4-ee-node1:9100,s4-ee-node2:9100,s4-ee-node3:9100,s4-ee-node4:9100,s4-ee-node5:9100,s4-ee-node6:9100"
+  S4_POOL_NAME: pool-1
+  S4_POOL_NODES: "node-1:s4-ee-node1:9100,node-2:s4-ee-node2:9100,node-3:s4-ee-node3:9100,node-4:s4-ee-node4:9100,node-5:s4-ee-node5:9100,node-6:s4-ee-node6:9100"
+  S4_POOL_TYPE: standard
+  S4_REPLICATION_FACTOR: "3"
+  S4_WRITE_QUORUM: "2"
+  S4_READ_QUORUM: "2"
+  S4_DATA_DIR: /data
+  S4_LICENSE_FILE: /run/secrets/s4-license.key
+  S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
+  S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
+  S4_MAX_UPLOAD_SIZE: ${S4_MAX_UPLOAD_SIZE:-10GB}
+  RUST_LOG: ${RUST_LOG:-s4_server=info,s4_api=info,s4_cluster=info,s4_ee=info}
+
+# Docker creates an empty directory in place of a missing bind source by
+# default, and the node would then start without a license. create_host_path:
+# false stops the start instead, with "bind source path does not exist".
+x-s4-license-volume: &s4-license-volume
+  type: bind
+  source: ${S4_LICENSE_HOST_FILE:-./license-key.txt}
+  target: /run/secrets/s4-license.key
+  read_only: true
+  bind:
+    create_host_path: false
+
+x-s4-node-common: &s4-node-common
+  image: ${S4_EE_IMAGE:-s4core/s4core:ee}
+  security_opt:
+    - ${S4_DOCKER_SECURITY_OPT:-apparmor=unconfined}
+  # The short sleep lets Docker's DNS learn every node's name before S4 resolves
+  # S4_POOL_NODES; a name that does not resolve on a first start stops the node.
+  entrypoint:
+    - /bin/sh
+    - -c
+    - 'sleep ${S4_START_DELAY_SECS:-2}; if [ -x /app/s4-server ]; then exec /app/s4-server; fi; exec /usr/local/bin/s4-server'
+  expose:
+    - "9000"
+    - "9100"
+  healthcheck:
+    test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
+    interval: 5s
+    timeout: 3s
+    start_period: 30s
+    retries: 30
+
+services:
+  haproxy:
+    image: haproxy:3.1-alpine
+    security_opt:
+      - ${S4_DOCKER_SECURITY_OPT:-apparmor=unconfined}
+    volumes:
+      - ./haproxy-ee-no-ec.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports:
+      - "${S4_EE_HTTP_PORT:-9000}:9000"
+      - "${S4_EE_HAPROXY_STATS_PORT:-8404}:8404"
+    depends_on:
+      s4-ee-node1:
+        condition: service_healthy
+      s4-ee-node2:
+        condition: service_healthy
+      s4-ee-node3:
+        condition: service_healthy
+      s4-ee-node4:
+        condition: service_healthy
+      s4-ee-node5:
+        condition: service_healthy
+      s4-ee-node6:
+        condition: service_healthy
+
+  s4-ee-node1:
+    <<: *s4-node-common
+    environment:
+      <<: *s4-node-env
+      S4_NODE_ID: node-1
+      S4_NODE_GRPC_ADDR: s4-ee-node1:9100
+      S4_NODE_HTTP_ADDR: s4-ee-node1:9000
+    volumes:
+      - s4-ee-node1:/data
+      - *s4-license-volume
+
+  s4-ee-node2:
+    <<: *s4-node-common
+    environment:
+      <<: *s4-node-env
+      S4_NODE_ID: node-2
+      S4_NODE_GRPC_ADDR: s4-ee-node2:9100
+      S4_NODE_HTTP_ADDR: s4-ee-node2:9000
+    volumes:
+      - s4-ee-node2:/data
+      - *s4-license-volume
+
+  s4-ee-node3:
+    <<: *s4-node-common
+    environment:
+      <<: *s4-node-env
+      S4_NODE_ID: node-3
+      S4_NODE_GRPC_ADDR: s4-ee-node3:9100
+      S4_NODE_HTTP_ADDR: s4-ee-node3:9000
+    volumes:
+      - s4-ee-node3:/data
+      - *s4-license-volume
+
+  s4-ee-node4:
+    <<: *s4-node-common
+    environment:
+      <<: *s4-node-env
+      S4_NODE_ID: node-4
+      S4_NODE_GRPC_ADDR: s4-ee-node4:9100
+      S4_NODE_HTTP_ADDR: s4-ee-node4:9000
+    volumes:
+      - s4-ee-node4:/data
+      - *s4-license-volume
+
+  s4-ee-node5:
+    <<: *s4-node-common
+    environment:
+      <<: *s4-node-env
+      S4_NODE_ID: node-5
+      S4_NODE_GRPC_ADDR: s4-ee-node5:9100
+      S4_NODE_HTTP_ADDR: s4-ee-node5:9000
+    volumes:
+      - s4-ee-node5:/data
+      - *s4-license-volume
+
+  s4-ee-node6:
+    <<: *s4-node-common
+    environment:
+      <<: *s4-node-env
+      S4_NODE_ID: node-6
+      S4_NODE_GRPC_ADDR: s4-ee-node6:9100
+      S4_NODE_HTTP_ADDR: s4-ee-node6:9000
+    volumes:
+      - s4-ee-node6:/data
+      - *s4-license-volume
+
+volumes:
+  s4-ee-node1:
+  s4-ee-node2:
+  s4-ee-node3:
+  s4-ee-node4:
+  s4-ee-node5:
+  s4-ee-node6:

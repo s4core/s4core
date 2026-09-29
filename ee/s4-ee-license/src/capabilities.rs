@@ -30,6 +30,9 @@ pub struct Capabilities {
     pub webdav: bool,
     /// Enable audit logging.
     pub audit_log: bool,
+    /// Enable erasure-coded storage pools.
+    #[serde(default)]
+    pub erasure_coding: bool,
 }
 
 impl Capabilities {
@@ -44,6 +47,7 @@ impl Capabilities {
             saml: false,
             webdav: false,
             audit_log: false,
+            erasure_coding: false,
         }
     }
 
@@ -59,6 +63,7 @@ impl Capabilities {
             saml: true,
             webdav: true,
             audit_log: true,
+            erasure_coding: true,
         }
     }
 }
@@ -84,6 +89,7 @@ mod tests {
         assert!(!caps.saml);
         assert!(!caps.webdav);
         assert!(!caps.audit_log);
+        assert!(!caps.erasure_coding);
     }
 
     #[test]
@@ -97,5 +103,6 @@ mod tests {
         assert!(caps.saml);
         assert!(caps.webdav);
         assert!(caps.audit_log);
+        assert!(caps.erasure_coding);
     }
 }

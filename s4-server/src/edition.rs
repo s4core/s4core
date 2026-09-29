@@ -128,6 +128,7 @@ fn limits_from_capabilities(caps: &s4_ee::Capabilities) -> ClusterLimits {
         allow_external_auth: caps.ldap || caps.saml,
         allow_webdav: caps.webdav,
         allow_audit_log: caps.audit_log,
+        allow_erasure_coding: caps.erasure_coding,
     }
 }
 
@@ -263,6 +264,7 @@ mod tests_ee {
         assert!(limits.allow_external_auth);
         assert!(limits.allow_webdav);
         assert!(limits.allow_audit_log);
+        assert!(limits.allow_erasure_coding);
         // _guard drops here → clear_env() runs automatically.
     }
 
@@ -324,6 +326,7 @@ mod tests_ee {
             replication_factor: None,
             write_quorum: None,
             read_quorum: None,
+            storage_class: s4_core::types::StorageClass::Standard,
         };
         let config = ClusterConfig {
             pools: vec![pool],

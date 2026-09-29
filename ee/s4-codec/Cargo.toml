@@ -1,0 +1,34 @@
+[package]
+name = "s4-codec"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+repository.workspace = true
+license = "Elastic-2.0"
+description = "S4Core Enterprise Edition erasure coding codec engine"
+
+[dependencies]
+bytes = { workspace = true }
+crc32fast = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+# Baseline for EC v2 plan 01 (ISA-L FFI). The numbers this produces are the
+# reference the SIMD codec is compared against.
+[[bench]]
+name = "codec_bench"
+harness = false
+
+# What each LRC recovery route costs, for EC v2 plan 06 (Full Unified LRC
+# Solver). The solver is a fallback reached where nothing else reaches, so the
+# comparison is between routes, not between implementations of one route.
+[[bench]]
+name = "lrc_bench"
+harness = false
+
+[lints]
+workspace = true

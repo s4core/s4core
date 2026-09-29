@@ -42,10 +42,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use s4_core::types::composite::{
-    MultipartPartRecord, MultipartUploadSession, MultipartUploadState,
+use s4_core::types::{
+    composite::{MultipartPartRecord, MultipartUploadSession, MultipartUploadState},
+    ObjectLayout, S4_STORAGE_CLASS_METADATA_KEY,
 };
-use s4_core::StorageEngine;
+use s4_core::{IndexRecord, StorageEngine};
 use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
@@ -57,7 +58,7 @@ use crate::config::ClusterConfig;
 use crate::error::ClusterError;
 use crate::hints::{Hint, HintOperation, HintedHandoffManager};
 use crate::hlc::{HlcTimestamp, HybridClock};
-use crate::identity::NodeId;
+use crate::identity::{NodeId, PoolId};
 use crate::placement::PlacementRouter;
 use crate::replica::MultipartReplicaStorage;
 use crate::rpc::proto;
@@ -75,6 +76,8 @@ pub struct QuorumWriteResult {
     pub replicas_acked: u8,
     /// Total number of replicas targeted.
     pub replicas_total: u8,
+    /// Replica nodes targeted by the placement router.
+    pub replica_nodes: Vec<NodeId>,
     /// HLC timestamp assigned to this write.
     pub hlc: HlcTimestamp,
 }
@@ -86,6 +89,12 @@ pub struct QuorumDeleteResult {
     pub replicas_acked: u8,
     /// Total number of replicas targeted.
     pub replicas_total: u8,
+    /// Replica nodes targeted by the placement router.
+    pub replica_nodes: Vec<NodeId>,
+    /// HLC timestamp assigned to this delete.
+    pub hlc: HlcTimestamp,
+    /// Idempotency ID assigned to this delete.
+    pub operation_id: uuid::Uuid,
 }
 
 /// Result of a quorum multipart create operation.
@@ -110,6 +119,17 @@ pub struct QuorumMultipartPartResult {
     pub replicas_total: u8,
 }
 
+/// Result of a quorum multipart ListParts operation.
+#[derive(Debug, Clone)]
+pub struct QuorumMultipartListPartsResult {
+    /// Durable part records selected from a quorum-visible replica.
+    pub parts: Vec<MultipartPartRecord>,
+    /// Number of replicas that returned upload metadata.
+    pub replicas_responded: u8,
+    /// Total number of replicas targeted.
+    pub replicas_total: u8,
+}
+
 /// Result of a quorum multipart complete operation.
 #[derive(Debug, Clone)]
 pub struct QuorumMultipartCompleteResult {
@@ -121,6 +141,8 @@ pub struct QuorumMultipartCompleteResult {
     pub replicas_acked: u8,
     /// Total number of replicas targeted.
     pub replicas_total: u8,
+    /// Replica nodes targeted by the placement router.
+    pub replica_nodes: Vec<NodeId>,
     /// HLC timestamp assigned to the completed object.
     pub hlc: HlcTimestamp,
 }
@@ -209,6 +231,21 @@ impl QuorumWriteCoordinator {
         self
     }
 
+    fn metadata_with_pool_storage_class(
+        &self,
+        pool_id: PoolId,
+        metadata: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let mut metadata = metadata.clone();
+        if let Some(pool) = self.router.pool_config(&pool_id) {
+            metadata.insert(
+                S4_STORAGE_CLASS_METADATA_KEY.to_string(),
+                pool.storage_class.as_metadata_value().to_string(),
+            );
+        }
+        metadata
+    }
+
     /// Execute a quorum write (PUT object).
     ///
     /// Fans out to all replicas, waits for W ACKs, stores hints for
@@ -222,11 +259,12 @@ impl QuorumWriteCoordinator {
         metadata: &HashMap<String, String>,
     ) -> Result<QuorumWriteResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
+        let metadata = self.metadata_with_pool_storage_class(decision.pool_id, metadata);
         let replicas = &decision.replicas;
 
         // Single-node bypass: write directly, no quorum needed
         if replicas.len() == 1 && replicas[0] == self.local_node_id {
-            return self.write_single_node(bucket, key, data, content_type, metadata).await;
+            return self.write_single_node(bucket, key, data, content_type, &metadata).await;
         }
 
         let operation_id = uuid::Uuid::new_v4().as_u128();
@@ -391,6 +429,7 @@ impl QuorumWriteCoordinator {
             etag,
             replicas_acked: acked.len() as u8,
             replicas_total,
+            replica_nodes: replicas.clone(),
             hlc,
         })
     }
@@ -401,23 +440,64 @@ impl QuorumWriteCoordinator {
         bucket: &str,
         key: &str,
     ) -> Result<QuorumDeleteResult, ClusterError> {
+        self.delete_with_expected_hlc(bucket, key, None).await
+    }
+
+    /// Execute a quorum physical purge only if replicas still store the expected HLC.
+    pub async fn delete_if_hlc(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected_source_hlc: HlcTimestamp,
+    ) -> Result<QuorumDeleteResult, ClusterError> {
+        self.delete_with_expected_hlc(bucket, key, Some(expected_source_hlc)).await
+    }
+
+    /// Allocate a coordinator HLC for metadata-only delete commits.
+    pub fn next_delete_hlc(&self) -> HlcTimestamp {
+        self.clock.now()
+    }
+
+    async fn delete_with_expected_hlc(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected_source_hlc: Option<HlcTimestamp>,
+    ) -> Result<QuorumDeleteResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
         let replicas = &decision.replicas;
+        let operation_uuid = uuid::Uuid::new_v4();
+        let operation_id = operation_uuid.as_u128();
+        let hlc = self.clock.now();
 
         // Single-node bypass
         if replicas.len() == 1 && replicas[0] == self.local_node_id {
-            self.storage
-                .delete_object(bucket, key)
-                .await
-                .map_err(|e| ClusterError::Storage(e.to_string()))?;
+            if let Some(expected) = expected_source_hlc {
+                self.storage
+                    .delete_object_if_hlc(
+                        bucket,
+                        key,
+                        expected.wall_time,
+                        expected.logical,
+                        expected.node_id,
+                    )
+                    .await
+                    .map_err(|e| ClusterError::Storage(e.to_string()))?;
+            } else {
+                self.storage
+                    .delete_object(bucket, key)
+                    .await
+                    .map_err(|e| ClusterError::Storage(e.to_string()))?;
+            }
             return Ok(QuorumDeleteResult {
                 replicas_acked: 1,
                 replicas_total: 1,
+                replica_nodes: replicas.clone(),
+                hlc,
+                operation_id: operation_uuid,
             });
         }
 
-        let operation_id = uuid::Uuid::new_v4().as_u128();
-        let hlc = self.clock.now();
         let replicas_total = replicas.len() as u8;
 
         let mut handles = Vec::with_capacity(replicas.len());
@@ -430,7 +510,22 @@ impl QuorumWriteCoordinator {
                 let timeout_dur = self.timeouts.replica_write_timeout;
 
                 tokio::spawn(async move {
-                    let result = timeout(timeout_dur, storage.delete_object(&bucket, &key)).await;
+                    let result = if let Some(expected) = expected_source_hlc {
+                        timeout(
+                            timeout_dur,
+                            storage.delete_object_if_hlc(
+                                &bucket,
+                                &key,
+                                expected.wall_time,
+                                expected.logical,
+                                expected.node_id,
+                            ),
+                        )
+                        .await
+                        .map(|inner| inner.map(|_| ()))
+                    } else {
+                        timeout(timeout_dur, storage.delete_object(&bucket, &key)).await
+                    };
                     match result {
                         Ok(Ok(())) => ReplicaResult::Success {
                             node_id,
@@ -456,6 +551,7 @@ impl QuorumWriteCoordinator {
                     operation_id: operation_id.to_be_bytes().to_vec(),
                     topology_epoch: self.topology_epoch,
                     version_id: None,
+                    expected_source_hlc: expected_source_hlc.map(|hlc| hlc.to_proto()),
                 };
                 let timeout_dur = self.timeouts.replica_write_timeout;
 
@@ -502,15 +598,27 @@ impl QuorumWriteCoordinator {
         // Store hints for every replica that did not ACK before quorum.
         let hint_nodes = unacked_replica_nodes(replicas, &results, None);
         for node_id in &hint_nodes {
-            let hint = Hint {
-                target_node: node_id.0,
-                operation: HintOperation::Delete {
+            let operation = if let Some(expected) = expected_source_hlc {
+                HintOperation::DeleteIfHlc {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    expected_source_hlc: expected,
+                    operation_id: operation_id.to_be_bytes().to_vec(),
+                    version_id: None,
+                    topology_epoch: self.topology_epoch,
+                }
+            } else {
+                HintOperation::Delete {
                     bucket: bucket.to_string(),
                     key: key.to_string(),
                     operation_id: operation_id.to_be_bytes().to_vec(),
                     version_id: None,
                     topology_epoch: self.topology_epoch,
-                },
+                }
+            };
+            let hint = Hint {
+                target_node: node_id.0,
+                operation,
                 created_at: crate::hlc::now_millis(),
                 ttl_ms: Duration::from_secs(3 * 3600).as_millis() as u64,
             };
@@ -527,7 +635,501 @@ impl QuorumWriteCoordinator {
         Ok(QuorumDeleteResult {
             replicas_acked: acked,
             replicas_total,
+            replica_nodes: replicas.clone(),
+            hlc,
+            operation_id: operation_uuid,
         })
+    }
+
+    /// Release the replicas' local copies of an object, keeping it in the
+    /// namespace with an erasure-coded layout.
+    ///
+    /// This is the cutover step of a hot-to-EC migration. It is a write, not a
+    /// delete: the object keeps its size, ETag, metadata and its place in every
+    /// listing, and only the bytes move. Deleting instead — which is what this
+    /// replaces — left the object readable by key but invisible to anything
+    /// that enumerates a bucket, including lifecycle rules.
+    ///
+    /// Guarded by `expected_source_hlc`, so an object overwritten while the
+    /// transcode was in flight is left untouched on every replica.
+    ///
+    /// A replica that does not ACK keeps its hot copy: nothing is lost and the
+    /// object stays listable there, but that node's space is reclaimed later,
+    /// by EC reconciliation rather than by a hint.
+    pub async fn detach_object_data_if_hlc(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected_source_hlc: HlcTimestamp,
+        erasure_set_id: u64,
+        ec_topology_epoch: u64,
+    ) -> Result<QuorumDeleteResult, ClusterError> {
+        let layout = ObjectLayout::ErasureCoded {
+            erasure_set_id,
+            topology_epoch: ec_topology_epoch,
+        };
+        let decision = self.router.route(bucket, key)?;
+        let replicas = &decision.replicas;
+        let operation_uuid = uuid::Uuid::new_v4();
+        let operation_id = operation_uuid.as_u128();
+        let hlc = self.clock.now();
+
+        // Single-node bypass
+        if replicas.len() == 1 && replicas[0] == self.local_node_id {
+            self.storage
+                .detach_object_data_if_hlc(
+                    bucket,
+                    key,
+                    expected_source_hlc.wall_time,
+                    expected_source_hlc.logical,
+                    expected_source_hlc.node_id,
+                    layout,
+                )
+                .await
+                .map_err(|e| ClusterError::Storage(e.to_string()))?;
+            return Ok(QuorumDeleteResult {
+                replicas_acked: 1,
+                replicas_total: 1,
+                replica_nodes: replicas.clone(),
+                hlc,
+                operation_id: operation_uuid,
+            });
+        }
+
+        let replicas_total = replicas.len() as u8;
+        let mut handles = Vec::with_capacity(replicas.len());
+
+        for &node_id in replicas {
+            let handle = if node_id == self.local_node_id {
+                let storage = self.storage.clone();
+                let bucket = bucket.to_string();
+                let key = key.to_string();
+                let timeout_dur = self.timeouts.replica_write_timeout;
+                let layout = layout.clone();
+
+                tokio::spawn(async move {
+                    let result = timeout(
+                        timeout_dur,
+                        storage.detach_object_data_if_hlc(
+                            &bucket,
+                            &key,
+                            expected_source_hlc.wall_time,
+                            expected_source_hlc.logical,
+                            expected_source_hlc.node_id,
+                            layout,
+                        ),
+                    )
+                    .await;
+
+                    match result {
+                        Ok(Ok(_)) => ReplicaResult::Success {
+                            node_id,
+                            etag: String::new(),
+                        },
+                        Ok(Err(e)) => ReplicaResult::Failure {
+                            node_id,
+                            error: format!("local detach error: {e}"),
+                        },
+                        Err(_) => ReplicaResult::Failure {
+                            node_id,
+                            error: "local detach timeout".into(),
+                        },
+                    }
+                })
+            } else {
+                let client = self.rpc_client.clone();
+                let request = proto::DetachObjectDataRequest {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    coordinator_id: self.local_node_id.to_bytes().to_vec(),
+                    operation_id: operation_id.to_be_bytes().to_vec(),
+                    topology_epoch: self.topology_epoch,
+                    expected_source_hlc: Some(expected_source_hlc.to_proto()),
+                    erasure_set_id,
+                    ec_topology_epoch,
+                };
+                let timeout_dur = self.timeouts.replica_write_timeout;
+
+                tokio::spawn(async move {
+                    let result = timeout(
+                        timeout_dur,
+                        client.send_detach_object_data(node_id, request),
+                    )
+                    .await;
+                    match result {
+                        Ok(Ok(resp)) if resp.success => ReplicaResult::Success {
+                            node_id,
+                            etag: String::new(),
+                        },
+                        Ok(Ok(resp)) if resp.epoch_mismatch => {
+                            ReplicaResult::EpochMismatch { node_id }
+                        }
+                        Ok(Ok(resp)) => ReplicaResult::Failure {
+                            node_id,
+                            error: resp.error,
+                        },
+                        Ok(Err(e)) => ReplicaResult::Failure {
+                            node_id,
+                            error: e.to_string(),
+                        },
+                        Err(_) => ReplicaResult::Failure {
+                            node_id,
+                            error: "replica detach timeout".into(),
+                        },
+                    }
+                })
+            };
+
+            handles.push(handle);
+        }
+
+        let results = self.collect_quorum_results(handles, self.write_quorum).await?;
+        let acked = results.iter().filter(|r| r.is_success()).count() as u8;
+
+        if acked < self.write_quorum {
+            return Err(ClusterError::QuorumNotMet {
+                needed: self.write_quorum,
+                achieved: acked,
+            });
+        }
+
+        Ok(QuorumDeleteResult {
+            replicas_acked: acked,
+            replicas_total,
+            replica_nodes: replicas.clone(),
+            hlc,
+            operation_id: operation_uuid,
+        })
+    }
+
+    /// Put the object's bytes back on its replicas, undoing a detach.
+    ///
+    /// This is the cutover step of an EC-to-hot promotion. `data` is the object
+    /// decoded from its shards once, by the caller, and handed to every replica
+    /// unchanged, so all of them store the same blob and the object keeps its
+    /// size, ETag, metadata, timestamps and generation.
+    ///
+    /// Guarded by `expected_source_hlc` for a stronger reason than its mirror:
+    /// a client PUT that landed while the shards were being decoded is newer
+    /// than these bytes, and writing them over it would roll the object back.
+    ///
+    /// `replicas_acked` counts only the replicas that actually took the bytes,
+    /// not the ones that merely answered. The caller is expected to compare it
+    /// against `replicas_total` and treat anything less as unfinished: unlike
+    /// the detach, where a replica that kept its copy still serves the object,
+    /// a replica left erasure coded answers a reader on the hot path with "these
+    /// bytes are shards in the pool". Reaching write quorum is enough to make
+    /// the object durable but not enough to make it readable everywhere.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterError::QuorumNotMet`] when fewer than the write quorum
+    /// of replicas took the bytes.
+    pub async fn attach_object_data_if_hlc(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        expected_source_hlc: HlcTimestamp,
+    ) -> Result<QuorumDeleteResult, ClusterError> {
+        let decision = self.router.route(bucket, key)?;
+        let replicas = &decision.replicas;
+        let operation_uuid = uuid::Uuid::new_v4();
+        let operation_id = operation_uuid.as_u128();
+        let hlc = self.clock.now();
+
+        // Single-node bypass
+        if replicas.len() == 1 && replicas[0] == self.local_node_id {
+            self.storage
+                .attach_object_data_if_hlc(
+                    bucket,
+                    key,
+                    expected_source_hlc.wall_time,
+                    expected_source_hlc.logical,
+                    expected_source_hlc.node_id,
+                    data,
+                )
+                .await
+                .map_err(|e| ClusterError::Storage(e.to_string()))?;
+            return Ok(QuorumDeleteResult {
+                replicas_acked: 1,
+                replicas_total: 1,
+                replica_nodes: replicas.clone(),
+                hlc,
+                operation_id: operation_uuid,
+            });
+        }
+
+        let replicas_total = replicas.len() as u8;
+        let mut handles = Vec::with_capacity(replicas.len());
+
+        for &node_id in replicas {
+            let handle = if node_id == self.local_node_id {
+                let storage = self.storage.clone();
+                let bucket = bucket.to_string();
+                let key = key.to_string();
+                let data = data.to_vec();
+                let timeout_dur = self.timeouts.replica_write_timeout;
+
+                tokio::spawn(async move {
+                    let result = timeout(
+                        timeout_dur,
+                        storage.attach_object_data_if_hlc(
+                            &bucket,
+                            &key,
+                            expected_source_hlc.wall_time,
+                            expected_source_hlc.logical,
+                            expected_source_hlc.node_id,
+                            &data,
+                        ),
+                    )
+                    .await;
+
+                    match result {
+                        // Only a replica that actually took the bytes counts.
+                        // One that answered "the generation does not match" is
+                        // still serving the object out of the pool, and a
+                        // promotion that went ahead without it would leave a
+                        // replica answering "these bytes are shards" to a
+                        // reader sent down the hot path.
+                        Ok(Ok(true)) => ReplicaResult::Success {
+                            node_id,
+                            etag: String::new(),
+                        },
+                        Ok(Ok(false)) => ReplicaResult::Failure {
+                            node_id,
+                            error: "local attach found no matching generation".into(),
+                        },
+                        Ok(Err(e)) => ReplicaResult::Failure {
+                            node_id,
+                            error: format!("local attach error: {e}"),
+                        },
+                        Err(_) => ReplicaResult::Failure {
+                            node_id,
+                            error: "local attach timeout".into(),
+                        },
+                    }
+                })
+            } else {
+                let client = self.rpc_client.clone();
+                let request = proto::AttachObjectDataRequest {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    coordinator_id: self.local_node_id.to_bytes().to_vec(),
+                    operation_id: operation_id.to_be_bytes().to_vec(),
+                    topology_epoch: self.topology_epoch,
+                    expected_source_hlc: Some(expected_source_hlc.to_proto()),
+                    data: data.to_vec(),
+                };
+                let timeout_dur = self.timeouts.replica_write_timeout;
+
+                tokio::spawn(async move {
+                    let result = timeout(
+                        timeout_dur,
+                        client.send_attach_object_data(node_id, request),
+                    )
+                    .await;
+                    match result {
+                        // As above: success is not enough, the replica has to
+                        // have taken the bytes.
+                        Ok(Ok(resp)) if resp.success && resp.attached => ReplicaResult::Success {
+                            node_id,
+                            etag: String::new(),
+                        },
+                        Ok(Ok(resp)) if resp.epoch_mismatch => {
+                            ReplicaResult::EpochMismatch { node_id }
+                        }
+                        Ok(Ok(resp)) if resp.success => ReplicaResult::Failure {
+                            node_id,
+                            error: "replica attach found no matching generation".into(),
+                        },
+                        Ok(Ok(resp)) => ReplicaResult::Failure {
+                            node_id,
+                            error: resp.error,
+                        },
+                        Ok(Err(e)) => ReplicaResult::Failure {
+                            node_id,
+                            error: e.to_string(),
+                        },
+                        Err(_) => ReplicaResult::Failure {
+                            node_id,
+                            error: "replica attach timeout".into(),
+                        },
+                    }
+                })
+            };
+
+            handles.push(handle);
+        }
+
+        let results = self.collect_quorum_results(handles, self.write_quorum).await?;
+        let acked = results.iter().filter(|r| r.is_success()).count() as u8;
+
+        if acked < self.write_quorum {
+            return Err(ClusterError::QuorumNotMet {
+                needed: self.write_quorum,
+                achieved: acked,
+            });
+        }
+
+        Ok(QuorumDeleteResult {
+            replicas_acked: acked,
+            replicas_total,
+            replica_nodes: replicas.clone(),
+            hlc,
+            operation_id: operation_uuid,
+        })
+    }
+
+    /// Put back the namespace entry of an erasure-coded object on its replicas.
+    ///
+    /// Repair path for objects whose entry was lost — by a cutover from before
+    /// layout migration existed, or by a replica that was down when its peers
+    /// converted theirs. The record is rebuilt from the EC manifest by the
+    /// caller; replicas that already have an entry keep it.
+    ///
+    /// Issued as a quorum operation because the caller is whichever node holds
+    /// the manifest, and that is not necessarily one of the object's replicas.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClusterError::QuorumNotMet`] when fewer than the write quorum
+    /// of replicas accepted the entry.
+    pub async fn restore_namespace_entry(
+        &self,
+        bucket: &str,
+        key: &str,
+        record: &IndexRecord,
+    ) -> Result<usize, ClusterError> {
+        let decision = self.router.route(bucket, key)?;
+        let replicas = &decision.replicas;
+        let operation_id = uuid::Uuid::new_v4().as_u128();
+        let encoded = bincode::serialize(record)
+            .map_err(|error| ClusterError::Storage(format!("cannot encode entry: {error}")))?;
+
+        let mut handles = Vec::with_capacity(replicas.len());
+        let mut restored = 0usize;
+
+        for &node_id in replicas {
+            let handle = if node_id == self.local_node_id {
+                let storage = self.storage.clone();
+                let bucket = bucket.to_string();
+                let key = key.to_string();
+                let record = record.clone();
+                let timeout_dur = self.timeouts.replica_write_timeout;
+
+                tokio::spawn(async move {
+                    match timeout(
+                        timeout_dur,
+                        storage.restore_erasure_coded_entry(&bucket, &key, record),
+                    )
+                    .await
+                    {
+                        Ok(Ok(written)) => (
+                            ReplicaResult::Success {
+                                node_id,
+                                etag: String::new(),
+                            },
+                            written,
+                        ),
+                        Ok(Err(e)) => (
+                            ReplicaResult::Failure {
+                                node_id,
+                                error: format!("local namespace restore error: {e}"),
+                            },
+                            false,
+                        ),
+                        Err(_) => (
+                            ReplicaResult::Failure {
+                                node_id,
+                                error: "local namespace restore timeout".into(),
+                            },
+                            false,
+                        ),
+                    }
+                })
+            } else {
+                let client = self.rpc_client.clone();
+                let request = proto::RestoreNamespaceEntryRequest {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    record: encoded.clone(),
+                    coordinator_id: self.local_node_id.to_bytes().to_vec(),
+                    operation_id: operation_id.to_be_bytes().to_vec(),
+                    topology_epoch: self.topology_epoch,
+                };
+                let timeout_dur = self.timeouts.replica_write_timeout;
+
+                tokio::spawn(async move {
+                    match timeout(
+                        timeout_dur,
+                        client.send_restore_namespace_entry(node_id, request),
+                    )
+                    .await
+                    {
+                        Ok(Ok(resp)) if resp.success => (
+                            ReplicaResult::Success {
+                                node_id,
+                                etag: String::new(),
+                            },
+                            resp.restored,
+                        ),
+                        Ok(Ok(resp)) if resp.epoch_mismatch => {
+                            (ReplicaResult::EpochMismatch { node_id }, false)
+                        }
+                        Ok(Ok(resp)) => (
+                            ReplicaResult::Failure {
+                                node_id,
+                                error: resp.error,
+                            },
+                            false,
+                        ),
+                        Ok(Err(e)) => (
+                            ReplicaResult::Failure {
+                                node_id,
+                                error: e.to_string(),
+                            },
+                            false,
+                        ),
+                        Err(_) => (
+                            ReplicaResult::Failure {
+                                node_id,
+                                error: "replica namespace restore timeout".into(),
+                            },
+                            false,
+                        ),
+                    }
+                })
+            };
+
+            handles.push(handle);
+        }
+
+        let mut acked = 0u8;
+        for handle in handles {
+            match handle.await {
+                Ok((result, written)) => {
+                    if result.is_success() {
+                        acked = acked.saturating_add(1);
+                    }
+                    if written {
+                        restored = restored.saturating_add(1);
+                    }
+                }
+                Err(error) => {
+                    error!(error = %error, "namespace restore task panicked");
+                }
+            }
+        }
+
+        if acked < self.write_quorum {
+            return Err(ClusterError::QuorumNotMet {
+                needed: self.write_quorum,
+                achieved: acked,
+            });
+        }
+
+        Ok(restored)
     }
 
     /// Create a native multipart upload session on a quorum of replicas.
@@ -540,6 +1142,7 @@ impl QuorumWriteCoordinator {
         metadata: &HashMap<String, String>,
     ) -> Result<QuorumMultipartCreateResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
+        let metadata = self.metadata_with_pool_storage_class(decision.pool_id, metadata);
         let replicas = &decision.replicas;
         let operation_id = uuid::Uuid::new_v4().as_u128();
         let replicas_total = replicas.len() as u8;
@@ -1096,6 +1699,46 @@ impl QuorumWriteCoordinator {
         Ok(successes)
     }
 
+    /// List multipart parts through the same no-sticky replica inspection path
+    /// used by complete. The selected response is a quorum-visible snapshot,
+    /// not local-node state.
+    pub async fn list_multipart_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<QuorumMultipartListPartsResult, ClusterError> {
+        let replicas_total = self.router.route(bucket, key)?.replicas.len() as u8;
+        let inspections = self.inspect_multipart_upload(bucket, key, upload_id).await?;
+        let replicas_responded = inspections.len() as u8;
+
+        if inspections.is_empty() {
+            return Err(ClusterError::MultipartUploadNotFound {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        if replicas_responded < self.write_quorum {
+            return Err(ClusterError::QuorumNotMet {
+                needed: self.write_quorum,
+                achieved: replicas_responded,
+            });
+        }
+
+        let mut selected = inspections
+            .into_iter()
+            .max_by_key(|inspection| inspection.parts.len())
+            .ok_or_else(|| ClusterError::MultipartUploadNotFound {
+                upload_id: upload_id.to_string(),
+            })?;
+        selected.parts.sort_by_key(|part| part.part_number);
+
+        Ok(QuorumMultipartListPartsResult {
+            parts: selected.parts,
+            replicas_responded,
+            replicas_total,
+        })
+    }
+
     /// Complete a native multipart upload on a quorum of replicas.
     #[allow(clippy::too_many_arguments)]
     pub async fn complete_multipart_upload(
@@ -1105,8 +1748,10 @@ impl QuorumWriteCoordinator {
         upload_id: &str,
         manifest_parts: &[(u32, String)],
     ) -> Result<QuorumMultipartCompleteResult, ClusterError> {
-        let plan = self.prepare_multipart_complete(bucket, key, upload_id, manifest_parts).await?;
+        let mut plan =
+            self.prepare_multipart_complete(bucket, key, upload_id, manifest_parts).await?;
         let decision = self.router.route(bucket, key)?;
+        plan.metadata = self.metadata_with_pool_storage_class(decision.pool_id, &plan.metadata);
         let replicas = &decision.replicas;
         let operation_id = uuid::Uuid::new_v4().as_u128();
         let hlc = self.clock.now();
@@ -1264,6 +1909,7 @@ impl QuorumWriteCoordinator {
             total_size: plan.total_size,
             replicas_acked: acked,
             replicas_total,
+            replica_nodes: replicas.clone(),
             hlc,
         })
     }
@@ -1423,6 +2069,7 @@ impl QuorumWriteCoordinator {
             etag,
             replicas_acked: 1,
             replicas_total: 1,
+            replica_nodes: vec![self.local_node_id],
             hlc,
         })
     }
@@ -1442,6 +2089,7 @@ impl QuorumWriteCoordinator {
         metadata: &HashMap<String, String>,
     ) -> Result<QuorumWriteResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
+        let metadata = self.metadata_with_pool_storage_class(decision.pool_id, metadata);
         let replicas = &decision.replicas;
 
         // Single-node: nothing to replicate
@@ -1450,6 +2098,7 @@ impl QuorumWriteCoordinator {
                 etag: String::new(),
                 replicas_acked: 1,
                 replicas_total: 1,
+                replica_nodes: vec![self.local_node_id],
                 hlc: self.clock.now(),
             });
         }
@@ -1569,6 +2218,7 @@ impl QuorumWriteCoordinator {
             etag: String::new(),
             replicas_acked: acked.len() as u8 + 1, // +1 for local
             replicas_total,
+            replica_nodes: replicas.clone(),
             hlc,
         })
     }
@@ -1971,10 +2621,14 @@ async fn fanout_multipart_piece(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PoolConfig;
     use crate::gossip::GossipHandle;
     use crate::hints::HintedHandoffConfig;
+    use crate::identity::NodeAddr;
+    use crate::placement::bucket_placement::BucketPlacement;
     use crate::placement::PlacementRouter;
     use crate::rpc::NodeClientConfig;
+    use s4_core::types::StorageClass;
 
     fn setup_single_node() -> (QuorumWriteCoordinator, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
@@ -2004,6 +2658,84 @@ mod tests {
         );
 
         (coordinator, tmp)
+    }
+
+    fn setup_pool_storage_class(
+        storage_class: StorageClass,
+    ) -> (QuorumWriteCoordinator, tempfile::TempDir, PoolId) {
+        let tmp = tempfile::tempdir().unwrap();
+        let node_id = NodeId(1);
+        let pool_id = PoolId::new(7);
+        let grpc_addr = "127.0.0.1:19001".parse().unwrap();
+        let gossip = Arc::new(GossipHandle::new_for_testing(Default::default()));
+        let rpc_client = Arc::new(NodeClient::new(gossip.clone(), NodeClientConfig::default()));
+        let clock = Arc::new(HybridClock::new(node_id));
+        let hint_config = HintedHandoffConfig::new(tmp.path());
+        let hints = Arc::new(HintedHandoffManager::new(
+            hint_config,
+            gossip,
+            rpc_client.clone(),
+        ));
+        let storage = Arc::new(MockStorage);
+        let config = ClusterConfig {
+            pools: vec![PoolConfig {
+                pool_id,
+                name: "ec-pool".to_string(),
+                nodes: vec![NodeAddr {
+                    grpc_addr,
+                    http_addr: "127.0.0.1:9001".parse().unwrap(),
+                    gossip_addr: "127.0.0.1:19002".parse().unwrap(),
+                }],
+                replication_factor: Some(1),
+                write_quorum: Some(1),
+                read_quorum: Some(1),
+                storage_class,
+            }],
+            default_replication_factor: 1,
+            default_write_quorum: 1,
+            default_read_quorum: 1,
+            ..ClusterConfig::default()
+        };
+        let resolver = HashMap::from([(grpc_addr, node_id)]);
+        let router = Arc::new(
+            PlacementRouter::new(&config, node_id, BucketPlacement::new(), &resolver).unwrap(),
+        );
+
+        let coordinator = QuorumWriteCoordinator::new(
+            node_id,
+            storage,
+            rpc_client,
+            router,
+            clock,
+            hints,
+            &config,
+            WriteTimeouts::default(),
+        );
+
+        (coordinator, tmp, pool_id)
+    }
+
+    #[test]
+    fn metadata_with_pool_storage_class_overrides_reserved_key() {
+        let (coordinator, _tmp, pool_id) = setup_pool_storage_class(StorageClass::ErasureCoded);
+        let metadata = HashMap::from([
+            (
+                S4_STORAGE_CLASS_METADATA_KEY.to_string(),
+                StorageClass::Standard.as_metadata_value().to_string(),
+            ),
+            ("x-amz-meta-owner".to_string(), "alice".to_string()),
+        ]);
+
+        let metadata = coordinator.metadata_with_pool_storage_class(pool_id, &metadata);
+
+        assert_eq!(
+            metadata.get(S4_STORAGE_CLASS_METADATA_KEY).map(String::as_str),
+            Some(StorageClass::ErasureCoded.as_metadata_value())
+        );
+        assert_eq!(
+            metadata.get("x-amz-meta-owner").map(String::as_str),
+            Some("alice")
+        );
     }
 
     #[tokio::test]

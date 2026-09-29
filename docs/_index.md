@@ -12,6 +12,7 @@ S4 solves the inode exhaustion problem common with traditional file-based storag
 - **Strict Consistency** — data is fsynced before returning success
 - **Built-in Security** — IAM with role-based access control and JWT authentication
 - **Federation** — leaderless quorum replication across multiple nodes for high availability
+- **Federation Erasure Coding (EE)** — fixed-width EC pool foundation and admin diagnostics
 - **Web Admin Console** — manage buckets, users, and keys from your browser
 
 ## Quick Links
@@ -19,7 +20,7 @@ S4 solves the inode exhaustion problem common with traditional file-based storag
 - [Getting Started](01-getting-started/) — install, configure, and run S4
 - [Architecture](02-architecture/) — understand how S4 works under the hood
 - [S3 API Reference](03-s3-api/) — bucket and object operations
-- [Features](04-features/) — versioning, lifecycle, Object Lock, deduplication, federation, CORS, TLS
+- [Features](04-features/) — versioning, lifecycle, Object Lock, deduplication, federation, erasure coding, CORS, TLS
 - [IAM & Admin API](05-iam/) — users, roles, and credentials
 - [Monitoring](06-monitoring/) — Prometheus metrics and stats API
 - [Web Console](07-web-console/) — browser-based admin UI

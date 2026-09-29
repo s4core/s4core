@@ -18,7 +18,7 @@
 //! per-pool placement strategies to produce a [`PlacementDecision`]
 //! for any S3 operation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::config::{ClusterConfig, PoolConfig};
 use crate::error::ClusterError;
@@ -74,12 +74,8 @@ impl PlacementRouter {
         bucket_placement: BucketPlacement,
         node_id_resolver: &HashMap<std::net::SocketAddr, NodeId>,
     ) -> Result<Self, ClusterError> {
-        let mut strategies = HashMap::new();
-        let mut pool_configs = HashMap::new();
-
+        let mut pool_node_ids = HashMap::new();
         for pool in &config.pools {
-            let (rf, _, _) = config.effective_quorum(pool);
-
             let node_ids: Vec<NodeId> = pool
                 .nodes
                 .iter()
@@ -92,12 +88,72 @@ impl PlacementRouter {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            if pool_node_ids.insert(pool.pool_id, node_ids).is_some() {
+                return Err(ClusterError::Placement(format!(
+                    "duplicate pool ID {}",
+                    pool.pool_id
+                )));
+            }
+        }
+        Self::from_pool_node_ids(config, local_node_id, bucket_placement, &pool_node_ids)
+    }
 
-            let strategy = PlacementStrategy::new(node_ids, rf)?;
+    /// Build placement from the stable, already resolved identities of each pool.
+    ///
+    /// Addresses are transport hints, not membership keys: an absent member's
+    /// remembered address may now belong to another member. Keeping the named
+    /// roster avoids collapsing those two identities into a single map entry.
+    /// Each roster must contain one distinct identity per configured member.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing or extra rosters, duplicate pools or identities, a roster
+    /// of the wrong size, and a replication factor the roster cannot satisfy.
+    pub fn from_pool_node_ids(
+        config: &ClusterConfig,
+        local_node_id: NodeId,
+        bucket_placement: BucketPlacement,
+        pool_node_ids: &HashMap<PoolId, Vec<NodeId>>,
+    ) -> Result<Self, ClusterError> {
+        let mut strategies = HashMap::new();
+        let mut pool_configs = HashMap::new();
+        for pool in &config.pools {
+            if strategies.contains_key(&pool.pool_id) {
+                return Err(ClusterError::Placement(format!(
+                    "duplicate pool ID {}",
+                    pool.pool_id
+                )));
+            }
+            let node_ids = pool_node_ids.get(&pool.pool_id).ok_or_else(|| {
+                ClusterError::Placement(format!("no named roster for pool {}", pool.pool_id))
+            })?;
+            if node_ids.len() != pool.nodes.len() {
+                return Err(ClusterError::Placement(format!(
+                    "pool {} names {} identities for {} configured members",
+                    pool.pool_id,
+                    node_ids.len(),
+                    pool.nodes.len()
+                )));
+            }
+            let mut unique = HashSet::with_capacity(node_ids.len());
+            for id in node_ids {
+                if !unique.insert(*id) {
+                    return Err(ClusterError::Placement(format!(
+                        "duplicate NodeId {id} in pool {}",
+                        pool.pool_id
+                    )));
+                }
+            }
+            let (rf, _, _) = config.effective_quorum(pool);
+            let strategy = PlacementStrategy::new(node_ids.clone(), rf)?;
             strategies.insert(pool.pool_id, strategy);
             pool_configs.insert(pool.pool_id, pool.clone());
         }
-
+        if let Some(pool_id) = pool_node_ids.keys().find(|id| !pool_configs.contains_key(id)) {
+            return Err(ClusterError::Placement(format!(
+                "named roster for unconfigured pool {pool_id}"
+            )));
+        }
         Ok(Self {
             strategies,
             pool_configs,
@@ -284,6 +340,7 @@ mod tests {
             replication_factor: None,
             write_quorum: None,
             read_quorum: None,
+            storage_class: s4_core::types::StorageClass::Standard,
         };
 
         let config = ClusterConfig {
@@ -299,6 +356,81 @@ mod tests {
     }
 
     // -- Single-node mode -------------------------------------------------
+
+    #[test]
+    fn duplicate_node_identities_are_rejected_before_building_the_ring() {
+        let (router, _) = setup_three_node_cluster();
+        let config = ClusterConfig {
+            pools: vec![router.pool_config(&PoolId(1)).unwrap().clone()],
+            ..ClusterConfig::default()
+        };
+        let resolver = HashMap::from([
+            (addr(9100), NodeId(1)),
+            (addr(9101), NodeId(1)),
+            (addr(9102), NodeId(3)),
+        ]);
+
+        let result = PlacementRouter::new(&config, NodeId(1), BucketPlacement::new(), &resolver);
+
+        assert!(
+            result.is_err(),
+            "RF=3 must not be built from two distinct identities"
+        );
+    }
+
+    #[test]
+    fn duplicate_pool_ids_are_not_silently_overwritten() {
+        let (router, _) = setup_three_node_cluster();
+        let pool = router.pool_config(&PoolId(1)).unwrap().clone();
+        let config = ClusterConfig {
+            pools: vec![pool.clone(), pool],
+            ..ClusterConfig::default()
+        };
+        let resolver = HashMap::from([
+            (addr(9100), NodeId(1)),
+            (addr(9101), NodeId(2)),
+            (addr(9102), NodeId(3)),
+        ]);
+
+        let result = PlacementRouter::new(&config, NodeId(1), BucketPlacement::new(), &resolver);
+
+        assert!(
+            result.is_err(),
+            "a repeated pool must not replace an earlier strategy"
+        );
+    }
+
+    #[test]
+    fn named_rosters_reject_missing_extra_short_and_duplicate_members() {
+        let (router, nodes) = setup_three_node_cluster();
+        let config = ClusterConfig {
+            pools: vec![router.pool_config(&PoolId(1)).unwrap().clone()],
+            ..ClusterConfig::default()
+        };
+        for roster in [
+            HashMap::new(),
+            HashMap::from([(PoolId(1), nodes.to_vec()), (PoolId(2), nodes.to_vec())]),
+            HashMap::from([(PoolId(1), nodes[..2].to_vec())]),
+            HashMap::from([(PoolId(1), vec![nodes[0], nodes[0], nodes[2]])]),
+        ] {
+            assert!(PlacementRouter::from_pool_node_ids(
+                &config,
+                nodes[0],
+                BucketPlacement::new(),
+                &roster
+            )
+            .is_err());
+        }
+        let mut impossible = config.clone();
+        impossible.pools[0].replication_factor = Some(4);
+        assert!(PlacementRouter::from_pool_node_ids(
+            &impossible,
+            nodes[0],
+            BucketPlacement::new(),
+            &HashMap::from([(PoolId(1), nodes.to_vec())])
+        )
+        .is_err());
+    }
 
     #[test]
     fn single_node_routes_to_self() {

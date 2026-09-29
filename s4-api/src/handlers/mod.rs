@@ -24,6 +24,7 @@
 
 pub mod admin;
 pub mod admin_cluster;
+pub mod admin_ec;
 pub mod bucket;
 pub mod bucket_config;
 pub mod multipart;
@@ -83,6 +84,106 @@ pub(crate) async fn check_bucket_standalone(
     None
 }
 
+/// Return true when the current request is served by an EC cluster pool.
+pub(crate) fn is_ec_cluster_pool(state: &crate::server::AppState) -> bool {
+    state.is_cluster_mode() && state.default_bucket_storage_class.is_erasure_coded()
+}
+
+/// Compute a SHA-256 digest as a fixed-size array.
+pub(crate) fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().into()
+}
+
+/// EC metadata recorded after a normal hot RF object write has succeeded.
+pub(crate) struct EcPutCommitInput {
+    /// Bucket name.
+    pub bucket: String,
+    /// Object key.
+    pub key: String,
+    /// Optional version ID.
+    pub version_id: Option<String>,
+    /// S3 ETag returned by the hot write path.
+    pub etag: String,
+    /// Object size in bytes.
+    pub size: u64,
+    /// Object content type.
+    pub content_type: String,
+    /// Object metadata.
+    pub metadata: std::collections::HashMap<String, String>,
+    /// Hot RF replica nodes assigned by placement.
+    pub hot_replica_nodes: Vec<s4_cluster::NodeId>,
+    /// SHA-256 of the complete object bytes.
+    pub content_hash_sha256: [u8; 32],
+    /// HLC assigned by the hot write path.
+    pub source_hlc: s4_cluster::HlcTimestamp,
+}
+
+/// Record EC metadata for a committed S3 object write when the pool is EC.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn record_ec_put_commit(
+    state: &crate::server::AppState,
+    input: EcPutCommitInput,
+) -> Result<Option<s4_cluster::EcObjectPutDisposition>, axum::response::Response> {
+    if !is_ec_cluster_pool(state) {
+        return Ok(None);
+    }
+
+    let commit = s4_cluster::EcObjectPutCommit {
+        bucket: input.bucket,
+        key: input.key,
+        version_id: input.version_id,
+        etag: input.etag,
+        size: input.size,
+        content_type: input.content_type,
+        metadata: input.metadata,
+        hot_replica_nodes: input.hot_replica_nodes,
+        content_hash_sha256: input.content_hash_sha256,
+        source_hlc: input.source_hlc,
+    };
+
+    state
+        .ec_object_runtime
+        .record_put_commit(commit)
+        .await
+        .map(Some)
+        .map_err(|error| {
+            tracing::error!(error = %error, "failed to record EC object put commit");
+            cluster_error_to_response(&error)
+        })
+}
+
+/// Record EC metadata cleanup for a committed S3 object delete when the pool is EC.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn record_ec_delete_commit(
+    state: &crate::server::AppState,
+    bucket: String,
+    key: String,
+    version_id: Option<String>,
+    delete_hlc: s4_cluster::HlcTimestamp,
+    operation_id: uuid::Uuid,
+) -> Result<(), axum::response::Response> {
+    if !is_ec_cluster_pool(state) {
+        return Ok(());
+    }
+
+    let commit = s4_cluster::EcObjectDeleteCommit {
+        bucket,
+        key,
+        version_id,
+        delete_hlc,
+        operation_id,
+    };
+
+    state.ec_object_runtime.record_delete_commit(commit).await.map_err(|error| {
+        tracing::error!(error = %error, "failed to record EC object delete commit");
+        cluster_error_to_response(&error)
+    })
+}
+
 /// Convert a cluster error into an HTTP response.
 ///
 /// Shared by all handlers that interact with cluster coordinators.
@@ -105,6 +206,10 @@ pub(crate) fn cluster_error_to_response(
         s4_cluster::ClusterError::MultipartPartTooSmall { .. } => {
             S3Error::EntityTooSmall.into_response()
         }
+        s4_cluster::ClusterError::EnterpriseRequired(message)
+        | s4_cluster::ClusterError::LicenseLimit(message) => {
+            (StatusCode::FORBIDDEN, message.clone()).into_response()
+        }
         s4_cluster::ClusterError::QuorumNotMet { .. }
         | s4_cluster::ClusterError::WriteTimeout(_)
         | s4_cluster::ClusterError::ReadTimeout(_) => axum::response::Response::builder()
@@ -115,6 +220,9 @@ pub(crate) fn cluster_error_to_response(
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body(Body::from("Cluster topology is changing, retry"))
             .unwrap(),
+        s4_cluster::ClusterError::InsufficientCapacity(_) => {
+            S3Error::InsufficientStorage.into_response()
+        }
         s4_cluster::ClusterError::Placement(msg) if msg.contains("no pool") => {
             S3Error::NoSuchBucket.into_response()
         }

@@ -7,6 +7,7 @@ S4 provides a rich set of features beyond basic object storage. This section cov
 - [Object Lock](object-lock.md) — WORM compliance (retention and legal hold)
 - [Deduplication](deduplication.md) — content-addressable storage with SHA-256
 - [Federation](federation.md) — leaderless distributed mode with quorum replication
+- [Federation Erasure Coding](erasure-coding.md) — Enterprise-only EC pool foundation and admin surface
 - [CORS](cors.md) — cross-origin resource sharing for browser access
 - [TLS](tls.md) — encrypted connections (HTTPS)
 - [Compaction](compaction.md) — background garbage collection for volume files

@@ -22,6 +22,7 @@ S4 is a high-performance, S3-compatible object storage server written in Rust. I
 - **S3 Select SQL**: Query CSV/JSON/Parquet objects with full SQL (powered by Apache DataFusion)
 - **Multi-Object SQL**: Extended S3 Select with glob patterns for querying across multiple objects
 - **Federation**: Leaderless quorum replication for high availability (N=3, W=2, R=2)
+- **Federation Erasure Coding (EE)**: Enterprise-only fixed-width EC pool foundation and admin surface
 - **High Performance**: Optimized for single-node and distributed deployments
 
 ## Architecture
@@ -119,27 +120,27 @@ docker build --build-arg EDITION=ee -t s4-server-ee .    # EE
 
 #### Using Docker Compose
 
-The project includes a `docker-compose.yml` that runs S4 server together with the web admin console.
+The project includes `docker-compose-single-node.yml`, which runs the S4 server together with the web admin console.
 
 ```bash
 # Run full stack (server + web console)
-docker compose up --build
+docker compose -f docker-compose-single-node.yml up --build
 
 # Run in background
-docker compose up -d --build
+docker compose -f docker-compose-single-node.yml up -d --build
 
 # Run only the server
-docker compose up s4-server --build
+docker compose -f docker-compose-single-node.yml up -d --build s4core
 
-# With custom environment variables
-S4_ROOT_PASSWORD=password12345 docker compose up --build
+# With a different root password
+S4_ROOT_PASSWORD=my-strong-password docker compose -f docker-compose-single-node.yml up -d --build
 ```
 
 After startup:
 - **S4 API**: http://localhost:9000
 - **Web Console**: http://localhost:3000 (login with root credentials)
 
-**docker-compose.yml overview:**
+**docker-compose-single-node.yml overview** (health check and restart policy left out):
 
 ```yaml
 services:
@@ -151,25 +152,33 @@ services:
       - s4-data:/data
     environment:
       - S4_BIND=0.0.0.0:9000
-      - S4_ROOT_PASSWORD=${S4_ROOT_PASSWORD:-}
-      - S4_ACCESS_KEY_ID=${S4_ACCESS_KEY_ID:-}
-      - S4_SECRET_ACCESS_KEY=${S4_SECRET_ACCESS_KEY:-}
+      - S4_ROOT_USERNAME=${S4_ROOT_USERNAME:-root}
+      - S4_ROOT_PASSWORD=${S4_ROOT_PASSWORD:-password12345}
+      - S4_ACCESS_KEY_ID=${S4_ACCESS_KEY_ID:-my-access-key-one}
+      - S4_SECRET_ACCESS_KEY=${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
 
-  s4-console:
+  s4console:
     image: s4core/s4console:latest
     ports:
       - "3000:3000"
     environment:
-      - S4_BACKEND_URL=http://s4-server:9000
+      - S4_BACKEND_URL=http://s4core:9000
     depends_on:
-      - s4core
+      s4core:
+        condition: service_healthy
 ```
+
+A three-node cluster behind HAProxy is in `docker-compose-cluster.yml` (released image) and
+`docker-compose-cluster-dev.yml` (built from source) — see
+[Cluster Deployment](docs/08-deployment/clustering.md#docker-compose).
 
 For web console-only development, see [frontend/README.md](frontend/README.md).
 
 ### Environment Variables
 
-S4 is configured through environment variables:
+S4 is configured through environment variables. The table below covers the common ones; the
+complete reference — including erasure coding and licensing — is in
+[docs/01-getting-started/configuration.md](docs/01-getting-started/configuration.md).
 
 | Variable | Description | Default | Example |
 |----------|-------------|---------|---------|
@@ -201,11 +210,13 @@ S4 is configured through environment variables:
 | `S4_MODE` | Operating mode: `single`, `cluster`, `gateway` | `single` | `cluster` |
 | `S4_CLUSTER_NAME` | Cluster name for network isolation | `default` | `production` |
 | `S4_NODE_ID` | Human-readable node name | Auto | `node-1` |
+| `S4_EXPECTED_NODE_IDENTITY` | Cluster identity (UUID) this data directory must belong to; node replacement tool | unset | `0d3bb4d8-…` |
 | `S4_NODE_GRPC_ADDR` | gRPC address for inter-node communication | — | `10.0.1.1:9100` |
 | `S4_NODE_HTTP_ADDR` | HTTP address advertised to cluster | — | `10.0.1.1:9000` |
 | `S4_SEEDS` | Comma-separated seed gRPC addresses | — | `10.0.1.1:9100,10.0.1.2:9100` |
 | `S4_POOL_NAME` | Pool this node belongs to | — | `pool-1` |
 | `S4_POOL_NODES` | Pool members (`id:addr,...`) | — | `node-1:10.0.1.1:9100,...` |
+| `S4_POOL_TYPE` | Pool storage type: `standard` or `ec` | `standard` | `ec` |
 | `S4_REPLICATION_FACTOR` | Replication factor (N) | `3` | `3` |
 | `S4_WRITE_QUORUM` | Write quorum (W) | `2` | `2` |
 | `S4_READ_QUORUM` | Read quorum (R) | `2` | `2` |
@@ -526,6 +537,14 @@ S4_SECRET_ACCESS_KEY=mysecretkey \
 
 For detailed architecture, Docker Compose examples, and configuration reference, see [docs/04-features/federation.md](docs/04-features/federation.md).
 
+### S4 Federation Erasure Coding (Enterprise)
+
+S4 Federation Erasure Coding is an Enterprise Edition feature enabled with `S4_POOL_TYPE=ec` in cluster mode and a license that includes the `erasure_coding` capability.
+
+Current v1 status: the Enterprise runtime wires staged hot RF=3 writes, transcode workers, EC cutover reads, repair, anti-entropy, scrub, tombstone/orphan GC, hot-copy purge gates, metrics, and admin diagnostics. EC health reports `runtime_ready` for active runtime wiring and keeps `production_ready=false` unless the EE artifact was built after the EC v1 readiness suite with `S4_EC_V1_CI_ACCEPTANCE_PASSED=true`.
+
+For EE setup, profiles, environment variables, and cluster examples, see [ee/README.md](ee/README.md#s4-federation-erasure-coding) and [docs/04-features/erasure-coding.md](docs/04-features/erasure-coding.md).
+
 ### CORS Configuration
 
 S4 supports S3-compatible CORS (Cross-Origin Resource Sharing) for browser-based access.
@@ -623,4 +642,4 @@ EE source code is available for audit. Using EE features in production requires 
 
 ## Status
 
-🚧 **Early Development** - S4 is currently in active development. Not ready for production use.
+🚧 **Production Release** - S4 v 1.1.0 is currently ready for production use.

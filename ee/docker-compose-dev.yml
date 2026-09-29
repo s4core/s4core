@@ -1,212 +1,188 @@
-# S4Core Enterprise Edition — Multi-Pool Cluster Example
+# S4Core Enterprise Edition — development cluster WITH erasure coding (EC).
 #
-# This compose file demonstrates EE capabilities: 2 pools, 6 nodes.
-# CE is limited to 1 pool / 3 nodes — this configuration requires a valid license.
+# What starts: one erasure-coded pool (S4_POOL_TYPE=ec) with the ec-rs-small
+# profile, RS(4,2) — 4 data and 2 parity shards, one shard per node, hence six
+# nodes — and HAProxy round-robin in front of them. Objects of at least
+# S4_EC_MIN_OBJECT_SIZE (1 MiB here) are written at RF=3 first and transcoded
+# into EC shards in the background; smaller objects stay at RF=3.
+# For an Enterprise cluster without erasure coding use
+# ee/docker-compose-dev-no-ec.yml.
 #
-# Usage:
-#   S4_LICENSE_KEY=<your-key> docker compose -f ee/docker-compose-dev.yml up
+# Image: an EE image that includes erasure coding — s4core/s4core:ee from the
+# first release that ships EC, or an image built from this repository:
+#   docker build --build-arg EDITION=ee -t s4core-ee:local .
+#   S4_EE_IMAGE=s4core-ee:local docker compose -f ee/docker-compose-dev.yml up -d
+# An EE image from before erasure coding ignores every S4_EC_* variable and
+# starts an ordinary replicated pool instead.
 #
-# Without S4_LICENSE_KEY, nodes will start in CE mode and reject the topology
-# (too many pools/nodes for Community Edition).
+# License: erasure coding needs an Enterprise license with the erasure_coding
+# capability. The license file is not part of the repository: it is issued by
+# the S4Core sales team — contact support@s4core.com. Save it as
+# ee/license-key.txt, or point S4_LICENSE_HOST_FILE at it:
+#   S4_LICENSE_HOST_FILE=/absolute/path/to/license.key docker compose -f ee/docker-compose-dev.yml up -d
+# Without the file compose refuses to start the nodes.
 #
-#
-# -**Multi-pool cluster** (EE only — requires license):
-#
-# ```bash
-# S4_LICENSE_KEY=<your-key> docker compose -f ee/docker-compose-dev.yml up
-# ```
-# This file is a 2-pool / 6-node example that demonstrates EE scaling beyond CE limits.
+# Usage from the repository root:
+#   docker compose -f ee/docker-compose-dev.yml up -d
+#   docker compose -f ee/docker-compose-dev.yml down -v   # reset: drops the data volumes
+
+name: s4-ee-ec-dev
+
+x-s4-node-env: &s4-node-env
+  S4_MODE: cluster
+  S4_BIND: "0.0.0.0:9000"
+  S4_CLUSTER_NAME: ee-ec-dev
+  S4_SEEDS: "s4-ee-node1:9100,s4-ee-node2:9100,s4-ee-node3:9100,s4-ee-node4:9100,s4-ee-node5:9100,s4-ee-node6:9100"
+  S4_POOL_NAME: pool-1
+  S4_POOL_NODES: "node-1:s4-ee-node1:9100,node-2:s4-ee-node2:9100,node-3:s4-ee-node3:9100,node-4:s4-ee-node4:9100,node-5:s4-ee-node5:9100,node-6:s4-ee-node6:9100"
+  S4_POOL_TYPE: ec
+  S4_REPLICATION_FACTOR: "3"
+  S4_WRITE_QUORUM: "2"
+  S4_READ_QUORUM: "2"
+  S4_EC_PROFILE: ec-rs-small
+  S4_EC_MIN_OBJECT_SIZE: ${S4_EC_MIN_OBJECT_SIZE:-1048576}
+  S4_EC_CHUNK_SIZE: ${S4_EC_CHUNK_SIZE:-1048576}
+  S4_EC_TOPOLOGY_POLICY: strict
+  S4_EC_NODE_TOPOLOGY: "node-1:zone=z1,rack=r1,host=h1,disk_group=d1;node-2:zone=z2,rack=r2,host=h2,disk_group=d2;node-3:zone=z3,rack=r3,host=h3,disk_group=d3;node-4:zone=z4,rack=r4,host=h4,disk_group=d4;node-5:zone=z5,rack=r5,host=h5,disk_group=d5;node-6:zone=z6,rack=r6,host=h6,disk_group=d6"
+  S4_EC_TRANSCODE_ENABLED: "true"
+  S4_EC_INLINE_WRITE_ENABLED: "false"
+  S4_EC_HOT_PURGE_MODE: auto
+  S4_EC_HOT_REPLICA_GC_GRACE_SECS: ${S4_EC_HOT_REPLICA_GC_GRACE_SECS:-30}
+  S4_DATA_DIR: /data
+  S4_LICENSE_FILE: /run/secrets/s4-license.key
+  S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-ee-ec-dev-key}
+  S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-ee-ec-dev-secret}
+  S4_ROOT_PASSWORD: ${S4_ROOT_PASSWORD:-ee-ec-root-password}
+  S4_JWT_SECRET: ${S4_JWT_SECRET:-ee-ec-dev-jwt-secret-at-least-32-bytes}
+  S4_MAX_UPLOAD_SIZE: ${S4_MAX_UPLOAD_SIZE:-10GB}
+  S4_DISABLE_AUTH: ${S4_DISABLE_AUTH:-1}
+  S4_COMPACTION_ENABLED: ${S4_COMPACTION_ENABLED:-false}
+  RUST_LOG: ${RUST_LOG:-s4_server=info,s4_api=info,s4_cluster=info,s4_ee=info}
+  RUST_BACKTRACE: ${RUST_BACKTRACE:-1}
+
+# Docker creates an empty directory in place of a missing bind source by
+# default, and the node would then start without a license. create_host_path:
+# false stops the start instead, with "bind source path does not exist".
+x-s4-license-volume: &s4-license-volume
+  type: bind
+  source: ${S4_LICENSE_HOST_FILE:-./license-key.txt}
+  target: /run/secrets/s4-license.key
+  read_only: true
+  bind:
+    create_host_path: false
+
+x-s4-node-common: &s4-node-common
+  image: ${S4_EE_IMAGE:-s4core/s4core:ee}
+  security_opt:
+    - ${S4_DOCKER_SECURITY_OPT:-apparmor=unconfined}
+  entrypoint:
+    - /bin/sh
+    - -c
+    - 'sleep ${S4_START_DELAY_SECS:-2}; if [ -x /app/s4-server ]; then exec /app/s4-server; fi; exec /usr/local/bin/s4-server'
+  expose:
+    - "9000"
+    - "9100"
+  healthcheck:
+    test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
+    interval: 5s
+    timeout: 3s
+    start_period: 30s
+    retries: 30
 
 services:
   haproxy:
     image: haproxy:3.1-alpine
+    security_opt:
+      - ${S4_DOCKER_SECURITY_OPT:-apparmor=unconfined}
     volumes:
       - ./haproxy-ee.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports:
-      - "9000:9000"
-      - "8404:8404"
+      - "${S4_EE_HTTP_PORT:-9000}:9000"
+      - "${S4_EE_HAPROXY_STATS_PORT:-8404}:8404"
     depends_on:
-      s4-p1-node1:
+      s4-ee-node1:
         condition: service_healthy
-      s4-p1-node2:
+      s4-ee-node2:
         condition: service_healthy
-      s4-p1-node3:
+      s4-ee-node3:
         condition: service_healthy
-      s4-p2-node1:
+      s4-ee-node4:
         condition: service_healthy
-      s4-p2-node2:
+      s4-ee-node5:
         condition: service_healthy
-      s4-p2-node3:
+      s4-ee-node6:
         condition: service_healthy
 
-  # ── Pool 1 ──────────────────────────────────────────────
-  s4-p1-node1:
-    image: s4core/s4core:ee
+  s4-ee-node1:
+    <<: *s4-node-common
     environment:
-      S4_MODE: cluster
-      S4_BIND: "0.0.0.0:9000"
-      S4_CLUSTER_NAME: enterprise
-      S4_NODE_ID: p1-node-1
-      S4_NODE_GRPC_ADDR: s4-p1-node1:9100
-      S4_NODE_HTTP_ADDR: s4-p1-node1:9000
-      S4_SEEDS: s4-p1-node1:9100,s4-p1-node2:9100,s4-p1-node3:9100,s4-p2-node1:9100,s4-p2-node2:9100,s4-p2-node3:9100
-      S4_POOL_NAME: pool-1
-      S4_POOL_NODES: "p1-node-1:s4-p1-node1:9100,p1-node-2:s4-p1-node2:9100,p1-node-3:s4-p1-node3:9100"
-      S4_DATA_DIR: /data
-      S4_LICENSE_KEY: ${S4_LICENSE_KEY:-}
-      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
-      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
-      S4_MAX_UPLOAD_SIZE: ${S4_MAX_UPLOAD_SIZE:-10GB}
-      RUST_LOG: ${RUST_LOG:-s4_api=info,s4_server=info,s4_cluster=info}
+      <<: *s4-node-env
+      S4_NODE_ID: node-1
+      S4_NODE_GRPC_ADDR: s4-ee-node1:9100
+      S4_NODE_HTTP_ADDR: s4-ee-node1:9000
     volumes:
-      - s4-p1-data-1:/data
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
-      interval: 5s
-      timeout: 3s
-      start_period: 10s
-      retries: 3
+      - s4-ee-ec-node1:/data
+      - *s4-license-volume
 
-  s4-p1-node2:
-    image: s4core/s4core:ee
+  s4-ee-node2:
+    <<: *s4-node-common
     environment:
-      S4_MODE: cluster
-      S4_BIND: "0.0.0.0:9000"
-      S4_CLUSTER_NAME: enterprise
-      S4_NODE_ID: p1-node-2
-      S4_NODE_GRPC_ADDR: s4-p1-node2:9100
-      S4_NODE_HTTP_ADDR: s4-p1-node2:9000
-      S4_SEEDS: s4-p1-node1:9100,s4-p1-node2:9100,s4-p1-node3:9100,s4-p2-node1:9100,s4-p2-node2:9100,s4-p2-node3:9100
-      S4_POOL_NAME: pool-1
-      S4_POOL_NODES: "p1-node-1:s4-p1-node1:9100,p1-node-2:s4-p1-node2:9100,p1-node-3:s4-p1-node3:9100"
-      S4_DATA_DIR: /data
-      S4_LICENSE_KEY: ${S4_LICENSE_KEY:-}
-      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
-      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
-      S4_MAX_UPLOAD_SIZE: ${S4_MAX_UPLOAD_SIZE:-10GB}
-      RUST_LOG: ${RUST_LOG:-s4_api=info,s4_server=info,s4_cluster=info}
+      <<: *s4-node-env
+      S4_NODE_ID: node-2
+      S4_NODE_GRPC_ADDR: s4-ee-node2:9100
+      S4_NODE_HTTP_ADDR: s4-ee-node2:9000
     volumes:
-      - s4-p1-data-2:/data
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
-      interval: 5s
-      timeout: 3s
-      start_period: 10s
-      retries: 3
+      - s4-ee-ec-node2:/data
+      - *s4-license-volume
 
-  s4-p1-node3:
-    image: s4core/s4core:ee
+  s4-ee-node3:
+    <<: *s4-node-common
     environment:
-      S4_MODE: cluster
-      S4_BIND: "0.0.0.0:9000"
-      S4_CLUSTER_NAME: enterprise
-      S4_NODE_ID: p1-node-3
-      S4_NODE_GRPC_ADDR: s4-p1-node3:9100
-      S4_NODE_HTTP_ADDR: s4-p1-node3:9000
-      S4_SEEDS: s4-p1-node1:9100,s4-p1-node2:9100,s4-p1-node3:9100,s4-p2-node1:9100,s4-p2-node2:9100,s4-p2-node3:9100
-      S4_POOL_NAME: pool-1
-      S4_POOL_NODES: "p1-node-1:s4-p1-node1:9100,p1-node-2:s4-p1-node2:9100,p1-node-3:s4-p1-node3:9100"
-      S4_DATA_DIR: /data
-      S4_LICENSE_KEY: ${S4_LICENSE_KEY:-}
-      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
-      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
-      S4_MAX_UPLOAD_SIZE: ${S4_MAX_UPLOAD_SIZE:-10GB}
-      RUST_LOG: ${RUST_LOG:-s4_api=info,s4_server=info,s4_cluster=info}
+      <<: *s4-node-env
+      S4_NODE_ID: node-3
+      S4_NODE_GRPC_ADDR: s4-ee-node3:9100
+      S4_NODE_HTTP_ADDR: s4-ee-node3:9000
     volumes:
-      - s4-p1-data-3:/data
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
-      interval: 5s
-      timeout: 3s
-      start_period: 10s
-      retries: 3
+      - s4-ee-ec-node3:/data
+      - *s4-license-volume
 
-  # ── Pool 2 ──────────────────────────────────────────────
-  s4-p2-node1:
-    image: s4core/s4core:ee
+  s4-ee-node4:
+    <<: *s4-node-common
     environment:
-      S4_MODE: cluster
-      S4_BIND: "0.0.0.0:9000"
-      S4_CLUSTER_NAME: enterprise
-      S4_NODE_ID: p2-node-1
-      S4_NODE_GRPC_ADDR: s4-p2-node1:9100
-      S4_NODE_HTTP_ADDR: s4-p2-node1:9000
-      S4_SEEDS: s4-p1-node1:9100,s4-p1-node2:9100,s4-p1-node3:9100,s4-p2-node1:9100,s4-p2-node2:9100,s4-p2-node3:9100
-      S4_POOL_NAME: pool-2
-      S4_POOL_NODES: "p2-node-1:s4-p2-node1:9100,p2-node-2:s4-p2-node2:9100,p2-node-3:s4-p2-node3:9100"
-      S4_DATA_DIR: /data
-      S4_LICENSE_KEY: ${S4_LICENSE_KEY:-}
-      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
-      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
-      S4_MAX_UPLOAD_SIZE: ${S4_MAX_UPLOAD_SIZE:-10GB}
-      RUST_LOG: ${RUST_LOG:-s4_api=info,s4_server=info,s4_cluster=info}
+      <<: *s4-node-env
+      S4_NODE_ID: node-4
+      S4_NODE_GRPC_ADDR: s4-ee-node4:9100
+      S4_NODE_HTTP_ADDR: s4-ee-node4:9000
     volumes:
-      - s4-p2-data-1:/data
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
-      interval: 5s
-      timeout: 3s
-      start_period: 10s
-      retries: 3
+      - s4-ee-ec-node4:/data
+      - *s4-license-volume
 
-  s4-p2-node2:
-    image: s4core/s4core:ee
+  s4-ee-node5:
+    <<: *s4-node-common
     environment:
-      S4_MODE: cluster
-      S4_BIND: "0.0.0.0:9000"
-      S4_CLUSTER_NAME: enterprise
-      S4_NODE_ID: p2-node-2
-      S4_NODE_GRPC_ADDR: s4-p2-node2:9100
-      S4_NODE_HTTP_ADDR: s4-p2-node2:9000
-      S4_SEEDS: s4-p1-node1:9100,s4-p1-node2:9100,s4-p1-node3:9100,s4-p2-node1:9100,s4-p2-node2:9100,s4-p2-node3:9100
-      S4_POOL_NAME: pool-2
-      S4_POOL_NODES: "p2-node-1:s4-p2-node1:9100,p2-node-2:s4-p2-node2:9100,p2-node-3:s4-p2-node3:9100"
-      S4_DATA_DIR: /data
-      S4_LICENSE_KEY: ${S4_LICENSE_KEY:-}
-      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
-      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
-      S4_MAX_UPLOAD_SIZE: ${S4_MAX_UPLOAD_SIZE:-10GB}
-      RUST_LOG: ${RUST_LOG:-s4_api=info,s4_server=info,s4_cluster=info}
+      <<: *s4-node-env
+      S4_NODE_ID: node-5
+      S4_NODE_GRPC_ADDR: s4-ee-node5:9100
+      S4_NODE_HTTP_ADDR: s4-ee-node5:9000
     volumes:
-      - s4-p2-data-2:/data
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
-      interval: 5s
-      timeout: 3s
-      start_period: 10s
-      retries: 3
+      - s4-ee-ec-node5:/data
+      - *s4-license-volume
 
-  s4-p2-node3:
-    image: s4core/s4core:ee
+  s4-ee-node6:
+    <<: *s4-node-common
     environment:
-      S4_MODE: cluster
-      S4_BIND: "0.0.0.0:9000"
-      S4_CLUSTER_NAME: enterprise
-      S4_NODE_ID: p2-node-3
-      S4_NODE_GRPC_ADDR: s4-p2-node3:9100
-      S4_NODE_HTTP_ADDR: s4-p2-node3:9000
-      S4_SEEDS: s4-p1-node1:9100,s4-p1-node2:9100,s4-p1-node3:9100,s4-p2-node1:9100,s4-p2-node2:9100,s4-p2-node3:9100
-      S4_POOL_NAME: pool-2
-      S4_POOL_NODES: "p2-node-1:s4-p2-node1:9100,p2-node-2:s4-p2-node2:9100,p2-node-3:s4-p2-node3:9100"
-      S4_DATA_DIR: /data
-      S4_LICENSE_KEY: ${S4_LICENSE_KEY:-}
-      S4_ACCESS_KEY_ID: ${S4_ACCESS_KEY_ID:-my-access-key-one}
-      S4_SECRET_ACCESS_KEY: ${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
-      S4_MAX_UPLOAD_SIZE: ${S4_MAX_UPLOAD_SIZE:-10GB}
-      RUST_LOG: ${RUST_LOG:-s4_api=info,s4_server=info,s4_cluster=info}
+      <<: *s4-node-env
+      S4_NODE_ID: node-6
+      S4_NODE_GRPC_ADDR: s4-ee-node6:9100
+      S4_NODE_HTTP_ADDR: s4-ee-node6:9000
     volumes:
-      - s4-p2-data-3:/data
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:9000/health"]
-      interval: 5s
-      timeout: 3s
-      start_period: 10s
-      retries: 3
+      - s4-ee-ec-node6:/data
+      - *s4-license-volume
 
 volumes:
-  s4-p1-data-1:
-  s4-p1-data-2:
-  s4-p1-data-3:
-  s4-p2-data-1:
-  s4-p2-data-2:
-  s4-p2-data-3:
+  s4-ee-ec-node1:
+  s4-ee-ec-node2:
+  s4-ee-ec-node3:
+  s4-ee-ec-node4:
+  s4-ee-ec-node5:
+  s4-ee-ec-node6:

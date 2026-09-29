@@ -141,6 +141,10 @@ pub enum S3Error {
     /// The server side encryption configuration was not found.
     #[error("The server side encryption configuration was not found")]
     ServerSideEncryptionConfigurationNotFound,
+
+    /// The storage pool has no room left for the object.
+    #[error("There is not enough space to store the object")]
+    InsufficientStorage,
 }
 
 impl S3Error {
@@ -177,6 +181,7 @@ impl S3Error {
             S3Error::ServerSideEncryptionConfigurationNotFound => {
                 "ServerSideEncryptionConfigurationNotFoundError"
             }
+            S3Error::InsufficientStorage => "InsufficientStorage",
         }
     }
 
@@ -211,6 +216,7 @@ impl S3Error {
             S3Error::BadDigest => StatusCode::BAD_REQUEST,
             S3Error::InvalidStorageClass => StatusCode::BAD_REQUEST,
             S3Error::ServerSideEncryptionConfigurationNotFound => StatusCode::NOT_FOUND,
+            S3Error::InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
         }
     }
 }
@@ -248,5 +254,16 @@ mod tests {
             StatusCode::CONFLICT
         );
         assert_eq!(S3Error::AccessDenied.status_code(), StatusCode::FORBIDDEN);
+    }
+
+    /// 507 rather than 500: an operator has to be able to tell "out of space"
+    /// from "the server broke".
+    #[test]
+    fn insufficient_storage_is_507_with_its_own_code() {
+        assert_eq!(S3Error::InsufficientStorage.code(), "InsufficientStorage");
+        assert_eq!(
+            S3Error::InsufficientStorage.status_code(),
+            StatusCode::INSUFFICIENT_STORAGE
+        );
     }
 }

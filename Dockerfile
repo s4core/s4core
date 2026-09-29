@@ -4,14 +4,24 @@
 # Build args:
 #   EDITION  - "ce" (default) or "ee"
 #   S4_VERSION - version string (e.g. "0.0.8"), typically set by CI from git tag
+#   S4_EC_V1_CI_ACCEPTANCE_PASSED - "true" only after the EC v1 readiness suite passed
 
 # ============================================
 # Stage 1: Build
 # ============================================
 FROM rust:1.90-alpine AS builder
 
-# Install build dependencies (protobuf-dev provides protoc for gRPC codegen)
-RUN apk add --no-cache musl-dev pkgconfig openssl-dev openssl-libs-static protobuf-dev
+# Install build dependencies (protobuf-dev provides protoc for gRPC codegen).
+# There is no OpenSSL here on purpose: TLS is rustls end to end, so nothing in
+# the workspace links libssl.
+#
+# nasm assembles the vendored ISA-L sources and is only useful on x86_64, the
+# one architecture where the accelerated erasure coding codec is built. The
+# architecture is read from `uname -m` rather than BuildKit's TARGETARCH,
+# because that also holds when the image is built by the legacy builder, and it
+# reports the target architecture under emulated multi-platform builds too.
+RUN apk add --no-cache musl-dev pkgconfig protobuf-dev && \
+    if [ "$(uname -m)" = "x86_64" ]; then apk add --no-cache nasm; fi
 
 WORKDIR /app
 
@@ -36,16 +46,24 @@ RUN if [ -n "${S4_VERSION}" ]; then \
 
 # Edition: "ce" (default) or "ee"
 ARG EDITION=ce
+ARG S4_EC_V1_CI_ACCEPTANCE_PASSED=false
 
 # Build release binary — EE includes enterprise feature flag
 # BuildKit cache mounts share Cargo artifacts between CE and EE builds,
 # so the EE build only recompiles crates affected by the enterprise feature.
+#
+# The Enterprise build turns on ISA-L accelerated erasure coding on x86_64 and
+# leaves it off elsewhere. Both produce identical shards, so an aarch64 image
+# and an x86_64 one can serve the same data in one cluster; only the speed of
+# the codec differs. See decisions EC2-002 and EC2-004.
 ENV RUSTFLAGS="-C target-feature=-crt-static"
 RUN --mount=type=cache,target=/app/target \
     --mount=type=cache,target=/root/.cargo/registry \
     if [ "${EDITION}" = "ee" ]; then \
-      echo "Building Enterprise Edition"; \
-      cargo build --release --bin s4-server --features enterprise; \
+      if [ "$(uname -m)" = "x86_64" ]; then FEATURES="isal"; else FEATURES="enterprise"; fi; \
+      echo "Building Enterprise Edition (features: ${FEATURES})"; \
+      S4_EC_V1_CI_ACCEPTANCE_PASSED="${S4_EC_V1_CI_ACCEPTANCE_PASSED}" \
+        cargo build --release --bin s4-server --features "${FEATURES}"; \
     else \
       echo "Building Community Edition"; \
       cargo build --release --bin s4-server; \
@@ -77,7 +95,9 @@ USER s4
 # Carry edition label into runtime for diagnostics
 ARG EDITION=ce
 ARG S4_VERSION=""
+ARG S4_EC_V1_CI_ACCEPTANCE_PASSED=false
 ENV S4_EDITION=${EDITION}
+ENV S4_EC_V1_CI_ACCEPTANCE_ATTESTED=${S4_EC_V1_CI_ACCEPTANCE_PASSED}
 
 # OCI image labels
 LABEL org.opencontainers.image.title="S4Core (${EDITION})" \

@@ -26,8 +26,12 @@ use axum::{
     routing::{delete, get, head, post, put},
     Router,
 };
-use s4_cluster::{DistributedListCoordinator, QuorumReadCoordinator, QuorumWriteCoordinator};
+use s4_cluster::{
+    DistributedListCoordinator, EcAdminService, EcObjectRuntime, NoopEcAdminService,
+    NoopEcObjectRuntime, QuorumReadCoordinator, QuorumWriteCoordinator,
+};
 use s4_core::storage::{BitcaskStorageEngine, StorageEngine};
+use s4_core::types::StorageClass;
 use s4_features::iam::{models::User, AuthService, IamStorage, JwtManager};
 
 use crate::s3::errors::S3Error;
@@ -80,6 +84,12 @@ pub struct AppState {
     pub read_coordinator: Option<Arc<QuorumReadCoordinator>>,
     /// Distributed LIST coordinator for scatter-gather list operations.
     pub list_coordinator: Option<Arc<DistributedListCoordinator>>,
+    /// Physical storage class assigned to newly-created bucket markers.
+    pub default_bucket_storage_class: StorageClass,
+    /// Edition-injected Erasure Coding admin operations.
+    pub ec_admin_service: Arc<dyn EcAdminService>,
+    /// Edition-injected Erasure Coding S3 object runtime hooks.
+    pub ec_object_runtime: Arc<dyn EcObjectRuntime>,
 }
 
 impl AppState {
@@ -155,6 +165,9 @@ impl AppState {
             write_coordinator: None,
             read_coordinator: None,
             list_coordinator: None,
+            default_bucket_storage_class: StorageClass::Standard,
+            ec_admin_service: Arc::new(NoopEcAdminService),
+            ec_object_runtime: Arc::new(NoopEcObjectRuntime),
         }
     }
 
@@ -180,6 +193,24 @@ impl AppState {
         self.write_coordinator = Some(write);
         self.read_coordinator = Some(read);
         self.list_coordinator = Some(list);
+        self
+    }
+
+    /// Sets the physical storage class used for new bucket markers.
+    pub fn with_default_bucket_storage_class(mut self, storage_class: StorageClass) -> Self {
+        self.default_bucket_storage_class = storage_class;
+        self
+    }
+
+    /// Sets the EC admin service implementation.
+    pub fn with_ec_admin_service(mut self, service: Arc<dyn EcAdminService>) -> Self {
+        self.ec_admin_service = service;
+        self
+    }
+
+    /// Sets the EC object runtime implementation.
+    pub fn with_ec_object_runtime(mut self, runtime: Arc<dyn EcObjectRuntime>) -> Self {
+        self.ec_object_runtime = runtime;
         self
     }
 
@@ -225,6 +256,68 @@ impl StorageEngine for IamStorageAdapter {
     ) -> Result<(), s4_core::error::StorageError> {
         let storage = self.0.write().await;
         storage.delete_object(bucket, key).await
+    }
+
+    // Must be delegated explicitly: the trait's default refuses, because
+    // releasing a blob reference cannot be expressed through the other methods.
+    async fn detach_object_data_if_hlc(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected_hlc_timestamp: u64,
+        expected_hlc_logical: u32,
+        expected_origin_node_id: u128,
+        layout: s4_core::types::ObjectLayout,
+    ) -> Result<bool, s4_core::error::StorageError> {
+        let storage = self.0.write().await;
+        storage
+            .detach_object_data_if_hlc(
+                bucket,
+                key,
+                expected_hlc_timestamp,
+                expected_hlc_logical,
+                expected_origin_node_id,
+                layout,
+            )
+            .await
+    }
+
+    // The mirror of the detach above, and delegated for the same reason: the
+    // trait's default refuses, because writing a blob and rewriting the index
+    // entry in one batch cannot be expressed through the other methods. This is
+    // the path a reverse migration takes on every replica.
+    async fn attach_object_data_if_hlc(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected_hlc_timestamp: u64,
+        expected_hlc_logical: u32,
+        expected_origin_node_id: u128,
+        data: &[u8],
+    ) -> Result<bool, s4_core::error::StorageError> {
+        let storage = self.0.write().await;
+        storage
+            .attach_object_data_if_hlc(
+                bucket,
+                key,
+                expected_hlc_timestamp,
+                expected_hlc_logical,
+                expected_origin_node_id,
+                data,
+            )
+            .await
+    }
+
+    // Local-only counterpart of the detach above; see the trait for why the
+    // default refuses.
+    async fn restore_erasure_coded_entry(
+        &self,
+        bucket: &str,
+        key: &str,
+        record: s4_core::types::IndexRecord,
+    ) -> Result<bool, s4_core::error::StorageError> {
+        let storage = self.0.write().await;
+        storage.restore_erasure_coded_entry(bucket, key, record).await
     }
 
     async fn head_object(
@@ -1112,6 +1205,114 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/node/health", get(handlers::admin_cluster::node_health))
         .route("/node/drain", post(handlers::admin_cluster::node_drain))
+        // Enterprise Erasure Coding operations (Phase 9)
+        .route("/ec/pools", get(handlers::admin_ec::list_pools))
+        .route(
+            "/ec/pools/:pool/health",
+            get(handlers::admin_ec::pool_health),
+        )
+        .route(
+            "/ec/objects/:bucket/*key",
+            get(handlers::admin_ec::object_manifest).post(handlers::admin_ec::verify_object),
+        )
+        .route(
+            "/ec/pools/:pool/failure-matrix",
+            get(handlers::admin_ec::failure_matrix),
+        )
+        .route(
+            "/ec/pools/:pool/repair",
+            post(handlers::admin_ec::repair_pool),
+        )
+        .route(
+            "/ec/pools/:pool/repair-status",
+            get(handlers::admin_ec::repair_status),
+        )
+        .route(
+            "/ec/pools/:pool/sets",
+            get(handlers::admin_ec::list_erasure_sets).post(handlers::admin_ec::add_erasure_set),
+        )
+        .route(
+            "/ec/pools/:pool/sets/:set_id/deactivate",
+            post(handlers::admin_ec::deactivate_erasure_set),
+        )
+        .route(
+            "/ec/pools/:pool/topology",
+            post(handlers::admin_ec::apply_pool_topology),
+        )
+        .route(
+            "/ec/pools/:pool/rejoin/approve",
+            post(handlers::admin_ec::approve_node_rejoin),
+        )
+        .route("/ec/dedup/report", get(handlers::admin_ec::dedup_report))
+        .route("/ec/orphans", get(handlers::admin_ec::list_orphans))
+        .route("/ec/orphans/gc", post(handlers::admin_ec::gc_orphans))
+        .route("/ec/tombstones/gc", post(handlers::admin_ec::gc_tombstones))
+        .route(
+            "/ec/segments/unpack",
+            post(handlers::admin_ec::unpack_packed_segments),
+        )
+        .route(
+            "/ec/test/fail-reconstruction",
+            post(handlers::admin_ec::test_fail_reconstruction),
+        )
+        .route(
+            "/ec/test/transcode/pause",
+            post(handlers::admin_ec::test_transcode_pause),
+        )
+        .route(
+            "/ec/test/orphans/scan",
+            post(handlers::admin_ec::test_scan_orphans),
+        )
+        .route(
+            "/ec/test/codec/foreign-matrix",
+            post(handlers::admin_ec::test_codec_foreign_matrix),
+        )
+        .route(
+            "/ec/test/scrub/run",
+            post(handlers::admin_ec::test_run_scrub),
+        )
+        .route(
+            "/ec/test/anti-entropy/run",
+            post(handlers::admin_ec::test_run_anti_entropy),
+        )
+        .route(
+            "/ec/test/namespace/reconcile",
+            post(handlers::admin_ec::test_reconcile_namespace),
+        )
+        // The static segment is matched before the parameter, so a bucket
+        // named "dry-run" cannot shadow the dry-run route.
+        .route(
+            "/ec/tiering/dry-run",
+            post(handlers::admin_ec::tiering_dry_run),
+        )
+        .route(
+            "/ec/tiering/:bucket",
+            get(handlers::admin_ec::tiering_policy).put(handlers::admin_ec::put_tiering_policy),
+        )
+        .route(
+            "/ec/test/tiering/heat/:bucket/*key",
+            get(handlers::admin_ec::test_object_heat),
+        )
+        .route(
+            "/ec/tiering/:bucket/promote",
+            post(handlers::admin_ec::promote_objects),
+        )
+        .route(
+            "/ec/test/tiering/run",
+            post(handlers::admin_ec::test_run_tiering_cycle),
+        )
+        .route(
+            "/ec/test/promotion/run",
+            post(handlers::admin_ec::test_run_promotion_cycle),
+        )
+        .route(
+            "/ec/test/promotion/job/:bucket/*key",
+            get(handlers::admin_ec::test_promotion_job),
+        )
+        .route(
+            "/ec/test/transcode/job/:bucket/*key",
+            get(handlers::admin_ec::test_transcode_job),
+        )
         // Add JWT authentication middleware
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -1186,5 +1387,164 @@ mod tests {
     fn test_server_config_creation() {
         let config = ServerConfig::new("127.0.0.1:9000");
         assert_eq!(config.bind_address, "127.0.0.1:9000");
+    }
+
+    /// The adapter must forward both halves of the EC layout migration.
+    ///
+    /// The trait defaults refuse rather than do nothing, so a method this
+    /// adapter forgets to delegate becomes a loud failure somewhere far from
+    /// here. Its sibling in `s4-server` was missed exactly that way, and the
+    /// two are edited together.
+    #[tokio::test]
+    async fn the_iam_adapter_forwards_the_ec_layout_migration_both_ways() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = BitcaskStorageEngine::new(
+            &temp.path().join("volumes"),
+            &temp.path().join("metadata"),
+            1_024 * 1_024,
+            4_096,
+            false,
+        )
+        .await
+        .unwrap();
+        let adapter = IamStorageAdapter(Arc::new(RwLock::new(storage)));
+
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert("_s4_hlc_wall".to_string(), "10".to_string());
+        metadata.insert("_s4_hlc_logical".to_string(), "0".to_string());
+        metadata.insert("_s4_hlc_node_id".to_string(), "1".to_string());
+        adapter
+            .put_object("bucket", "object.bin", b"payload", "text/plain", &metadata)
+            .await
+            .expect("write the object");
+
+        assert!(adapter
+            .detach_object_data_if_hlc(
+                "bucket",
+                "object.bin",
+                10,
+                0,
+                1,
+                s4_core::types::ObjectLayout::ErasureCoded {
+                    erasure_set_id: 1,
+                    topology_epoch: 1,
+                },
+            )
+            .await
+            .expect("the detach must be delegated, not refused by the trait default"));
+
+        assert!(adapter
+            .attach_object_data_if_hlc("bucket", "object.bin", 10, 0, 1, b"payload")
+            .await
+            .expect("the attach must be delegated, not refused by the trait default"));
+
+        let (body, record) = adapter.get_object("bucket", "object.bin").await.expect("read back");
+        assert_eq!(body, b"payload");
+        assert!(!record.is_erasure_coded());
+    }
+
+    /// EC2-FIX-04-001: collecting the shards of deleted objects is an operator
+    /// route, and the test-hook path it used to answer on is gone.
+    ///
+    /// Asked of the router itself rather than of a running cluster: which
+    /// namespace a destructive action lives in is a property of this table, and
+    /// a scenario that needs six nodes to notice a moved route notices it late.
+    ///
+    /// Registration is read off the answer's body, not its status. A path the
+    /// admin router does not claim falls through to the S3 router, which reads
+    /// it as a bucket request and refuses it — with the same `403` this CE
+    /// build gives a registered EC route it has no Enterprise service for. The
+    /// bodies differ, and that is what says which of the two happened.
+    #[tokio::test]
+    async fn the_tombstone_sweep_is_an_operator_route_and_not_a_test_hook() {
+        /// Whether the EC admin layer answered — that is, whether this path is
+        /// a route at all.
+        async fn reaches_ec_admin(router: &Router, token: &str, uri: &str) -> bool {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("Host", "localhost")
+                .header("Authorization", format!("Bearer {token}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let response = tower::ServiceExt::oneshot(router.clone(), request).await.unwrap();
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+            String::from_utf8_lossy(&body).contains("erasure coding")
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("volumes");
+        let metadata_dir = temp.path().join("metadata");
+        let storage =
+            BitcaskStorageEngine::new(&data_dir, &metadata_dir, 1_024 * 1_024, 4_096, false)
+                .await
+                .unwrap();
+        let state = AppState::with_max_upload_size(
+            storage,
+            "access-key".to_string(),
+            "secret-key".to_string(),
+            DEFAULT_MAX_UPLOAD_SIZE,
+            &data_dir,
+        )
+        .await;
+
+        // A SuperUser token, because the admin router authorises before it
+        // routes: without one every path under /api/admin answers the same.
+        let user = state
+            .iam_storage
+            .create_user(
+                "route_probe".to_string(),
+                "route-probe-password".to_string(),
+                s4_features::iam::Role::SuperUser,
+            )
+            .await
+            .expect("create the probing user");
+        let token = state
+            .auth_service
+            .login(s4_features::iam::LoginRequest {
+                username: user.username.clone(),
+                password: "route-probe-password".to_string(),
+            })
+            .await
+            .expect("log the probing user in")
+            .token;
+        let router = create_router(state);
+
+        assert!(
+            reaches_ec_admin(&router, &token, "/api/admin/ec/tombstones/gc").await,
+            "the operator route for the tombstone sweep is not registered"
+        );
+        assert!(
+            !reaches_ec_admin(&router, &token, "/api/admin/ec/test/tombstone-gc/run").await,
+            "an action that removes data must not live under /ec/test/"
+        );
+
+        // Two controls, so neither assertion above can pass for the wrong
+        // reason: the neighbour this sweep now sits beside is registered, and
+        // an address nobody registered is not.
+        assert!(reaches_ec_admin(&router, &token, "/api/admin/ec/orphans/gc").await);
+        assert!(!reaches_ec_admin(&router, &token, "/api/admin/ec/no-such-route").await);
+    }
+
+    #[tokio::test]
+    async fn ec_admin_routes_do_not_panic_on_router_creation() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("volumes");
+        let metadata_dir = temp.path().join("metadata");
+        let storage =
+            BitcaskStorageEngine::new(&data_dir, &metadata_dir, 1_024 * 1_024, 4_096, false)
+                .await
+                .unwrap();
+
+        let state = AppState::with_max_upload_size(
+            storage,
+            "access-key".to_string(),
+            "secret-key".to_string(),
+            DEFAULT_MAX_UPLOAD_SIZE,
+            &data_dir,
+        )
+        .await;
+
+        let _router = create_router(state);
     }
 }

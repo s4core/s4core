@@ -18,6 +18,7 @@ pub mod blob;
 pub mod composite;
 pub mod metadata;
 pub mod object_lock;
+pub mod storage_class;
 pub mod versioning;
 
 pub use blob::{BlobHeader, BlobHeaderFlags};
@@ -25,6 +26,10 @@ pub use composite::{
     BlobId, BlobLocation, BlobRefEntry, CompositeManifest, ManifestSegmentRef, MultipartPartRecord,
     MultipartUploadSession, MultipartUploadState, ObjectLayout, MANIFEST_FORMAT_VERSION,
 };
-pub use metadata::{IndexRecord, DELETE_MARKER_FILE_ID};
+pub use metadata::{
+    IndexRecord, BUCKET_MARKER_KEY_PREFIX, DELETE_MARKER_FILE_ID, EXTERNAL_DATA_FILE_ID,
+    OBJECT_TAGS_METADATA_KEY,
+};
 pub use object_lock::{DefaultRetention, RetentionMode};
+pub use storage_class::{StorageClass, S4_STORAGE_CLASS_METADATA_KEY};
 pub use versioning::VersioningStatus;

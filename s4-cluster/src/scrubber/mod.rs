@@ -49,7 +49,8 @@ use crate::identity::NodeStatus;
 use crate::placement::PlacementStrategy;
 use crate::rpc::NodeClient;
 use metrics::ScrubberMetrics;
-use s4_core::storage::{IndexDb, VolumeReader};
+use s4_core::storage::{IndexDb, KeyspaceId, VolumeReader};
+use s4_core::StorageEngine;
 
 /// Configuration for the background data scrubber.
 #[derive(Debug, Clone)]
@@ -62,6 +63,21 @@ pub struct ScrubberConfig {
     pub throttle_delay: Duration,
     /// Sleep between volume scans within a cycle (default: 1s).
     pub inter_volume_delay: Duration,
+    /// How long the first cycle waits after start (default: 30s).
+    ///
+    /// Healing needs peers, and a node that has just started has not finished
+    /// hearing about them. A scan that runs first would find a damaged blob,
+    /// fail to reach anybody who has a healthy copy and write the damage off —
+    /// for a whole `full_scan_period`.
+    pub start_delay: Duration,
+    /// How long until the next cycle when this one left damage unhealed
+    /// (default: 5 minutes).
+    ///
+    /// A copy that could not be fetched now — the peer was busy, restarting,
+    /// or briefly unreachable — is worth asking for again long before the next
+    /// full scan is due. A cycle that healed everything it found goes back to
+    /// the full scan period.
+    pub unhealed_retry_period: Duration,
 }
 
 impl Default for ScrubberConfig {
@@ -71,6 +87,8 @@ impl Default for ScrubberConfig {
             full_scan_period: Duration::from_secs(30 * 24 * 3600), // 30 days
             throttle_delay: Duration::from_micros(100),
             inter_volume_delay: Duration::from_secs(1),
+            start_delay: Duration::from_secs(30),
+            unhealed_retry_period: Duration::from_secs(300),
         }
     }
 }
@@ -85,6 +103,9 @@ pub struct HealingContext {
     pub gossip: Arc<GossipHandle>,
     /// Placement strategy for finding replica set for a key.
     pub placement: Arc<PlacementStrategy>,
+    /// Local storage engine, where a healthy copy fetched from a replica is
+    /// written back. Without it a scrubber can only report damage.
+    pub storage: Arc<dyn StorageEngine>,
 }
 
 /// Statistics from a single scrub cycle.
@@ -182,7 +203,23 @@ impl DataScrubber {
             "data scrubber started"
         );
 
+        // Let membership settle before the first cycle: see `start_delay`.
+        if !self.config.start_delay.is_zero() {
+            tokio::select! {
+                _ = tokio::time::sleep(self.config.start_delay) => {}
+                _ = shutdown.changed() => {
+                    if *shutdown.borrow() {
+                        self.running.store(false, Ordering::SeqCst);
+                        return;
+                    }
+                }
+            }
+        }
+
         loop {
+            // How long until the next cycle: set by what this one finds.
+            let next_cycle_in;
+
             // Run a full scan cycle
             match self.run_scrub_cycle(&mut shutdown).await {
                 Ok(Some(stats)) => {
@@ -193,6 +230,9 @@ impl DataScrubber {
                     self.metrics.last_full_scan_timestamp.store(ts, Ordering::Relaxed);
                     self.metrics.cycles_completed.fetch_add(1, Ordering::Relaxed);
                     self.metrics.scan_progress_pct.store(100, Ordering::Relaxed);
+                    crate::cluster_metrics::set_scrubber_scan_progress(1.0);
+
+                    next_cycle_in = self.inter_cycle_delay(&stats);
 
                     info!(
                         blobs_checked = stats.blobs_checked,
@@ -200,6 +240,7 @@ impl DataScrubber {
                         corruptions_healed = stats.corruptions_healed,
                         corruptions_unrecoverable = stats.corruptions_unrecoverable,
                         volumes_scanned = stats.volumes_scanned,
+                        next_cycle_secs = next_cycle_in.as_secs(),
                         "scrub cycle completed"
                     );
                 }
@@ -208,13 +249,14 @@ impl DataScrubber {
                     break;
                 }
                 Err(e) => {
+                    next_cycle_in = self.config.unhealed_retry_period;
                     error!(error = %e, "scrub cycle failed");
                 }
             }
 
             // Sleep until next cycle (interruptible by shutdown)
             tokio::select! {
-                _ = tokio::time::sleep(self.inter_cycle_delay()) => {}
+                _ = tokio::time::sleep(next_cycle_in) => {}
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() { break; }
                 }
@@ -232,6 +274,18 @@ impl DataScrubber {
     ) -> Result<Option<ScrubCycleStats>, ClusterError> {
         let volume_ids = self.list_volume_ids().await?;
         if volume_ids.is_empty() {
+            // A node with nothing stored yet has no volumes, and that is
+            // ordinary. A directory that is not there at all is not: it means
+            // this scrubber is looking somewhere the data is not, and would go
+            // on reporting a clean pool forever.
+            if !self.volumes_dir.exists() {
+                warn!(
+                    volumes_dir = %self.volumes_dir.display(),
+                    "scrubber found no volumes directory; nothing on this node is being checked"
+                );
+            } else {
+                debug!(volumes_dir = %self.volumes_dir.display(), "scrubber found no volumes yet");
+            }
             return Ok(Some(ScrubCycleStats::default()));
         }
 
@@ -243,6 +297,7 @@ impl DataScrubber {
             // Update progress
             let progress = (vol_idx as u64 * 100) / total_volumes;
             self.metrics.scan_progress_pct.store(progress, Ordering::Relaxed);
+            crate::cluster_metrics::set_scrubber_scan_progress(progress as f64 / 100.0);
 
             match self.scrub_volume(&reader, *volume_id, shutdown).await {
                 Ok(Some(vol_stats)) => {
@@ -288,7 +343,7 @@ impl DataScrubber {
 
         let mut stats = ScrubCycleStats::default();
 
-        for (_keyspace_id, key, record) in &records {
+        for (keyspace_id, key, record) in &records {
             // Check shutdown
             if shutdown.has_changed().unwrap_or(false) && *shutdown.borrow() {
                 return Ok(None);
@@ -301,6 +356,7 @@ impl DataScrubber {
 
             stats.blobs_checked += 1;
             self.metrics.blobs_scanned_total.fetch_add(1, Ordering::Relaxed);
+            crate::cluster_metrics::record_scrubber_blobs_scanned(1);
 
             match reader.read_blob(record.file_id, record.offset).await {
                 Ok((header, _read_key, data)) => {
@@ -313,6 +369,7 @@ impl DataScrubber {
                     if actual_crc != header.crc {
                         stats.corruptions_found += 1;
                         self.metrics.corruptions_found_total.fetch_add(1, Ordering::Relaxed);
+                        crate::cluster_metrics::record_scrubber_corruption_found();
 
                         warn!(
                             key = %key,
@@ -323,15 +380,19 @@ impl DataScrubber {
                             "bit rot detected"
                         );
 
-                        // Attempt healing in cluster mode
-                        if self.healing.is_some() {
+                        // Attempt healing in cluster mode. Only objects: the
+                        // other records this scan meets — IAM, bucket markers —
+                        // have no replica to fetch a copy from, and reporting a
+                        // heal for them would be reporting work nobody did.
+                        if self.healing.is_some() && *keyspace_id == KeyspaceId::Objects {
                             match self.heal_from_replica(key, record).await {
                                 Ok(true) => {
                                     stats.corruptions_healed += 1;
                                     self.metrics
                                         .corruptions_healed_total
                                         .fetch_add(1, Ordering::Relaxed);
-                                    info!(key = %key, "bit rot healed from replica");
+                                    crate::cluster_metrics::record_scrubber_corruption_healed();
+                                    info!(key = %key, "bit rot healed: the bytes are back on this node");
                                 }
                                 Ok(false) => {
                                     stats.corruptions_unrecoverable += 1;
@@ -353,7 +414,11 @@ impl DataScrubber {
                             self.metrics
                                 .corruptions_unrecoverable_total
                                 .fetch_add(1, Ordering::Relaxed);
-                            warn!(key = %key, "no replicas available for healing (single-node mode)");
+                            warn!(
+                                key = %key,
+                                "damaged record cannot be healed from a replica \
+                                 (single-node mode, or a record that is not an object)"
+                            );
                         }
                     }
                 }
@@ -382,10 +447,7 @@ impl DataScrubber {
             .as_ref()
             .ok_or_else(|| ClusterError::Storage("healing context not available".into()))?;
 
-        // Extract bucket and object key from the composite key ("bucket/object")
-        let (bucket, object_key) = key
-            .split_once('/')
-            .ok_or_else(|| ClusterError::Storage(format!("invalid composite key: {key}")))?;
+        let (bucket, object_key) = object_reference(key, record.version_id.as_deref())?;
 
         // Find replicas for this key
         let replicas = ctx.placement.get_replicas(key);
@@ -431,6 +493,29 @@ impl DataScrubber {
                                 replica = %replica_id,
                                 "fetched healthy copy from replica"
                             );
+                            // Fetching the copy is half the job. Writing it
+                            // back is the other half, and until it is done
+                            // this node still holds the damage — however
+                            // confidently the counter says otherwise.
+                            ctx.storage
+                                .heal_object_blob(
+                                    bucket,
+                                    object_key,
+                                    record.version_id.as_deref(),
+                                    &response.data,
+                                )
+                                .await
+                                .map_err(|e| {
+                                    ClusterError::Storage(format!(
+                                        "writing the healthy copy of {key} back failed: {e}"
+                                    ))
+                                })?;
+                            info!(
+                                key = %key,
+                                replica = %replica_id,
+                                bytes = response.data.len(),
+                                "bit rot repaired from replica"
+                            );
                             return Ok(true);
                         }
                         warn!(
@@ -463,12 +548,42 @@ impl DataScrubber {
         list_volume_ids(&self.volumes_dir).await
     }
 
-    /// Compute inter-cycle delay. Spreads cycles across the full_scan_period.
-    fn inter_cycle_delay(&self) -> Duration {
-        // After completing one full cycle, wait before starting the next.
-        // Full scan period is the target for completing all cycles.
-        self.config.full_scan_period
+    /// How long to wait before the next cycle, given what this one found.
+    ///
+    /// A cycle that left damage behind comes back soon: the copy it could not
+    /// fetch may be one restart away, and a month is a long time to carry a
+    /// blob nobody can read. A clean cycle paces itself by the full scan
+    /// period, which is what the scrubber's I/O budget is written against.
+    fn inter_cycle_delay(&self, stats: &ScrubCycleStats) -> Duration {
+        if stats.corruptions_unrecoverable > 0 {
+            self.config.unhealed_retry_period.min(self.config.full_scan_period)
+        } else {
+            self.config.full_scan_period
+        }
     }
+}
+
+/// The bucket and object key an index key names.
+///
+/// Index keys are `bucket/key`, and a version of an object is indexed as
+/// `bucket/key#version`. Everything outside the index — a read from a replica,
+/// a heal on this node — takes the version beside the key rather than inside
+/// it, so the suffix comes off here and exactly once.
+fn object_reference<'a>(
+    key: &'a str,
+    version_id: Option<&str>,
+) -> Result<(&'a str, &'a str), ClusterError> {
+    let (bucket, indexed_key) = key
+        .split_once('/')
+        .ok_or_else(|| ClusterError::Storage(format!("invalid composite key: {key}")))?;
+    let object_key = match version_id {
+        Some(version_id) => {
+            let suffix = format!("#{version_id}");
+            indexed_key.strip_suffix(&suffix).unwrap_or(indexed_key)
+        }
+        None => indexed_key,
+    };
+    Ok((bucket, object_key))
 }
 
 /// List volume IDs from a volumes directory.
@@ -518,6 +633,119 @@ mod tests {
         let (vol_id, offset) = writer.write_blob(&header, key, data).await.unwrap();
         writer.sync().await.unwrap();
         (vol_id, offset, header)
+    }
+
+    /// A version is healed as the version it is. Sending the index key as the
+    /// object key would ask a replica for an object called "key#version",
+    /// which nothing has, and the damage would be reported as unrecoverable
+    /// while a healthy copy sat on the next node.
+    #[test]
+    fn an_index_key_names_the_object_and_the_version_separately() {
+        assert_eq!(
+            object_reference("photos/raw.bin", None).unwrap(),
+            ("photos", "raw.bin")
+        );
+        assert_eq!(
+            object_reference("photos/raw.bin#v7", Some("v7")).unwrap(),
+            ("photos", "raw.bin")
+        );
+        // A key that ends in something that merely looks like the version is
+        // left alone: only the version this record carries comes off.
+        assert_eq!(
+            object_reference("photos/raw.bin#v7", Some("v8")).unwrap(),
+            ("photos", "raw.bin#v7")
+        );
+        // And a hash inside an ordinary key is part of the key.
+        assert_eq!(
+            object_reference("photos/raw#1.bin", None).unwrap(),
+            ("photos", "raw#1.bin")
+        );
+        assert!(object_reference("no-bucket-here", None).is_err());
+    }
+
+    /// Damage that could not be healed is worth another attempt long before the
+    /// next full scan: the copy this cycle could not fetch may be one restart
+    /// away, and a month is a long time to carry a blob nobody can read.
+    #[tokio::test]
+    async fn a_cycle_that_left_damage_behind_comes_back_sooner() {
+        let (_dir, index_db, volumes_dir) = setup_test_env().await;
+        let config = ScrubberConfig {
+            full_scan_period: Duration::from_secs(30 * 24 * 3600),
+            unhealed_retry_period: Duration::from_secs(300),
+            ..Default::default()
+        };
+        let scrubber = DataScrubber::new_standalone(config, &volumes_dir, index_db);
+
+        let healed = ScrubCycleStats {
+            corruptions_found: 2,
+            corruptions_healed: 2,
+            ..Default::default()
+        };
+        let unhealed = ScrubCycleStats {
+            corruptions_found: 2,
+            corruptions_healed: 1,
+            corruptions_unrecoverable: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scrubber.inter_cycle_delay(&healed),
+            Duration::from_secs(30 * 24 * 3600)
+        );
+        assert_eq!(
+            scrubber.inter_cycle_delay(&unhealed),
+            Duration::from_secs(300)
+        );
+    }
+
+    /// And never later than the full scan it belongs to: a retry period longer
+    /// than the scan period would slow the scrubber down for finding something.
+    #[tokio::test]
+    async fn the_retry_never_pushes_a_cycle_past_the_full_scan_period() {
+        let (_dir, index_db, volumes_dir) = setup_test_env().await;
+        let config = ScrubberConfig {
+            full_scan_period: Duration::from_secs(60),
+            unhealed_retry_period: Duration::from_secs(300),
+            ..Default::default()
+        };
+        let scrubber = DataScrubber::new_standalone(config, &volumes_dir, index_db);
+
+        let unhealed = ScrubCycleStats {
+            corruptions_found: 1,
+            corruptions_unrecoverable: 1,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            scrubber.inter_cycle_delay(&unhealed),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// A scrubber pointed at a directory that is not there scans nothing, and
+    /// nothing is exactly what it used to report as a clean pool. It still
+    /// cannot fail the cycle — a node may legitimately hold no volumes — so the
+    /// guard is the warning beside this, and the wiring is held by
+    /// `scripts/52-bitrot-durability-test.sh`, which rots a blob and requires
+    /// the scrubber to find it.
+    #[tokio::test]
+    async fn a_scrubber_pointed_at_nothing_scans_nothing() {
+        let (dir, index_db, _volumes_dir) = setup_test_env().await;
+        let missing = dir.path().join("volumes").join("volumes");
+        let scrubber = DataScrubber::new_standalone(
+            ScrubberConfig {
+                start_delay: Duration::from_millis(0),
+                ..Default::default()
+            },
+            &missing,
+            index_db,
+        );
+
+        let (_tx, mut shutdown) = watch::channel(false);
+        let stats = scrubber.run_scrub_cycle(&mut shutdown).await.unwrap().unwrap();
+
+        assert_eq!(stats.volumes_scanned, 0);
+        assert_eq!(stats.blobs_checked, 0);
     }
 
     #[tokio::test]
@@ -705,6 +933,8 @@ mod tests {
             throttle_delay: Duration::from_millis(0),
             inter_volume_delay: Duration::from_millis(0),
             full_scan_period: Duration::from_secs(1),
+            start_delay: Duration::from_millis(0),
+            ..Default::default()
         };
         let scrubber = DataScrubber::new_standalone(config, &volumes_dir, index_db);
 

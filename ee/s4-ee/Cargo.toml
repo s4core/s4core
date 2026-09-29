@@ -7,11 +7,43 @@ repository.workspace = true
 license = "Elastic-2.0"
 description = "S4Core Enterprise Edition — feature implementations"
 
+# ISA-L acceleration is opt-in. Without it the EC runtime builds and behaves
+# exactly as before, on the portable engine. See decision EC2-004.
+[features]
+default = []
+isal = ["dep:s4-codec-isal"]
+
 [dependencies]
 s4-cluster = { path = "../../s4-cluster" }
+s4-codec = { path = "../s4-codec" }
+s4-codec-isal = { path = "../s4-codec-isal", optional = true }
+s4-core = { path = "../../s4-core" }
 s4-ee-license = { path = "../s4-ee-license" }
+async-trait = "0.1"
+bincode = { workspace = true }
+bytes = { workspace = true }
+crc32fast = { workspace = true }
+fjall = { workspace = true }
+metrics = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+tempfile = "3.10"
+# `test-util` only in the test build: it is what lets a read that waits on
+# shard fetches be timed against a paused clock instead of a wall clock.
+tokio = { workspace = true, features = ["test-util"] }
+# Only the test targets get the cluster test fakes; the library build above
+# keeps `s4-cluster` on its default features.
+s4-cluster = { path = "../../s4-cluster", features = ["test-util"] }
+
+[[bench]]
+name = "ec_placement_bench"
+harness = false

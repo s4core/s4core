@@ -99,8 +99,14 @@ jobs:
         run: |
           TAG_NAME="${GITHUB_REF_NAME}"
           RELEASE_DATE="$(date -u +'%Y.%-m.%-d')"
-          COMMIT_MSG="$(git log -1 --format='%B' HEAD)"
-          SUBJECT="$(printf '%s\n' "${COMMIT_MSG}" | sed -n '1p')"
+          if git rev-parse -q --verify "refs/tags/${TAG_NAME}^{tag}" >/dev/null; then
+            echo "Using annotated tag message for release notes."
+            RELEASE_MSG="$(git for-each-ref "refs/tags/${TAG_NAME}" --format='%(contents)')"
+          else
+            echo "Using tagged commit message for release notes."
+            RELEASE_MSG="$(git log -1 --format='%B' HEAD)"
+          fi
+          SUBJECT="$(printf '%s\n' "${RELEASE_MSG}" | sed -n '/[^[:space:]]/ {p; q;}')"
 
           PREV_TAG="$(git tag --sort=-creatordate | grep '^v' | grep -v "^${TAG_NAME}$" | head -1 || true)"
           if [ -n "${PREV_TAG}" ]; then
@@ -111,10 +117,18 @@ jobs:
 
           AUTHORS="$(git log "${RANGE}" --format='%an' | sort -u)"
 
-          if printf '%s\n' "${SUBJECT}" | grep -q '^# '; then
-            printf '%s\n' "${COMMIT_MSG}" > release-notes.md
+          RAW_MARKDOWN=false
+          if printf '%s\n' "${SUBJECT}" | grep -Eq '^(#{1,6}[[:space:]]|\*\*.+\*\*[[:space:]]*$)'; then
+            RAW_MARKDOWN=true
+          fi
+          if printf '%s\n' "${RELEASE_MSG}" | grep -Eq '^(#{1,6}[[:space:]]|[*-][[:space:]]+\*\*)'; then
+            RAW_MARKDOWN=true
+          fi
+
+          if [ "${RAW_MARKDOWN}" = "true" ]; then
+            printf '%s\n' "${RELEASE_MSG}" > release-notes.md
           else
-            BODY="$(printf '%s\n' "${COMMIT_MSG}" | sed '1d' | sed '/^[[:space:]]*$/d')"
+            BODY="$(printf '%s\n' "${RELEASE_MSG}" | sed '1d' | sed '/^[[:space:]]*$/d')"
 
             TYPE="Changes"
             case "${SUBJECT}" in

@@ -41,7 +41,12 @@ pub async fn login(
     State(state): State<AppState>,
     Json(request): Json<LoginRequest>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
-    let response = state.auth_service.login(request).await?;
+    let response = state.auth_service.login(request).await.map_err(|err| match err {
+        // A wrong password and an unknown account answer the same 401, so the
+        // login endpoint cannot be used to enumerate account names.
+        IamError::UserNotFound | IamError::InvalidCredentials => AdminError::InvalidCredentials,
+        other => AdminError::from(other),
+    })?;
 
     Ok(Json(json!({
         "token": response.token,
@@ -116,8 +121,9 @@ pub async fn get_user(
         .await
         .map_err(|_| AdminError::UserNotFound)?;
 
-    let user: s4_features::iam::User =
-        serde_json::from_slice(&user_bytes).map_err(|_| AdminError::InvalidData)?;
+    let user: s4_features::iam::User = serde_json::from_slice(&user_bytes).map_err(|e| {
+        AdminError::Storage(format!("Stored user record {user_id} is unreadable: {e}"))
+    })?;
 
     Ok(Json(json!(UserResponse::from(user))))
 }
@@ -284,12 +290,18 @@ pub async fn create_bucket(
         return Err(AdminError::Forbidden);
     }
 
+    // The same naming rules the S3 path enforces: a bucket the admin API
+    // accepted but S3 cannot address would be unusable.
+    if let Err(e) = super::bucket::validate_bucket_name(&bucket_name) {
+        return Err(AdminError::InvalidBucketName(e.to_string()));
+    }
+
     let storage = state.storage.read().await;
     let marker_key = format!("__s4_bucket_marker_{}", bucket_name);
 
     // Check if already exists
     if storage.head_object("__system__", &marker_key).await.is_ok() {
-        return Err(AdminError::InvalidData);
+        return Err(AdminError::BucketAlreadyExists(bucket_name));
     }
 
     storage
@@ -337,15 +349,19 @@ pub async fn delete_bucket(
 
     // Check exists
     if storage.head_object("__system__", &marker_key).await.is_err() {
-        return Err(AdminError::UserNotFound); // reusing as "not found"
+        return Err(AdminError::BucketNotFound(bucket_name));
     }
 
     if query.force {
         // Recursively delete all objects in batches
         let batch_size = 1000;
         loop {
+            // A failed listing must not be read as "nothing left": that would
+            // drop the bucket marker while its objects are still stored.
             let objects =
-                storage.list_objects(&bucket_name, "", batch_size).await.unwrap_or_default();
+                storage.list_objects(&bucket_name, "", batch_size).await.map_err(|e| {
+                    AdminError::Storage(format!("Failed to list objects in '{bucket_name}': {e}"))
+                })?;
             if objects.is_empty() {
                 break;
             }
@@ -363,10 +379,13 @@ pub async fn delete_bucket(
             }
         }
     } else {
-        // Check empty
-        let objects = storage.list_objects(&bucket_name, "", 1).await.unwrap_or_default();
+        // Check empty — and report a failed listing rather than mistaking it
+        // for an empty bucket.
+        let objects = storage.list_objects(&bucket_name, "", 1).await.map_err(|e| {
+            AdminError::Storage(format!("Failed to list objects in '{bucket_name}': {e}"))
+        })?;
         if !objects.is_empty() {
-            return Err(AdminError::InvalidData);
+            return Err(AdminError::BucketNotEmpty(bucket_name));
         }
     }
 
@@ -421,6 +440,14 @@ pub async fn list_bucket_objects(
     }
 
     let storage = state.storage.read().await;
+
+    // Without this check a deleted bucket and an empty one both answer 200 with
+    // an empty list, and the caller cannot tell them apart.
+    let marker_key = format!("__s4_bucket_marker_{}", bucket_name);
+    if storage.head_object("__system__", &marker_key).await.is_err() {
+        return Err(AdminError::BucketNotFound(bucket_name));
+    }
+
     let prefix = params.prefix.unwrap_or_default();
     let max_keys = params.max_keys.unwrap_or(50);
 
@@ -643,46 +670,127 @@ pub async fn scrubber_status(
 }
 
 /// Admin API error type.
+///
+/// Every variant carries its own HTTP status and a stable, machine-readable
+/// code, so a caller (the web console, a script) can branch on the outcome
+/// instead of matching on the human-readable message. Only genuine server
+/// faults — `Iam` and `Storage` — answer 5xx; anything the caller can correct
+/// itself answers 4xx.
 #[derive(Debug)]
 pub enum AdminError {
-    /// User is not authorized (invalid token)
+    /// Token is missing, malformed or expired (401).
     Unauthorized,
-    /// User lacks required permissions
+    /// Login rejected: unknown account or wrong password (401).
+    ///
+    /// Both cases share one variant deliberately — telling them apart would let
+    /// an unauthenticated caller enumerate account names.
+    InvalidCredentials,
+    /// Caller is authenticated but lacks the required role (403).
     Forbidden,
-    /// User not found
+    /// No user with the requested id or name (404).
     UserNotFound,
-    /// Invalid request data
+    /// A user with this name already exists (409).
+    UserAlreadyExists,
+    /// Username does not satisfy the format rules (400).
+    InvalidUsername(String),
+    /// The user has no S3 credentials issued (404).
+    NoS3Credentials,
+    /// No bucket with the requested name (404).
+    BucketNotFound(String),
+    /// A bucket with this name already exists (409).
+    BucketAlreadyExists(String),
+    /// The bucket still holds objects and `force` was not requested (409).
+    BucketNotEmpty(String),
+    /// Bucket name does not satisfy the S3 naming rules (400).
+    InvalidBucketName(String),
+    /// Request body or parameters could not be interpreted (400).
     InvalidData,
-    /// IAM error
+    /// IAM subsystem fault (500).
     Iam(IamError),
-    /// Storage error
+    /// Storage engine fault (500).
     Storage(String),
+}
+
+impl AdminError {
+    /// HTTP status and stable error code for this error.
+    fn status_and_code(&self) -> (StatusCode, &'static str) {
+        match self {
+            AdminError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized"),
+            AdminError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "InvalidCredentials"),
+            AdminError::Forbidden => (StatusCode::FORBIDDEN, "Forbidden"),
+            AdminError::UserNotFound => (StatusCode::NOT_FOUND, "UserNotFound"),
+            AdminError::UserAlreadyExists => (StatusCode::CONFLICT, "UserAlreadyExists"),
+            AdminError::InvalidUsername(_) => (StatusCode::BAD_REQUEST, "InvalidUsername"),
+            AdminError::NoS3Credentials => (StatusCode::NOT_FOUND, "NoS3Credentials"),
+            // Same code the S3 path uses for a missing bucket, so a client can
+            // share one branch between the two APIs.
+            AdminError::BucketNotFound(_) => (StatusCode::NOT_FOUND, "NoSuchBucket"),
+            AdminError::BucketAlreadyExists(_) => (StatusCode::CONFLICT, "BucketAlreadyExists"),
+            AdminError::BucketNotEmpty(_) => (StatusCode::CONFLICT, "BucketNotEmpty"),
+            AdminError::InvalidBucketName(_) => (StatusCode::BAD_REQUEST, "InvalidBucketName"),
+            AdminError::InvalidData => (StatusCode::BAD_REQUEST, "InvalidData"),
+            AdminError::Iam(_) | AdminError::Storage(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "InternalError")
+            }
+        }
+    }
+
+    /// Human-readable message for this error.
+    fn message(&self) -> String {
+        match self {
+            AdminError::Unauthorized => "Unauthorized".to_string(),
+            AdminError::InvalidCredentials => "Invalid credentials".to_string(),
+            AdminError::Forbidden => "Forbidden".to_string(),
+            AdminError::UserNotFound => "User not found".to_string(),
+            AdminError::UserAlreadyExists => "User already exists".to_string(),
+            AdminError::InvalidUsername(reason) => reason.clone(),
+            AdminError::NoS3Credentials => "No S3 credentials configured for this user".to_string(),
+            AdminError::BucketNotFound(name) => format!("Bucket '{name}' not found"),
+            AdminError::BucketAlreadyExists(name) => format!("Bucket '{name}' already exists"),
+            AdminError::BucketNotEmpty(name) => format!(
+                "Bucket '{name}' is not empty. Delete its objects first, \
+                 or repeat the request with ?force=true"
+            ),
+            AdminError::InvalidBucketName(reason) => reason.clone(),
+            AdminError::InvalidData => "Invalid request data".to_string(),
+            AdminError::Iam(err) => err.to_string(),
+            AdminError::Storage(err) => err.clone(),
+        }
+    }
 }
 
 impl From<IamError> for AdminError {
     fn from(err: IamError) -> Self {
         match err {
             IamError::UserNotFound => AdminError::UserNotFound,
+            IamError::UserAlreadyExists => AdminError::UserAlreadyExists,
+            // IamError's own wording spells out the format rule — pass it on.
+            IamError::InvalidUsername => {
+                AdminError::InvalidUsername(IamError::InvalidUsername.to_string())
+            }
+            IamError::InvalidCredentials => AdminError::InvalidCredentials,
             IamError::InsufficientPermissions => AdminError::Forbidden,
             IamError::InvalidToken => AdminError::Unauthorized,
-            _ => AdminError::Iam(err),
+            IamError::NoS3Credentials => AdminError::NoS3Credentials,
+            // What is left is a server-side fault: hashing, token generation,
+            // storage, or a record we wrote ourselves and can no longer read.
+            other => AdminError::Iam(other),
         }
     }
 }
 
 impl IntoResponse for AdminError {
     fn into_response(self) -> Response {
-        let (status, message) = match self {
-            AdminError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".to_string()),
-            AdminError::Forbidden => (StatusCode::FORBIDDEN, "Forbidden".to_string()),
-            AdminError::UserNotFound => (StatusCode::NOT_FOUND, "User not found".to_string()),
-            AdminError::InvalidData => (StatusCode::BAD_REQUEST, "Invalid data".to_string()),
-            AdminError::Iam(err) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-            AdminError::Storage(err) => (StatusCode::INTERNAL_SERVER_ERROR, err),
-        };
+        let (status, code) = self.status_and_code();
+        let message = self.message();
+
+        if status.is_server_error() {
+            error!("Admin API fault ({}): {}", code, message);
+        }
 
         let body = Json(json!({
             "error": message,
+            "code": code,
         }));
 
         (status, body).into_response()

@@ -29,9 +29,12 @@ pub mod types;
 pub use error::StorageError;
 pub use storage::bitcask::{BitcaskStorageEngine, DiagnosticSnapshot, StorageStats};
 pub use storage::engine::{
-    DeleteMarkerEntry, DeleteResult, ListVersionsResult, ObjectStream, ObjectVersion, ReadOptions,
-    StorageEngine, StreamingPutResult,
+    is_force_physical_write, DeleteMarkerEntry, DeleteResult, ListVersionsResult, ObjectStream,
+    ObjectVersion, ReadOptions, StorageEngine, StreamingPutResult,
+    FORCE_PHYSICAL_WRITE_METADATA_KEY,
 };
 pub use storage::version_index::VersionList;
 pub use storage::versioning::{generate_version_id, is_null_version, NULL_VERSION_ID};
-pub use types::{BlobHeader, IndexRecord, VersioningStatus, DELETE_MARKER_FILE_ID};
+pub use types::{
+    BlobHeader, IndexRecord, VersioningStatus, DELETE_MARKER_FILE_ID, EXTERNAL_DATA_FILE_ID,
+};

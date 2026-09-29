@@ -42,7 +42,10 @@
 //! recovery.
 
 use crate::error::StorageError;
-use crate::storage::engine::{DeleteMarkerEntry, DeleteResult, ListVersionsResult, ObjectVersion};
+use crate::storage::engine::{
+    is_force_physical_write, DeleteMarkerEntry, DeleteResult, ListVersionsResult, ObjectVersion,
+    FORCE_PHYSICAL_WRITE_METADATA_KEY,
+};
 use crate::storage::journal::JournalEventType;
 use crate::storage::{
     generate_version_id, BatchAction, BatchOp, Deduplicator, IndexDb, KeyspaceId, MetadataJournal,
@@ -811,15 +814,20 @@ impl BitcaskStorageEngine {
     ) -> Result<(IndexRecord, String, Option<BatchOp>), StorageError> {
         let content_hash = Deduplicator::compute_hash(data);
         let etag = Self::compute_etag(data);
+        let force_physical_write = is_force_physical_write(metadata);
 
         // Check for dedup reuse (lock-free MVCC read)
-        let reused = Self::try_reuse_existing(
-            &self.deduplicator,
-            content_hash,
-            data.len() as u64,
-            &etag,
-            content_type,
-        )?;
+        let reused = if force_physical_write {
+            None
+        } else {
+            Self::try_reuse_existing(
+                &self.deduplicator,
+                content_hash,
+                data.len() as u64,
+                &etag,
+                content_type,
+            )?
+        };
 
         // Phase 5: All new objects are written to volumes, regardless of size.
         // Legacy inline objects (file_id == u32::MAX) are still readable but no
@@ -888,6 +896,7 @@ impl BitcaskStorageEngine {
                         record.operation_id = val;
                     }
                 }
+                FORCE_PHYSICAL_WRITE_METADATA_KEY => {}
                 _ => {
                     record.metadata.insert(k.clone(), v.clone());
                 }
@@ -895,6 +904,53 @@ impl BitcaskStorageEngine {
         }
 
         Ok((record, etag, dedup_op))
+    }
+
+    /// Take the blob this record points at out of the dedup index.
+    ///
+    /// Called when a read has just found that the bytes there do not hash to
+    /// what the record says they are. Deduplication answers a write with
+    /// "those bytes are already here", and after this it will not answer that
+    /// with these bytes: the next object with this content gets a copy of its
+    /// own, instead of being born corrupt on somebody else's bit rot.
+    ///
+    /// The entry is left alone unless it names exactly this copy — it may
+    /// already have been moved to a healthy one by a heal or by an earlier
+    /// writer, and moving it back would undo that.
+    ///
+    /// Best effort on purpose: this runs on a read that is already failing,
+    /// and the failure the caller must see is the damaged object, not a
+    /// secondary error from tidying the index.
+    async fn quarantine_rotted_blob(&self, record: &IndexRecord) {
+        if record.file_id == u32::MAX || record.is_composite() || record.is_erasure_coded() {
+            return;
+        }
+        match self.deduplicator.get_entry(&record.content_hash) {
+            Ok(Some(entry))
+                if entry.volume_id == record.file_id && entry.offset == record.offset =>
+            {
+                let op = self.deduplicator.make_quarantine_op(&record.content_hash);
+                if let Err(error) = self.index_db.batch_write(vec![op]).await {
+                    tracing::warn!(
+                        volume_id = record.file_id,
+                        offset = record.offset,
+                        %error,
+                        "could not take a damaged blob out of the dedup index"
+                    );
+                } else {
+                    tracing::warn!(
+                        volume_id = record.file_id,
+                        offset = record.offset,
+                        "damaged blob taken out of the dedup index; \
+                         new writes of this content will store their own copy"
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "could not read the dedup entry of a damaged blob");
+            }
+        }
     }
 
     /// Reads object data from a record.
@@ -1980,6 +2036,23 @@ impl BitcaskStorageEngine {
     }
 }
 
+/// The error every local read path returns for an erasure-coded record.
+///
+/// Such a record is a namespace entry: it describes the object but owns none of
+/// its bytes, which live as shards across a pool. Reading them is the EC
+/// runtime's job, and a local engine asked to do it is being called from the
+/// wrong layer — so this says that plainly instead of returning "not found",
+/// which would read as data loss.
+fn erasure_coded_data_is_remote(key: &str) -> StorageError {
+    StorageError::InvalidOperation {
+        operation: "read local object data".to_string(),
+        reason: format!(
+            "object '{key}' is erasure coded; its bytes are shards in the pool and must be read \
+             through the EC runtime"
+        ),
+    }
+}
+
 #[async_trait::async_trait]
 impl StorageEngine for BitcaskStorageEngine {
     async fn put_object(
@@ -1995,12 +2068,14 @@ impl StorageEngine for BitcaskStorageEngine {
         // Write object data and get dedup batch op
         let (record, etag, dedup_op) =
             self.write_object_data(&full_key, data, content_type, metadata).await?;
+        let force_physical_write = is_force_physical_write(metadata);
+        let existing = self.index_db.get(&full_key).await?;
 
         // LWW guard: in cluster mode (HLC present), skip write if existing
         // record has a newer HLC timestamp. This prevents a concurrent write
         // with an older HLC from overwriting a version that arrived first.
         if record.hlc_timestamp > 0 {
-            if let Some(existing) = self.index_db.get(&full_key).await? {
+            if let Some(existing) = &existing {
                 if existing.hlc_timestamp > 0 {
                     let existing_ord = (
                         existing.hlc_timestamp,
@@ -2013,7 +2088,7 @@ impl StorageEngine for BitcaskStorageEngine {
                         record.origin_node_id,
                     );
                     if existing_ord >= new_ord {
-                        return Ok(existing.etag);
+                        return Ok(existing.etag.clone());
                     }
                 }
             }
@@ -2028,7 +2103,31 @@ impl StorageEngine for BitcaskStorageEngine {
             action: BatchAction::Put(stripped_key.as_bytes().to_vec(), record_bytes),
         }];
         if let Some(op) = dedup_op {
-            ops.push(op);
+            if force_physical_write
+                && existing.as_ref().is_some_and(|old| old.content_hash == record.content_hash)
+            {
+                if self.deduplicator.get_entry(&record.content_hash)?.is_some() {
+                    ops.push(self.deduplicator.make_update_location_op(
+                        &record.content_hash,
+                        record.file_id,
+                        record.offset,
+                    ));
+                } else {
+                    ops.push(op);
+                }
+            } else {
+                ops.push(op);
+            }
+        }
+        if let Some(old) = &existing {
+            if old.content_hash != record.content_hash {
+                if old.is_composite() {
+                    let mut ref_ops = self.composite_delete_ref_ops(old).await?;
+                    ops.append(&mut ref_ops);
+                } else if old.file_id != u32::MAX {
+                    ops.push(self.deduplicator.make_unregister_op(&old.content_hash));
+                }
+            }
         }
         ops.push(
             self.journal.make_journal_entry_op(JournalEventType::ObjectPut {
@@ -2059,6 +2158,10 @@ impl StorageEngine for BitcaskStorageEngine {
                     key: full_key.clone(),
                 })?;
 
+        if record.is_erasure_coded() {
+            return Err(erasure_coded_data_is_remote(&full_key));
+        }
+
         if record.is_composite() {
             // Composite object: assemble data from segment blobs via streaming reader
             use crate::storage::engine::ReadOptions;
@@ -2073,6 +2176,7 @@ impl StorageEngine for BitcaskStorageEngine {
             let data = self.read_object_data(&record).await?;
             let computed_hash = Deduplicator::compute_hash(&data);
             if computed_hash != record.content_hash {
+                self.quarantine_rotted_blob(&record).await;
                 return Err(StorageError::ChecksumMismatch { key: full_key });
             }
             Ok((data, record))
@@ -2091,7 +2195,12 @@ impl StorageEngine for BitcaskStorageEngine {
 
         // Unregister from dedup if not inline; handle composite objects
         if let Some(record) = self.index_db.get(&full_key).await? {
-            if record.is_composite() {
+            if record.is_erasure_coded() {
+                // The blob reference was already released when the data moved to
+                // the pool. Releasing it a second time would decrement a count
+                // this record no longer holds, and take the blob away from
+                // whichever object still does.
+            } else if record.is_composite() {
                 // Composite object: decrement committed refs for all segments + manifest
                 let mut ref_ops = self.composite_delete_ref_ops(&record).await?;
                 ops.append(&mut ref_ops);
@@ -2112,6 +2221,263 @@ impl StorageEngine for BitcaskStorageEngine {
         self.index_db.batch_write(ops).await?;
 
         Ok(())
+    }
+
+    async fn delete_object_if_hlc(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected_hlc_timestamp: u64,
+        expected_hlc_logical: u32,
+        expected_origin_node_id: u128,
+    ) -> Result<bool, StorageError> {
+        let full_key = self.make_key(bucket, key);
+        let Some(record) = self.index_db.get(&full_key).await? else {
+            return Ok(false);
+        };
+        if record.hlc_timestamp != expected_hlc_timestamp
+            || record.hlc_logical != expected_hlc_logical
+            || record.origin_node_id != expected_origin_node_id
+        {
+            return Ok(false);
+        }
+
+        let (keyspace, stripped_key) = self.index_db.route_key_id(&full_key);
+        let mut ops = vec![BatchOp {
+            keyspace,
+            action: BatchAction::Delete(stripped_key.as_bytes().to_vec()),
+        }];
+
+        if record.is_erasure_coded() {
+            // Data already released by the move to the pool; see `delete_object`.
+        } else if record.is_composite() {
+            let mut ref_ops = self.composite_delete_ref_ops(&record).await?;
+            ops.append(&mut ref_ops);
+        } else if record.file_id != u32::MAX {
+            ops.push(self.deduplicator.make_unregister_op(&record.content_hash));
+        }
+
+        ops.push(
+            self.journal.make_journal_entry_op(JournalEventType::ObjectDelete {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: None,
+            })?,
+        );
+
+        self.index_db.batch_write(ops).await?;
+        Ok(true)
+    }
+
+    async fn detach_object_data_if_hlc(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected_hlc_timestamp: u64,
+        expected_hlc_logical: u32,
+        expected_origin_node_id: u128,
+        layout: crate::types::ObjectLayout,
+    ) -> Result<bool, StorageError> {
+        let crate::types::ObjectLayout::ErasureCoded {
+            erasure_set_id,
+            topology_epoch,
+        } = layout
+        else {
+            return Err(StorageError::InvalidOperation {
+                operation: "detach_object_data_if_hlc".to_string(),
+                reason: "only an erasure-coded layout can replace local data".to_string(),
+            });
+        };
+
+        let full_key = self.make_key(bucket, key);
+        let Some(record) = self.index_db.get(&full_key).await? else {
+            return Ok(false);
+        };
+        if record.hlc_timestamp != expected_hlc_timestamp
+            || record.hlc_logical != expected_hlc_logical
+            || record.origin_node_id != expected_origin_node_id
+        {
+            return Ok(false);
+        }
+        if record.is_erasure_coded() {
+            // Already converted by an earlier attempt. Idempotent: the caller
+            // retries purges, and a second pass must not release the blob twice.
+            return Ok(true);
+        }
+
+        let (keyspace, stripped_key) = self.index_db.route_key_id(&full_key);
+        let converted = record.clone().into_erasure_coded(erasure_set_id, topology_epoch);
+
+        // Release the local data exactly as a delete would, then write the
+        // namespace entry back in the same batch. The blob itself is reclaimed
+        // by compaction once nothing references it.
+        let mut ops = if record.is_composite() {
+            self.composite_delete_ref_ops(&record).await?
+        } else if record.file_id != DELETE_MARKER_FILE_ID {
+            vec![self.deduplicator.make_unregister_op(&record.content_hash)]
+        } else {
+            Vec::new()
+        };
+
+        ops.push(BatchOp {
+            keyspace,
+            action: BatchAction::Put(
+                stripped_key.as_bytes().to_vec(),
+                bincode::serialize(&converted)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?,
+            ),
+        });
+
+        // Journalled as a put, not a delete: recovery has to restore the record
+        // with its new layout, and replaying a delete would drop the object out
+        // of the namespace all over again.
+        ops.push(
+            self.journal.make_journal_entry_op(JournalEventType::ObjectPut {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: converted.version_id.clone(),
+                record: converted,
+            })?,
+        );
+
+        self.index_db.batch_write(ops).await?;
+        Ok(true)
+    }
+
+    async fn attach_object_data_if_hlc(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected_hlc_timestamp: u64,
+        expected_hlc_logical: u32,
+        expected_origin_node_id: u128,
+        data: &[u8],
+    ) -> Result<bool, StorageError> {
+        let full_key = self.make_key(bucket, key);
+        let Some(record) = self.index_db.get(&full_key).await? else {
+            return Ok(false);
+        };
+        if record.hlc_timestamp != expected_hlc_timestamp
+            || record.hlc_logical != expected_hlc_logical
+            || record.origin_node_id != expected_origin_node_id
+        {
+            return Ok(false);
+        }
+        if !record.is_erasure_coded() {
+            // Already local: either an earlier attempt of this promotion got
+            // here, or the object was never detached on this replica. Both are
+            // the state the caller asked for, and the caller retries.
+            return Ok(true);
+        }
+        if data.len() as u64 != record.size {
+            return Err(StorageError::InvalidOperation {
+                operation: "attach_object_data_if_hlc".to_string(),
+                reason: format!(
+                    "supplied {} byte(s) for an object the index records as {} byte(s)",
+                    data.len(),
+                    record.size
+                ),
+            });
+        }
+
+        let content_hash = Deduplicator::compute_hash(data);
+
+        // Reuse the blob when this content is already stored — the promoted
+        // object is very often a copy of something the node still holds, and a
+        // second physical copy would cost the space erasure coding just saved.
+        let (file_id, offset) = match self.deduplicator.check_existing(&content_hash)? {
+            Some((volume_id, offset)) if volume_id != DELETE_MARKER_FILE_ID => (volume_id, offset),
+            _ => {
+                let mut writer = self.volume_writer.write().await;
+                let written = writer
+                    .write_blob(
+                        &BlobHeader::new(
+                            full_key.len() as u32,
+                            data.len() as u64,
+                            crc32fast::hash(data),
+                        ),
+                        &full_key,
+                        data,
+                    )
+                    .await?;
+                if self.strict_sync {
+                    writer.sync().await?;
+                }
+                written
+            }
+        };
+
+        let mut restored = record.into_locally_stored(file_id, offset);
+        // The hash the index carried belonged to whatever layout the object had
+        // before it was encoded, and for a multipart object that is not the
+        // hash of its bytes. Both the dedup reference taken below and the
+        // checksum the read path verifies are about the blob just written, so
+        // both have to read the hash of exactly those bytes.
+        restored.content_hash = content_hash;
+
+        let (keyspace, stripped_key) = self.index_db.route_key_id(&full_key);
+        let ops = vec![
+            self.deduplicator.make_register_op(content_hash, file_id, offset),
+            BatchOp {
+                keyspace,
+                action: BatchAction::Put(
+                    stripped_key.as_bytes().to_vec(),
+                    bincode::serialize(&restored)
+                        .map_err(|e| StorageError::Serialization(e.to_string()))?,
+                ),
+            },
+            self.journal.make_journal_entry_op(JournalEventType::ObjectPut {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: restored.version_id.clone(),
+                record: restored,
+            })?,
+        ];
+
+        self.index_db.batch_write(ops).await?;
+        Ok(true)
+    }
+
+    async fn restore_erasure_coded_entry(
+        &self,
+        bucket: &str,
+        key: &str,
+        record: IndexRecord,
+    ) -> Result<bool, StorageError> {
+        if !record.is_erasure_coded() {
+            return Err(StorageError::InvalidOperation {
+                operation: "restore_erasure_coded_entry".to_string(),
+                reason: "the record must carry an erasure-coded layout".to_string(),
+            });
+        }
+
+        let full_key = self.make_key(bucket, key);
+        if self.index_db.get(&full_key).await?.is_some() {
+            // Whatever the index holds is at least as new as the manifest we
+            // rebuilt this from, so it wins.
+            return Ok(false);
+        }
+
+        let (keyspace, stripped_key) = self.index_db.route_key_id(&full_key);
+        let ops = vec![
+            BatchOp {
+                keyspace,
+                action: BatchAction::Put(
+                    stripped_key.as_bytes().to_vec(),
+                    bincode::serialize(&record)
+                        .map_err(|e| StorageError::Serialization(e.to_string()))?,
+                ),
+            },
+            self.journal.make_journal_entry_op(JournalEventType::ObjectPut {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: record.version_id.clone(),
+                record,
+            })?,
+        ];
+
+        self.index_db.batch_write(ops).await?;
+        Ok(true)
     }
 
     async fn head_object(&self, bucket: &str, key: &str) -> Result<IndexRecord, StorageError> {
@@ -2337,6 +2703,7 @@ impl StorageEngine for BitcaskStorageEngine {
         // Verify checksum
         let computed_hash = Deduplicator::compute_hash(&data);
         if computed_hash != record.content_hash {
+            self.quarantine_rotted_blob(&record).await;
             return Err(StorageError::ChecksumMismatch {
                 key: format!("{}#{}", key, version_id),
             });
@@ -3177,6 +3544,100 @@ impl StorageEngine for BitcaskStorageEngine {
         }
         self.open_record_stream(record, options).await
     }
+
+    async fn heal_object_blob(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: Option<&str>,
+        data: &[u8],
+    ) -> Result<(), StorageError> {
+        let full_key = match version_id {
+            Some(version_id) => self.make_version_key(bucket, key, version_id),
+            None => self.make_key(bucket, key),
+        };
+        let mut record =
+            self.index_db
+                .get(&full_key)
+                .await?
+                .ok_or_else(|| StorageError::ObjectNotFound {
+                    key: full_key.clone(),
+                })?;
+
+        if record.is_delete_marker || record.file_id == u32::MAX {
+            return Err(StorageError::InvalidData(format!(
+                "{full_key} has no blob of its own to heal"
+            )));
+        }
+        if record.is_composite() || record.is_erasure_coded() {
+            return Err(StorageError::InvalidData(format!(
+                "{full_key} is stored in parts; heal the part that is damaged"
+            )));
+        }
+        // The caller is restoring this object, not writing a new one. Bytes
+        // that are not this object's content would be a silent overwrite, and
+        // the one thing a repair must never do is replace data with other data.
+        if Deduplicator::compute_hash(data) != record.content_hash {
+            return Err(StorageError::ChecksumMismatch {
+                key: full_key.clone(),
+            });
+        }
+
+        let (volume_id, offset) = {
+            let mut writer = self.volume_writer.write().await;
+            let location = writer
+                .write_blob(
+                    &BlobHeader::new(
+                        full_key.len() as u32,
+                        data.len() as u64,
+                        crc32fast::hash(data),
+                    ),
+                    &full_key,
+                    data,
+                )
+                .await?;
+            // Always synced, whatever the engine's usual durability setting:
+            // a heal that is still in the page cache when the machine dies
+            // leaves the same damage behind that it was called to remove.
+            writer.sync().await?;
+            location
+        };
+
+        record.file_id = volume_id;
+        record.offset = offset;
+
+        let record_bytes =
+            bincode::serialize(&record).map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let (keyspace, stripped_key) = self.index_db.route_key_id(&full_key);
+        let mut ops = vec![BatchOp {
+            keyspace,
+            action: BatchAction::Put(stripped_key.as_bytes().to_vec(), record_bytes),
+        }];
+        // The dedup entry goes with the healthy copy. Left where it was, it
+        // would keep handing the damaged blob to the next writer of this
+        // content, and the compactor would count the damage as live and the
+        // copy just written as garbage.
+        if self.deduplicator.get_entry(&record.content_hash)?.is_some() {
+            ops.push(self.deduplicator.make_update_location_op(
+                &record.content_hash,
+                volume_id,
+                offset,
+            ));
+        } else {
+            ops.push(self.deduplicator.make_register_op(record.content_hash, volume_id, offset));
+        }
+        ops.push(
+            self.journal.make_journal_entry_op(JournalEventType::ObjectPut {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: version_id.map(|id| id.to_string()),
+                record: record.clone(),
+            })?,
+        );
+        self.index_db.batch_write(ops).await?;
+
+        Ok(())
+    }
 }
 
 /// A slice specification for one segment in a composite read.
@@ -3539,8 +4000,17 @@ impl BitcaskStorageEngine {
             });
         }
 
+        if record.is_erasure_coded() {
+            return Err(erasure_coded_data_is_remote(""));
+        }
+
         let total_size = record.size;
-        self.verify_record_stream_integrity(&record).await?;
+        if let Err(error) = self.verify_record_stream_integrity(&record).await {
+            if matches!(error, StorageError::ChecksumMismatch { .. }) {
+                self.quarantine_rotted_blob(&record).await;
+            }
+            return Err(error);
+        }
 
         // Legacy inline storage: fall back to buffered read
         if record.file_id == u32::MAX && !record.is_composite() {
@@ -3763,6 +4233,7 @@ impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Sha256TeeReader<'
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{ObjectLayout, EXTERNAL_DATA_FILE_ID};
     use tempfile::TempDir;
 
     #[tokio::test]
@@ -3857,6 +4328,474 @@ mod tests {
         assert_eq!(record1.offset, record2.offset);
     }
 
+    /// A PUT whose caller went away mid-write, the way an RPC does when the
+    /// node on the other end is stopped: the objects written after it must
+    /// still read back. They used to be recorded at offsets that lagged behind
+    /// where their bytes went, and read as "invalid u8 while decoding bool".
+    #[tokio::test]
+    async fn a_put_dropped_mid_write_leaves_later_objects_readable() {
+        use futures::FutureExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let engine = BitcaskStorageEngine::new(
+            temp_dir.path().join("volumes"),
+            temp_dir.path().join("metadata_db"),
+            64 * 1024 * 1024,
+            4096,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let dropped_body = vec![0xE2u8; 256 * 1024];
+        let metadata = HashMap::new();
+        let mut dropped = false;
+        for attempt in 0..100 {
+            let key = format!("dropped-{attempt}");
+            let put = engine.put_object(
+                "bucket",
+                &key,
+                &dropped_body,
+                "application/octet-stream",
+                &metadata,
+            );
+            if put.now_or_never().is_none() {
+                dropped = true;
+                break;
+            }
+        }
+        assert!(dropped, "no PUT stayed pending long enough to be dropped");
+
+        for index in 0..3u8 {
+            let key = format!("after-{index}");
+            let body: Vec<u8> = (0..4096u32).map(|i| (i as u8).wrapping_mul(index + 3)).collect();
+            engine
+                .put_object(
+                    "bucket",
+                    &key,
+                    &body,
+                    "application/octet-stream",
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap();
+            let (read, _) = engine.get_object("bucket", &key).await.unwrap();
+            assert_eq!(read, body, "{key} does not read back");
+        }
+    }
+
+    #[tokio::test]
+    async fn force_physical_write_bypasses_dedup_reuse() {
+        let temp_dir = TempDir::new().unwrap();
+        let volumes_dir = temp_dir.path().join("volumes");
+        let metadata_path = temp_dir.path().join("metadata_db");
+
+        let engine =
+            BitcaskStorageEngine::new(&volumes_dir, &metadata_path, 1024 * 1024, 4096, false)
+                .await
+                .unwrap();
+
+        let data = b"repair shard bytes";
+        engine
+            .put_object(
+                "bucket",
+                "key",
+                data,
+                "application/octet-stream",
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let first = engine.head_object("bucket", "key").await.unwrap();
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            FORCE_PHYSICAL_WRITE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        );
+        engine
+            .put_object("bucket", "key", data, "application/octet-stream", &metadata)
+            .await
+            .unwrap();
+
+        let (read, second) = engine.get_object("bucket", "key").await.unwrap();
+        assert_eq!(read, data);
+        assert_ne!(
+            (first.file_id, first.offset),
+            (second.file_id, second.offset)
+        );
+        assert!(!second.metadata.contains_key(FORCE_PHYSICAL_WRITE_METADATA_KEY));
+    }
+
+    /// Flip one byte of `needle` where it lies in a volume file, the way bit
+    /// rot does — the blob keeps its index record, its dedup entry and its
+    /// recorded hash, and only the bytes on the disk are no longer those.
+    async fn rot_one_byte(volumes_dir: &std::path::Path, needle: &[u8]) {
+        let mut entries = tokio::fs::read_dir(volumes_dir).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let path = entry.path();
+            if path.extension().is_none_or(|ext| ext != "dat") {
+                continue;
+            }
+            let mut bytes = tokio::fs::read(&path).await.unwrap();
+            let Some(position) = bytes.windows(needle.len()).position(|window| window == needle)
+            else {
+                continue;
+            };
+            bytes[position] ^= 0xFF;
+            tokio::fs::write(&path, &bytes).await.unwrap();
+            return;
+        }
+        panic!("the bytes to rot are not in any volume file under {volumes_dir:?}");
+    }
+
+    /// The guarantee a repair stands on: a write that asks to materialise its
+    /// bytes replaces what rotted instead of being answered from the dedup
+    /// index.
+    #[tokio::test]
+    async fn a_healing_write_replaces_bytes_that_rotted_on_disk() {
+        let temp_dir = TempDir::new().unwrap();
+        let volumes_dir = temp_dir.path().join("volumes");
+        let metadata_path = temp_dir.path().join("metadata_db");
+
+        let engine =
+            BitcaskStorageEngine::new(&volumes_dir, &metadata_path, 1024 * 1024, 4096, false)
+                .await
+                .unwrap();
+
+        let data = b"a shard that rots on its owner's disk";
+        engine
+            .put_object(
+                "bucket",
+                "shard",
+                data,
+                "application/octet-stream",
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let before = engine.head_object("bucket", "shard").await.unwrap();
+
+        rot_one_byte(&volumes_dir, data).await;
+        assert!(
+            matches!(
+                engine.get_object("bucket", "shard").await,
+                Err(StorageError::ChecksumMismatch { .. })
+            ),
+            "a rotted blob must be read as damaged, not served"
+        );
+
+        let healing = HashMap::from([(
+            FORCE_PHYSICAL_WRITE_METADATA_KEY.to_string(),
+            "true".to_string(),
+        )]);
+        engine
+            .put_object(
+                "bucket",
+                "shard",
+                data,
+                "application/octet-stream",
+                &healing,
+            )
+            .await
+            .unwrap();
+
+        let (read, after) = engine.get_object("bucket", "shard").await.unwrap();
+        assert_eq!(read, data, "the healing write did not put the bytes back");
+        assert_ne!(
+            (before.file_id, before.offset),
+            (after.file_id, after.offset),
+            "the healed record still points at the blob that rotted"
+        );
+    }
+
+    /// And why a repair has to ask: an ordinary rewrite of identical content is
+    /// a dedup hit by design, so it cannot be what heals a damaged blob.
+    #[tokio::test]
+    async fn an_ordinary_rewrite_of_the_same_content_does_not_heal_a_rotted_blob() {
+        let temp_dir = TempDir::new().unwrap();
+        let volumes_dir = temp_dir.path().join("volumes");
+        let metadata_path = temp_dir.path().join("metadata_db");
+
+        let engine =
+            BitcaskStorageEngine::new(&volumes_dir, &metadata_path, 1024 * 1024, 4096, false)
+                .await
+                .unwrap();
+
+        let data = b"content a second writer happens to hold too";
+        engine
+            .put_object(
+                "bucket",
+                "shard",
+                data,
+                "application/octet-stream",
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        rot_one_byte(&volumes_dir, data).await;
+
+        engine
+            .put_object(
+                "bucket",
+                "shard",
+                data,
+                "application/octet-stream",
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                engine.get_object("bucket", "shard").await,
+                Err(StorageError::ChecksumMismatch { .. })
+            ),
+            "an ordinary write must not be mistaken for a heal"
+        );
+    }
+
+    /// The hazard deduplication brings with it: a second object with the same
+    /// content must not be handed the blob a read has already found damaged.
+    #[tokio::test]
+    async fn a_new_object_is_not_deduplicated_onto_a_blob_known_to_be_damaged() {
+        let temp_dir = TempDir::new().unwrap();
+        let volumes_dir = temp_dir.path().join("volumes");
+        let metadata_path = temp_dir.path().join("metadata_db");
+
+        let engine =
+            BitcaskStorageEngine::new(&volumes_dir, &metadata_path, 1024 * 1024, 4096, false)
+                .await
+                .unwrap();
+
+        let data = b"content two objects happen to share";
+        engine
+            .put_object(
+                "bucket",
+                "first",
+                data,
+                "application/octet-stream",
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        rot_one_byte(&volumes_dir, data).await;
+
+        // The read is what tells the engine those bytes are not what they claim.
+        assert!(matches!(
+            engine.get_object("bucket", "first").await,
+            Err(StorageError::ChecksumMismatch { .. })
+        ));
+
+        engine
+            .put_object(
+                "bucket",
+                "second",
+                data,
+                "application/octet-stream",
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let (read, second) = engine.get_object("bucket", "second").await.unwrap();
+        assert_eq!(
+            read, data,
+            "the new object was born on somebody else's bit rot"
+        );
+
+        // And the dedup entry now names the healthy copy, not the damaged one:
+        // the compactor decides what is live by what the entries name, so an
+        // entry left naming nothing would make this blob look like garbage.
+        let first = engine.head_object("bucket", "first").await.unwrap();
+        let entry = engine.deduplicator.get_entry(&second.content_hash).unwrap().unwrap();
+        assert_eq!(
+            (entry.volume_id, entry.offset),
+            (second.file_id, second.offset)
+        );
+        assert_ne!(
+            (entry.volume_id, entry.offset),
+            (first.file_id, first.offset)
+        );
+    }
+
+    /// A blob nobody has read yet is not suspected of anything: the entry keeps
+    /// its location, and identical content is still stored once.
+    #[tokio::test]
+    async fn deduplication_still_shares_a_blob_that_reads_correctly() {
+        let temp_dir = TempDir::new().unwrap();
+        let volumes_dir = temp_dir.path().join("volumes");
+        let metadata_path = temp_dir.path().join("metadata_db");
+
+        let engine =
+            BitcaskStorageEngine::new(&volumes_dir, &metadata_path, 1024 * 1024, 4096, false)
+                .await
+                .unwrap();
+
+        let data = b"content stored once";
+        engine
+            .put_object(
+                "bucket",
+                "first",
+                data,
+                "application/octet-stream",
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        engine.get_object("bucket", "first").await.unwrap();
+        engine
+            .put_object(
+                "bucket",
+                "second",
+                data,
+                "application/octet-stream",
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let first = engine.head_object("bucket", "first").await.unwrap();
+        let second = engine.head_object("bucket", "second").await.unwrap();
+        assert_eq!(
+            (first.file_id, first.offset),
+            (second.file_id, second.offset)
+        );
+    }
+
+    /// What a scrubber needs: the bytes of an object it found damaged go back
+    /// on the disk, and nothing else about the object changes.
+    #[tokio::test]
+    async fn healing_an_object_restores_its_bytes_and_keeps_its_identity() {
+        let temp_dir = TempDir::new().unwrap();
+        let volumes_dir = temp_dir.path().join("volumes");
+        let metadata_path = temp_dir.path().join("metadata_db");
+
+        let engine =
+            BitcaskStorageEngine::new(&volumes_dir, &metadata_path, 1024 * 1024, 4096, false)
+                .await
+                .unwrap();
+
+        let data = b"an object a disk will damage";
+        let metadata = HashMap::from([("x-amz-meta-owner".to_string(), "sre".to_string())]);
+        engine
+            .put_object("bucket", "object", data, "text/plain", &metadata)
+            .await
+            .unwrap();
+        let before = engine.head_object("bucket", "object").await.unwrap();
+
+        rot_one_byte(&volumes_dir, data).await;
+        assert!(matches!(
+            engine.get_object("bucket", "object").await,
+            Err(StorageError::ChecksumMismatch { .. })
+        ));
+
+        engine.heal_object_blob("bucket", "object", None, data).await.unwrap();
+
+        let (read, after) = engine.get_object("bucket", "object").await.unwrap();
+        assert_eq!(read, data);
+        assert_ne!(
+            (before.file_id, before.offset),
+            (after.file_id, after.offset)
+        );
+        assert_eq!(before.etag, after.etag);
+        assert_eq!(before.size, after.size);
+        assert_eq!(before.content_type, after.content_type);
+        assert_eq!(before.content_hash, after.content_hash);
+        assert_eq!(before.hlc_timestamp, after.hlc_timestamp);
+        assert_eq!(
+            before.metadata.get("x-amz-meta-owner"),
+            after.metadata.get("x-amz-meta-owner")
+        );
+
+        // The dedup entry follows the healthy copy.
+        let entry = engine.deduplicator.get_entry(&after.content_hash).unwrap().unwrap();
+        assert_eq!(
+            (entry.volume_id, entry.offset),
+            (after.file_id, after.offset)
+        );
+    }
+
+    /// A heal restores an object; it never replaces one. Bytes that are not
+    /// this object's content are refused rather than written.
+    #[tokio::test]
+    async fn healing_refuses_bytes_that_are_not_the_object() {
+        let temp_dir = TempDir::new().unwrap();
+        let volumes_dir = temp_dir.path().join("volumes");
+        let metadata_path = temp_dir.path().join("metadata_db");
+
+        let engine =
+            BitcaskStorageEngine::new(&volumes_dir, &metadata_path, 1024 * 1024, 4096, false)
+                .await
+                .unwrap();
+
+        engine
+            .put_object(
+                "bucket",
+                "object",
+                b"the real content",
+                "text/plain",
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let outcome = engine
+            .heal_object_blob("bucket", "object", None, b"something else entirely")
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(StorageError::ChecksumMismatch { .. })
+        ));
+        let (read, _) = engine.get_object("bucket", "object").await.unwrap();
+        assert_eq!(read, b"the real content");
+    }
+
+    /// Versions are objects too, and a scrubber meets their records in exactly
+    /// the same volumes.
+    #[tokio::test]
+    async fn healing_restores_one_version_of_a_versioned_object() {
+        let temp_dir = TempDir::new().unwrap();
+        let volumes_dir = temp_dir.path().join("volumes");
+        let metadata_path = temp_dir.path().join("metadata_db");
+
+        let engine =
+            BitcaskStorageEngine::new(&volumes_dir, &metadata_path, 1024 * 1024, 4096, false)
+                .await
+                .unwrap();
+
+        let data = b"the first version of a versioned object";
+        let (_, version_id) = engine
+            .put_object_versioned(
+                "bucket",
+                "object",
+                data,
+                "text/plain",
+                &HashMap::new(),
+                VersioningStatus::Enabled,
+            )
+            .await
+            .unwrap();
+        let version_id = version_id.expect("versioning was enabled");
+
+        rot_one_byte(&volumes_dir, data).await;
+        assert!(matches!(
+            engine.get_object_version("bucket", "object", &version_id).await,
+            Err(StorageError::ChecksumMismatch { .. })
+        ));
+
+        engine
+            .heal_object_blob("bucket", "object", Some(&version_id), data)
+            .await
+            .unwrap();
+
+        let (read, record) =
+            engine.get_object_version("bucket", "object", &version_id).await.unwrap();
+        assert_eq!(read, data);
+        assert_eq!(record.version_id.as_deref(), Some(version_id.as_str()));
+    }
+
     #[tokio::test]
     async fn test_delete_object() {
         let temp_dir = TempDir::new().unwrap();
@@ -3877,6 +4816,545 @@ mod tests {
 
         let result = engine.get_object("bucket", "key").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_object_if_hlc_preserves_different_generation() {
+        let temp_dir = TempDir::new().unwrap();
+        let volumes_dir = temp_dir.path().join("volumes");
+        let metadata_path = temp_dir.path().join("metadata_db");
+
+        let engine =
+            BitcaskStorageEngine::new(&volumes_dir, &metadata_path, 1024 * 1024, 4096, false)
+                .await
+                .unwrap();
+
+        let mut old_metadata = HashMap::new();
+        old_metadata.insert("_s4_hlc_wall".to_string(), "10".to_string());
+        old_metadata.insert("_s4_hlc_logical".to_string(), "0".to_string());
+        old_metadata.insert("_s4_hlc_node_id".to_string(), "1".to_string());
+        engine
+            .put_object("bucket", "key", b"old", "text/plain", &old_metadata)
+            .await
+            .unwrap();
+
+        let mut new_metadata = HashMap::new();
+        new_metadata.insert("_s4_hlc_wall".to_string(), "20".to_string());
+        new_metadata.insert("_s4_hlc_logical".to_string(), "0".to_string());
+        new_metadata.insert("_s4_hlc_node_id".to_string(), "1".to_string());
+        engine
+            .put_object("bucket", "key", b"new", "text/plain", &new_metadata)
+            .await
+            .unwrap();
+
+        let deleted = engine.delete_object_if_hlc("bucket", "key", 10, 0, 1).await.unwrap();
+        assert!(!deleted);
+
+        let (data, record) = engine.get_object("bucket", "key").await.unwrap();
+        assert_eq!(data, b"new");
+        assert_eq!(record.hlc_timestamp, 20);
+
+        let deleted = engine.delete_object_if_hlc("bucket", "key", 20, 0, 1).await.unwrap();
+        assert!(deleted);
+        assert!(matches!(
+            engine.head_object("bucket", "key").await,
+            Err(StorageError::ObjectNotFound { .. })
+        ));
+    }
+
+    /// Helper: writes one object at a known HLC generation.
+    #[cfg(test)]
+    async fn put_at_hlc(
+        engine: &BitcaskStorageEngine,
+        bucket: &str,
+        key: &str,
+        body: &[u8],
+        wall: u64,
+    ) {
+        let mut metadata = HashMap::new();
+        metadata.insert("_s4_hlc_wall".to_string(), wall.to_string());
+        metadata.insert("_s4_hlc_logical".to_string(), "0".to_string());
+        metadata.insert("_s4_hlc_node_id".to_string(), "1".to_string());
+        metadata.insert("x-amz-meta-owner".to_string(), "acceptance".to_string());
+        engine
+            .put_object(bucket, key, body, "application/octet-stream", &metadata)
+            .await
+            .unwrap();
+    }
+
+    /// Detaching the data must keep everything a client can see.
+    ///
+    /// This is the whole point of the operation: the object moves to erasure
+    /// coding, and a listing, a lifecycle scan or a bucket-statistics pass must
+    /// still find it, with the same size and ETag as before.
+    #[tokio::test]
+    async fn detach_object_data_keeps_the_object_in_the_namespace() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = BitcaskStorageEngine::new(
+            &temp_dir.path().join("volumes"),
+            &temp_dir.path().join("metadata_db"),
+            1024 * 1024,
+            4096,
+            false,
+        )
+        .await
+        .unwrap();
+
+        put_at_hlc(&engine, "bucket", "dir/object.bin", b"payload-bytes", 10).await;
+        let before = engine.head_object("bucket", "dir/object.bin").await.unwrap();
+
+        let detached = engine
+            .detach_object_data_if_hlc(
+                "bucket",
+                "dir/object.bin",
+                10,
+                0,
+                1,
+                ObjectLayout::ErasureCoded {
+                    erasure_set_id: 7,
+                    topology_epoch: 3,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(detached);
+
+        let after = engine.head_object("bucket", "dir/object.bin").await.unwrap();
+        assert!(after.is_erasure_coded());
+        assert_eq!(after.file_id, EXTERNAL_DATA_FILE_ID);
+        assert_eq!(
+            after.layout,
+            Some(ObjectLayout::ErasureCoded {
+                erasure_set_id: 7,
+                topology_epoch: 3
+            })
+        );
+
+        // Client-visible fields survive untouched.
+        assert_eq!(after.size, before.size);
+        assert_eq!(after.etag, before.etag);
+        assert_eq!(after.content_type, before.content_type);
+        assert_eq!(
+            after.metadata.get("x-amz-meta-owner"),
+            Some(&"acceptance".to_string())
+        );
+        assert_eq!(after.modified_at, before.modified_at);
+        assert_eq!(after.hlc_timestamp, before.hlc_timestamp);
+
+        // And the object is still listed, which is what the S3 client sees.
+        let listed = engine.list_objects("bucket", "dir/", 10).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, "dir/object.bin");
+        assert_eq!(listed[0].1.size, before.size);
+    }
+
+    /// The local data is released, so compaction can reclaim the space.
+    ///
+    /// A detached record must not keep its content hash alive in the live-ref
+    /// scan; if it did, hot purge would free nothing and the pool would keep
+    /// paying for both the replicas and the shards.
+    #[tokio::test]
+    async fn detach_object_data_releases_the_local_blob() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = BitcaskStorageEngine::new(
+            &temp_dir.path().join("volumes"),
+            &temp_dir.path().join("metadata_db"),
+            1024 * 1024,
+            4096,
+            false,
+        )
+        .await
+        .unwrap();
+
+        put_at_hlc(&engine, "bucket", "object.bin", b"payload-bytes", 10).await;
+        let (live_before, _) = engine.index_db.scan_all_content_refs().await.unwrap();
+        assert_eq!(live_before.len(), 1);
+
+        engine
+            .detach_object_data_if_hlc(
+                "bucket",
+                "object.bin",
+                10,
+                0,
+                1,
+                ObjectLayout::ErasureCoded {
+                    erasure_set_id: 1,
+                    topology_epoch: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (live_after, _) = engine.index_db.scan_all_content_refs().await.unwrap();
+        assert!(
+            live_after.is_empty(),
+            "detached record must not count as a live reference to its old blob"
+        );
+
+        // Reading local bytes must fail loudly rather than return "not found",
+        // which a caller would read as data loss.
+        let error = engine.get_object("bucket", "object.bin").await.unwrap_err();
+        assert!(
+            matches!(error, StorageError::InvalidOperation { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// Deleting a detached object must not release the blob a second time.
+    ///
+    /// The reference was already given up when the data moved to the pool. A
+    /// second release would decrement a count this record no longer holds, and
+    /// take the blob away from whichever object still shares it.
+    #[tokio::test]
+    async fn deleting_a_detached_record_releases_the_blob_only_once() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = BitcaskStorageEngine::new(
+            &temp_dir.path().join("volumes"),
+            &temp_dir.path().join("metadata_db"),
+            1024 * 1024,
+            4096,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Identical bytes under two keys: one blob, two references.
+        put_at_hlc(&engine, "bucket", "a.bin", b"shared-body", 10).await;
+        put_at_hlc(&engine, "bucket", "b.bin", b"shared-body", 20).await;
+        let content_hash = engine.head_object("bucket", "a.bin").await.unwrap().content_hash;
+        assert_eq!(
+            engine.deduplicator.get_entry(&content_hash).unwrap().unwrap().ref_count,
+            2
+        );
+
+        // The move to EC gives up one reference.
+        engine
+            .detach_object_data_if_hlc(
+                "bucket",
+                "a.bin",
+                10,
+                0,
+                1,
+                ObjectLayout::ErasureCoded {
+                    erasure_set_id: 1,
+                    topology_epoch: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            engine.deduplicator.get_entry(&content_hash).unwrap().unwrap().ref_count,
+            1
+        );
+
+        // Removing the namespace entry afterwards must not give up another.
+        engine.delete_object("bucket", "a.bin").await.unwrap();
+        assert_eq!(
+            engine.deduplicator.get_entry(&content_hash).unwrap().unwrap().ref_count,
+            1,
+            "the surviving object must keep its reference to the shared blob"
+        );
+
+        let (data, _) = engine.get_object("bucket", "b.bin").await.unwrap();
+        assert_eq!(data, b"shared-body");
+    }
+
+    /// Reconciliation writes an entry back, and never overwrites a live one.
+    #[tokio::test]
+    async fn restore_erasure_coded_entry_fills_a_gap_but_never_overwrites() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = BitcaskStorageEngine::new(
+            &temp_dir.path().join("volumes"),
+            &temp_dir.path().join("metadata_db"),
+            1024 * 1024,
+            4096,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let mut rebuilt = IndexRecord::new(
+            EXTERNAL_DATA_FILE_ID,
+            0,
+            4096,
+            [7u8; 32],
+            "\"rebuilt-etag\"".to_string(),
+            "application/octet-stream".to_string(),
+        );
+        rebuilt.hlc_timestamp = 10;
+        let rebuilt = rebuilt.into_erasure_coded(3, 1);
+
+        // Nothing there: the entry is written and the object becomes listable.
+        assert!(engine
+            .restore_erasure_coded_entry("bucket", "lost.bin", rebuilt.clone())
+            .await
+            .unwrap());
+        let restored = engine.head_object("bucket", "lost.bin").await.unwrap();
+        assert!(restored.is_erasure_coded());
+        assert_eq!(restored.etag, "\"rebuilt-etag\"");
+        assert_eq!(
+            engine.list_objects("bucket", "", 10).await.unwrap().len(),
+            1
+        );
+
+        // Something there: the index is the live truth and must win, because the
+        // object may have been overwritten since the manifest was written.
+        put_at_hlc(&engine, "bucket", "live.bin", b"current bytes", 99).await;
+        assert!(!engine
+            .restore_erasure_coded_entry("bucket", "live.bin", rebuilt.clone())
+            .await
+            .unwrap());
+        let untouched = engine.head_object("bucket", "live.bin").await.unwrap();
+        assert!(!untouched.is_erasure_coded());
+        assert_eq!(untouched.hlc_timestamp, 99);
+
+        // A record without an EC layout is a programming error, not a fallback.
+        let mut wrong = rebuilt.clone();
+        wrong.layout = None;
+        assert!(matches!(
+            engine.restore_erasure_coded_entry("bucket", "other.bin", wrong).await,
+            Err(StorageError::InvalidOperation { .. })
+        ));
+    }
+
+    /// The generation guard, and idempotency on retry.
+    #[tokio::test]
+    async fn detach_object_data_respects_the_hlc_generation() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = BitcaskStorageEngine::new(
+            &temp_dir.path().join("volumes"),
+            &temp_dir.path().join("metadata_db"),
+            1024 * 1024,
+            4096,
+            false,
+        )
+        .await
+        .unwrap();
+
+        put_at_hlc(&engine, "bucket", "object.bin", b"old", 10).await;
+        put_at_hlc(&engine, "bucket", "object.bin", b"new", 20).await;
+
+        // The object was overwritten while the migration was in flight: the
+        // stale generation must be left alone.
+        let detached = engine
+            .detach_object_data_if_hlc(
+                "bucket",
+                "object.bin",
+                10,
+                0,
+                1,
+                ObjectLayout::ErasureCoded {
+                    erasure_set_id: 1,
+                    topology_epoch: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!detached);
+        assert!(!engine.head_object("bucket", "object.bin").await.unwrap().is_erasure_coded());
+
+        assert!(engine
+            .detach_object_data_if_hlc(
+                "bucket",
+                "object.bin",
+                20,
+                0,
+                1,
+                ObjectLayout::ErasureCoded {
+                    erasure_set_id: 1,
+                    topology_epoch: 1
+                }
+            )
+            .await
+            .unwrap());
+
+        // Purges are retried, so a second pass must be a no-op rather than
+        // releasing the blob reference twice.
+        assert!(engine
+            .detach_object_data_if_hlc(
+                "bucket",
+                "object.bin",
+                20,
+                0,
+                1,
+                ObjectLayout::ErasureCoded {
+                    erasure_set_id: 1,
+                    topology_epoch: 1
+                }
+            )
+            .await
+            .unwrap());
+        assert!(engine.head_object("bucket", "object.bin").await.unwrap().is_erasure_coded());
+
+        // A missing object is not an error, just nothing to do.
+        assert!(!engine
+            .detach_object_data_if_hlc(
+                "bucket",
+                "absent.bin",
+                20,
+                0,
+                1,
+                ObjectLayout::ErasureCoded {
+                    erasure_set_id: 1,
+                    topology_epoch: 1
+                }
+            )
+            .await
+            .unwrap());
+    }
+
+    /// A promotion has to undo a detach without the client noticing.
+    ///
+    /// Auto-tiering may move an object to erasure coding and back any number of
+    /// times. If a round trip changed the ETag or the modification time, a
+    /// background heuristic would be rewriting facts the client compares
+    /// against, and conditional requests would start failing for no reason the
+    /// client can see.
+    #[tokio::test]
+    async fn attach_object_data_restores_the_object_it_detached() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = BitcaskStorageEngine::new(
+            &temp_dir.path().join("volumes"),
+            &temp_dir.path().join("metadata_db"),
+            1024 * 1024,
+            4096,
+            false,
+        )
+        .await
+        .unwrap();
+
+        put_at_hlc(&engine, "bucket", "dir/object.bin", b"payload-bytes", 10).await;
+        let before = engine.head_object("bucket", "dir/object.bin").await.unwrap();
+
+        engine
+            .detach_object_data_if_hlc(
+                "bucket",
+                "dir/object.bin",
+                10,
+                0,
+                1,
+                ObjectLayout::ErasureCoded {
+                    erasure_set_id: 7,
+                    topology_epoch: 3,
+                },
+            )
+            .await
+            .unwrap();
+
+        let attached = engine
+            .attach_object_data_if_hlc("bucket", "dir/object.bin", 10, 0, 1, b"payload-bytes")
+            .await
+            .unwrap();
+        assert!(attached);
+
+        let after = engine.head_object("bucket", "dir/object.bin").await.unwrap();
+        assert!(!after.is_erasure_coded());
+        assert_eq!(after.size, before.size);
+        assert_eq!(after.etag, before.etag);
+        assert_eq!(after.content_type, before.content_type);
+        assert_eq!(after.content_hash, before.content_hash);
+        assert_eq!(
+            after.metadata.get("x-amz-meta-owner"),
+            Some(&"acceptance".to_string())
+        );
+        assert_eq!(after.modified_at, before.modified_at);
+        assert_eq!(after.created_at, before.created_at);
+        assert_eq!(after.hlc_timestamp, before.hlc_timestamp);
+
+        // The bytes are readable locally again, checksum included.
+        let (data, _) = engine.get_object("bucket", "dir/object.bin").await.unwrap();
+        assert_eq!(data, b"payload-bytes");
+
+        // And the blob is referenced again, so compaction keeps it.
+        let (live, _) = engine.index_db.scan_all_content_refs().await.unwrap();
+        assert_eq!(live.len(), 1);
+    }
+
+    /// The guard, the size check, and idempotency on retry.
+    #[tokio::test]
+    async fn attach_object_data_refuses_a_stale_generation_and_foreign_bytes() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = BitcaskStorageEngine::new(
+            &temp_dir.path().join("volumes"),
+            &temp_dir.path().join("metadata_db"),
+            1024 * 1024,
+            4096,
+            false,
+        )
+        .await
+        .unwrap();
+
+        put_at_hlc(&engine, "bucket", "object.bin", b"first-body", 10).await;
+        engine
+            .detach_object_data_if_hlc(
+                "bucket",
+                "object.bin",
+                10,
+                0,
+                1,
+                ObjectLayout::ErasureCoded {
+                    erasure_set_id: 1,
+                    topology_epoch: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        // A client overwrote the object while the promotion was decoding. Its
+        // write wins; the decoded bytes are stale and must not be stored.
+        put_at_hlc(&engine, "bucket", "object.bin", b"second-body", 20).await;
+        assert!(!engine
+            .attach_object_data_if_hlc("bucket", "object.bin", 10, 0, 1, b"first-body")
+            .await
+            .unwrap());
+        let (data, _) = engine.get_object("bucket", "object.bin").await.unwrap();
+        assert_eq!(data, b"second-body");
+
+        // Bytes of the wrong length are a caller bug, not something to store.
+        engine
+            .detach_object_data_if_hlc(
+                "bucket",
+                "object.bin",
+                20,
+                0,
+                1,
+                ObjectLayout::ErasureCoded {
+                    erasure_set_id: 1,
+                    topology_epoch: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            engine
+                .attach_object_data_if_hlc("bucket", "object.bin", 20, 0, 1, b"short")
+                .await,
+            Err(StorageError::InvalidOperation { .. })
+        ));
+
+        assert!(engine
+            .attach_object_data_if_hlc("bucket", "object.bin", 20, 0, 1, b"second-body")
+            .await
+            .unwrap());
+
+        // Promotions are retried, and a second pass must not take a second
+        // reference to the blob it just registered.
+        let content_hash = engine.head_object("bucket", "object.bin").await.unwrap().content_hash;
+        let refs = engine.deduplicator.get_entry(&content_hash).unwrap().unwrap().ref_count;
+        assert!(engine
+            .attach_object_data_if_hlc("bucket", "object.bin", 20, 0, 1, b"second-body")
+            .await
+            .unwrap());
+        assert_eq!(
+            engine.deduplicator.get_entry(&content_hash).unwrap().unwrap().ref_count,
+            refs
+        );
+
+        // A missing object is not an error, just nothing to do.
+        assert!(!engine
+            .attach_object_data_if_hlc("bucket", "absent.bin", 20, 0, 1, b"anything")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
