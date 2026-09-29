@@ -20,7 +20,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install System Dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        # nasm assembles the vendored ISA-L sources in ee/s4-codec-isal.
+        # Required by any cargo command that covers the whole workspace.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler nasm
 
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -52,7 +54,7 @@ jobs:
         run: |
           cargo test --workspace --all-targets
           cargo test --workspace --doc
-        timeout-minutes: 30
+        timeout-minutes: 45
 
       - name: Build documentation
         run: cargo doc --workspace --no-deps
