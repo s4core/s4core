@@ -250,6 +250,27 @@ S4 uses **leaderless quorum replication** for high availability. Any node can ac
 - **Deployment Modes**: `single` (default), `cluster` (storage + replication), `gateway` (stateless router).
 - **Graceful Operations**: Graceful shutdown with drain, rolling upgrades with protocol versioning, admin API for cluster health and operations.
 
+## Credentials and Admin Tokens
+
+The same code in CE and EE; `s4-server/src/secrets.rs` holds the rules.
+
+- **Sources**: `S4_ROOT_USERNAME`, `S4_ROOT_PASSWORD`, `S4_ACCESS_KEY_ID`, `S4_SECRET_ACCESS_KEY`
+  and `S4_JWT_SECRET` are read directly or from the file their `_FILE` form names (Docker and
+  Kubernetes secrets). Both forms set, or a file that is unreadable, empty, not UTF-8 or larger
+  than 64 KiB, stops the start.
+- **Admin JWT secret**: the admin API trusts the role inside any token signed with it (HS256), so
+  the secret is a SuperUser credential. There is no built-in value. At startup, before the node
+  joins a cluster:
+  - a configured secret shorter than 32 bytes is refused: it can be guessed offline from any
+    issued token;
+  - unset on a single node, a random secret is generated per start, and sessions end on restart;
+  - unset in cluster or gateway mode with IAM in use (`S4_ROOT_PASSWORD` set, or IAM users on
+    disk), the start is refused: each node would sign with its own secret, and a token would work
+    only on the node that issued it.
+- **Legacy S3 keys**: `S4_ACCESS_KEY_ID` / `S4_SECRET_ACCESS_KEY` authenticate as a synthetic
+  SuperUser (`env-admin`) when no IAM user holds the access key. Unset, they are random per start;
+  set to an empty value, this login is off.
+
 ## Editions (CE / EE)
 
 S4 follows an Open-Core model with two editions built from the same codebase:
@@ -348,6 +369,7 @@ these scenarios.
 | `51-ec-minimal-read-test.sh` | EE EC v2 minimal read (plan 10): on six nodes, each in a zone of its own, what a read pulls off the pool is counted rather than argued about. Both read counters exist on every node at zero before a single object is written, so an empty graph reads as "nothing was read" and not as "no data". A healthy `GET` then pulls exactly the `k` data shards of every chunk and a short range exactly the shards it falls in — one inside a shard, two across a shard boundary, two across a chunk boundary — with the expected fetches, bytes and cross-zone split computed from the manifest and the topology labels, so the metric is checked against the pool rather than against itself. The same node with `S4_EC_MINIMAL_READ_ENABLED=false` is the EC v1 read again, all `n` shards of every chunk it touches, answering byte for byte the same bodies with the same `ETag`, size, type and `Last-Modified`, and saying which read it is doing in its own pool health. A shard the range falls in going missing costs the client nothing but time: the range still answers with the object's bytes, the read lifts the whole chunk exactly once without asking for anything twice, counts itself degraded, counts the shard that failed its hash and queues its repair, which puts the bytes back on the owner's disk. Then the price of the saving, in the open: a corrupt parity shard is invisible to reads — right bytes, not degraded, nothing counted, nothing queued — and it is the local scrub pass that finds it, reports it as corruption rather than as absence, quarantines it so the node stops claiming a shard it cannot produce, and queues the ordinary repair that names that very slot. The first run of this scenario found that last part wrong — a shard whose bytes its owner refuses was reported as missing, skipping quarantine and every corruption counter — which is decision EC2-185 |
 | `52-bitrot-durability-test.sh` | Bit rot on a three-node RF=3 cluster: a blob whose bytes were flipped is never handed to another object by deduplication — the next writer of that content gets a copy of its own — and the scrubber repairs rather than reports, fetching a healthy copy from a replica and writing it back, checked in the volume file of the node whose disk was damaged and in `s4_scrubber_corruptions_healed_total` (decision EC2-165) |
 | `53-ec-stale-layout-record-test.sh` | EE EC regression on six nodes `ec-rs-small`: a node's cached layout record that fell behind the quorum. The hot-copy purge commits the manifest again as `hot_replicas_purged`, and an overwrite through another node clears the record only on the node that took it, so the node that ran the transcode, a node that read the object between cutover and purge, and the node that transcoded the previous generation all hold a reference the quorum no longer matches. Through exactly those nodes, with no read in between to refresh them: `DELETE` after the purge and `DELETE` after an overwrite answer 204, the object is gone on every node, the quorum holds a tombstone, and it stays gone after every node runs the namespace reconcile — the defect answered 500 there after the hot delete had committed, and the reconcile brought the object back; admin verify after the purge and after an overwrite reads the whole object and matches on every node. Which node runs each transcode is chosen by where the `PUT` goes and confirmed in that node's log |
+| `54-FILE-ENV-and-jwt-test.sh` | Credentials from `_FILE` and the admin JWT secret, against a real binary (CE, or EE with `S4_LICENSE_KEY`): all five credentials read from files and used for login and S3; a token forged with the fixed secret of older releases is refused; without a secret a single node signs with a random one that changes on restart; empty S3 keys switch the key login off; and each misconfiguration stops the start with the variable named — both forms set, a missing, empty or oversized file, a secret shorter than 32 bytes, and a cluster node with IAM in use and no secret, whether from `S4_ROOT_PASSWORD` or from IAM users left on disk |
 
 This section is kept last on purpose: `AGENTS.md` points at it by line number, and appending
 elsewhere in this file would move it.

@@ -17,6 +17,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::secrets::{secret_from_env, SecretError};
+use s4_features::iam::jwt::generate_secret;
+
 /// Server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -434,16 +437,120 @@ pub struct FeaturesConfig {
 }
 
 /// Security configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Every credential here can be set directly (`S4_ACCESS_KEY_ID=...`) or, for
+/// Docker and Kubernetes secrets, through a file (`S4_ACCESS_KEY_ID_FILE=/run/secrets/...`);
+/// see [`crate::secrets`] for the rules. `Debug` redacts the secret values.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SecurityConfig {
-    /// Access key ID for S3 authentication.
-    /// Can be set via S4_ACCESS_KEY_ID environment variable.
+    /// Access key ID for S3 authentication (`S4_ACCESS_KEY_ID`).
     pub access_key_id: String,
-    /// Secret access key for S3 authentication.
-    /// Can be set via S4_SECRET_ACCESS_KEY environment variable.
+    /// Secret access key for S3 authentication (`S4_SECRET_ACCESS_KEY`).
+    #[serde(skip_serializing, default = "dev_secret_access_key")]
     pub secret_access_key: String,
+    /// Root admin user name (`S4_ROOT_USERNAME`, default `root`).
+    #[serde(default = "default_root_username")]
+    pub root_username: String,
+    /// Root admin password (`S4_ROOT_PASSWORD`). The root user is created only
+    /// when it is set.
+    #[serde(skip_serializing, default)]
+    pub root_password: Option<String>,
+    /// Secret that signs admin JWTs (`S4_JWT_SECRET`), at least 32 bytes. When
+    /// unset, a single node generates a random one at startup; see
+    /// [`crate::secrets::resolve_jwt_secret`].
+    #[serde(skip_serializing, default)]
+    pub jwt_secret: Option<String>,
     /// Audit log path
     pub audit_log_path: Option<PathBuf>,
+}
+
+impl SecurityConfig {
+    /// Reads the credentials from `S4_*` variables or the files their `S4_*_FILE`
+    /// counterparts name.
+    ///
+    /// Unset S3 keys fall back to random development keys. A key set to an empty
+    /// value stays empty, which switches off the login with these keys, as it
+    /// always has. An empty user name, root password or JWT secret counts as unset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError`] when a variable and its `_FILE` form are both set,
+    /// or a `_FILE` cannot be read, is too large, is not UTF-8 text or is empty.
+    pub fn from_env() -> Result<Self, SecretError> {
+        Self::from_secrets(secret_from_env)
+    }
+
+    /// [`Self::from_env`] over any source of secrets, so it can be tested
+    /// without touching the process environment.
+    fn from_secrets(
+        secret: impl Fn(&str) -> Result<Option<String>, SecretError>,
+    ) -> Result<Self, SecretError> {
+        let non_empty = |value: Option<String>| value.filter(|value| !value.is_empty());
+        Ok(Self {
+            access_key_id: secret("S4_ACCESS_KEY_ID")?.unwrap_or_else(dev_access_key_id),
+            secret_access_key: secret("S4_SECRET_ACCESS_KEY")?
+                .unwrap_or_else(dev_secret_access_key),
+            root_username: non_empty(secret("S4_ROOT_USERNAME")?)
+                .unwrap_or_else(default_root_username),
+            root_password: non_empty(secret("S4_ROOT_PASSWORD")?),
+            jwt_secret: non_empty(secret("S4_JWT_SECRET")?),
+            audit_log_path: default_audit_log_path(),
+        })
+    }
+}
+
+impl Default for SecurityConfig {
+    /// Development defaults: random S3 keys, no root user, no JWT secret.
+    fn default() -> Self {
+        Self {
+            access_key_id: dev_access_key_id(),
+            secret_access_key: dev_secret_access_key(),
+            root_username: default_root_username(),
+            root_password: None,
+            jwt_secret: None,
+            audit_log_path: default_audit_log_path(),
+        }
+    }
+}
+
+impl std::fmt::Debug for SecurityConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        const REDACTED: &str = "<redacted>";
+        f.debug_struct("SecurityConfig")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &REDACTED)
+            .field("root_username", &self.root_username)
+            .field(
+                "root_password",
+                &self.root_password.as_ref().map(|_| REDACTED),
+            )
+            .field("jwt_secret", &self.jwt_secret.as_ref().map(|_| REDACTED))
+            .field("audit_log_path", &self.audit_log_path)
+            .finish()
+    }
+}
+
+fn default_root_username() -> String {
+    "root".to_string()
+}
+
+fn default_audit_log_path() -> Option<PathBuf> {
+    Some(PathBuf::from("/var/log/s4/audit.log"))
+}
+
+/// Development access key used when `S4_ACCESS_KEY_ID` is not set.
+///
+/// Both development keys come from the OS random generator: the legacy login
+/// with these keys acts as a SuperUser, so they must not be guessable from the
+/// start time or the process id.
+fn dev_access_key_id() -> String {
+    let random = generate_secret();
+    format!("dev-{}", &random[..16])
+}
+
+/// Development secret key used when `S4_SECRET_ACCESS_KEY` is not set.
+fn dev_secret_access_key() -> String {
+    format!("dev-secret-{}", generate_secret())
 }
 
 /// Metrics configuration.
@@ -591,11 +698,17 @@ impl Default for MetricsConfig {
 }
 
 impl Config {
-    /// Loads configuration from file or uses defaults.
+    /// Loads configuration from the environment on top of the defaults.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a credential is misconfigured (see [`SecurityConfig::from_env`]),
+    /// so a broken secret stops the start instead of being replaced by a default.
     pub fn load() -> anyhow::Result<Self> {
-        // For now, return default configuration
-        // Later: load from config.toml or environment variables
-        Ok(Self::default())
+        Ok(Self {
+            security: SecurityConfig::from_env()?,
+            ..Self::default()
+        })
     }
 }
 
@@ -631,26 +744,8 @@ impl Default for Config {
                 atomic_dirs: true,
                 extended_metadata: true,
             },
-            security: SecurityConfig {
-                // Load credentials from environment variables with secure defaults
-                access_key_id: std::env::var("S4_ACCESS_KEY_ID").unwrap_or_else(|_| {
-                    // Generate a random key for development if not set
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = DefaultHasher::new();
-                    std::time::SystemTime::now().hash(&mut hasher);
-                    format!("dev-{:016x}", hasher.finish())
-                }),
-                secret_access_key: std::env::var("S4_SECRET_ACCESS_KEY").unwrap_or_else(|_| {
-                    // Generate a random key for development if not set
-                    use std::collections::hash_map::DefaultHasher;
-                    use std::hash::{Hash, Hasher};
-                    let mut hasher = DefaultHasher::new();
-                    (std::time::SystemTime::now(), std::process::id()).hash(&mut hasher);
-                    format!("dev-secret-{:016x}", hasher.finish())
-                }),
-                audit_log_path: Some(PathBuf::from("/var/log/s4/audit.log")),
-            },
+            // Credentials are read, with their `_FILE` forms, by `Config::load`.
+            security: SecurityConfig::default(),
             metrics: MetricsConfig::default(),
             lifecycle: LifecycleConfig::default(),
             compaction: CompactionConfig::default(),
@@ -663,6 +758,87 @@ impl Default for Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Security settings read from a fake environment with the given values.
+    fn security_from(env: &[(&str, &str)]) -> SecurityConfig {
+        SecurityConfig::from_secrets(|name| {
+            Ok(env.iter().find(|(key, _)| *key == name).map(|(_, value)| value.to_string()))
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn unset_s3_keys_fall_back_to_random_development_keys() {
+        let first = security_from(&[]);
+        let second = security_from(&[]);
+
+        assert!(
+            first.access_key_id.starts_with("dev-"),
+            "{}",
+            first.access_key_id
+        );
+        assert_eq!(first.access_key_id.len(), "dev-".len() + 16);
+        assert!(first.secret_access_key.starts_with("dev-secret-"));
+        assert_eq!(first.secret_access_key.len(), "dev-secret-".len() + 64);
+        assert_ne!(first.access_key_id, second.access_key_id);
+        assert_ne!(first.secret_access_key, second.secret_access_key);
+    }
+
+    #[test]
+    fn empty_s3_keys_stay_empty_and_switch_the_key_login_off() {
+        let security = security_from(&[("S4_ACCESS_KEY_ID", ""), ("S4_SECRET_ACCESS_KEY", "")]);
+
+        assert_eq!(security.access_key_id, "");
+        assert_eq!(security.secret_access_key, "");
+    }
+
+    #[test]
+    fn empty_root_credentials_and_jwt_secret_count_as_unset() {
+        let security = security_from(&[
+            ("S4_ROOT_USERNAME", ""),
+            ("S4_ROOT_PASSWORD", ""),
+            ("S4_JWT_SECRET", ""),
+        ]);
+
+        assert_eq!(security.root_username, "root");
+        assert!(security.root_password.is_none());
+        assert!(security.jwt_secret.is_none());
+    }
+
+    #[test]
+    fn configured_credentials_are_used() {
+        let security = security_from(&[
+            ("S4_ACCESS_KEY_ID", "ak"),
+            ("S4_SECRET_ACCESS_KEY", "sk"),
+            ("S4_ROOT_USERNAME", "admin"),
+            ("S4_ROOT_PASSWORD", "pw"),
+            ("S4_JWT_SECRET", "jwt"),
+        ]);
+
+        assert_eq!(security.access_key_id, "ak");
+        assert_eq!(security.secret_access_key, "sk");
+        assert_eq!(security.root_username, "admin");
+        assert_eq!(security.root_password.as_deref(), Some("pw"));
+        assert_eq!(security.jwt_secret.as_deref(), Some("jwt"));
+    }
+
+    #[test]
+    fn security_debug_output_hides_the_secrets() {
+        let security = security_from(&[
+            ("S4_SECRET_ACCESS_KEY", "secret-key-value"),
+            ("S4_ROOT_PASSWORD", "root-password-value"),
+            ("S4_JWT_SECRET", "jwt-secret-value"),
+        ]);
+        let shown = format!("{security:?}");
+
+        for secret in [
+            "secret-key-value",
+            "root-password-value",
+            "jwt-secret-value",
+        ] {
+            assert!(!shown.contains(secret), "{shown}");
+        }
+    }
 
     #[test]
     fn test_parse_size_bytes() {

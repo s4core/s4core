@@ -101,11 +101,17 @@ jobs:
         run: |
           TAG_NAME="${GITHUB_REF_NAME}"
           RELEASE_DATE="$(date -u +'%Y.%-m.%-d')"
+          # actions/checkout leaves the tag of a tag run lightweight: it fetches
+          # the tag again as the bare commit (actions/checkout#290). The release
+          # notes in the tag message are then lost and the tagged commit's
+          # message is used instead, which is how v1.1.0-erasure-coding went out
+          # on GitHub as "ci: install nasm". Take the tags as they are on the server.
+          git fetch --tags --force
           if git rev-parse -q --verify "refs/tags/${TAG_NAME}^{tag}" >/dev/null; then
             echo "Using annotated tag message for release notes."
             RELEASE_MSG="$(git for-each-ref "refs/tags/${TAG_NAME}" --format='%(contents)')"
           else
-            echo "Using tagged commit message for release notes."
+            echo "::warning::Tag ${TAG_NAME} is not annotated; the release notes come from the tagged commit's message."
             RELEASE_MSG="$(git log -1 --format='%B' HEAD)"
           fi
           SUBJECT="$(printf '%s\n' "${RELEASE_MSG}" | sed -n '/[^[:space:]]/ {p; q;}')"

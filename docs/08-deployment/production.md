@@ -9,11 +9,26 @@ This page covers best practices for running S4 in production.
 Always enable IAM in production:
 
 ```bash
+openssl rand -hex 32 > /etc/s4/jwt_secret   # once, then keep the file
 export S4_ROOT_PASSWORD=<strong-random-password>
-export S4_JWT_SECRET=<256-bit-crypto-random-string>
+export S4_JWT_SECRET_FILE=/etc/s4/jwt_secret
 ```
 
 **Important:** Do not use the default password. Generate a strong random password and JWT secret.
+
+`S4_JWT_SECRET` signs the admin tokens, and the admin API trusts the role inside a validly signed
+token, so treat it like the root password. The server refuses to start when it is shorter than
+32 bytes, and in cluster and gateway mode when IAM is in use and it is not set; there it must be
+the same on every node. On a single node an unset secret is replaced by a random one at every
+start, which is safe but ends admin sessions on restart. Details:
+[Admin JWT Secret](../01-getting-started/configuration.md#admin-jwt-secret).
+
+### Keep Credentials out of the Environment
+
+Every credential variable also has a `_FILE` form (`S4_ROOT_PASSWORD_FILE=/run/secrets/s4_pass`)
+that reads the value from a file, for Docker and Kubernetes secrets. See
+[Secrets from Files](../01-getting-started/configuration.md#secrets-from-files-_file) and the
+[Docker example](docker.md#credentials-from-docker-secrets).
 
 ### Enable TLS
 

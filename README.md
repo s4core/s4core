@@ -185,9 +185,9 @@ complete reference — including erasure coding and licensing — is in
 | `S4_BIND` | S4 BIND host | `127.0.0.1:9000` | `0.0.0.0:9000` |
 | `S4_ROOT_USERNAME` | Root admin username | `root` | `admin` |
 | `S4_ROOT_PASSWORD` | Root admin password (enables IAM) | None (IAM disabled) | `password12345` |
-| `S4_JWT_SECRET` | Secret key for signing JWT tokens | Auto-generated at startup (dev mode only) | `256-bit-crypto-random-string-like-this-1234567890ABCDEF` |
-| `S4_ACCESS_KEY_ID` | Access key for S3 authentication | Auto-generated dev key | `myaccesskey` |
-| `S4_SECRET_ACCESS_KEY` | Secret key for S3 authentication | Auto-generated dev key | `mysecretkey` |
+| `S4_JWT_SECRET` | Secret that signs admin JWTs, at least 32 bytes; required and identical on every node in cluster and gateway mode with IAM | Single node: random at every start | Output of `openssl rand -hex 32`, generated once |
+| `S4_ACCESS_KEY_ID` | Access key for S3 authentication | Random dev key at every start | `myaccesskey` |
+| `S4_SECRET_ACCESS_KEY` | Secret key for S3 authentication | Random dev key at every start | `mysecretkey` |
 | `S4_DATA_DIR` | Base directory for storage | System temp dir | `/var/lib/s4` |
 | `S4_MAX_UPLOAD_SIZE` | Maximum upload size per request | `5GB` | `10GB`, `100MB`, `1024KB` |
 | `S4_TLS_CERT` | Path to TLS certificate (PEM format) | None (HTTP mode) | `/etc/ssl/certs/s4.pem` |
@@ -227,6 +227,16 @@ complete reference — including erasure coding and licensing — is in
 | `S4_HINT_TTL_HOURS` | Hinted handoff TTL (hours) | `3` | `3` |
 
 **Size format**: Supports `GB`/`G`, `MB`/`M`, `KB`/`K`, or bytes (no suffix).
+
+**Secrets from files**: `S4_ROOT_USERNAME`, `S4_ROOT_PASSWORD`, `S4_ACCESS_KEY_ID`,
+`S4_SECRET_ACCESS_KEY` and `S4_JWT_SECRET` can also be read from a file through their `_FILE` form
+(`S4_ROOT_PASSWORD_FILE=/run/secrets/s4_pass`), for Docker and Kubernetes secrets — see
+[Credentials from Docker Secrets](docs/08-deployment/docker.md#credentials-from-docker-secrets).
+
+**The server refuses to start** when `S4_JWT_SECRET` is shorter than 32 bytes, and in cluster or
+gateway mode when IAM is in use (`S4_ROOT_PASSWORD` set, or IAM users exist) and `S4_JWT_SECRET`
+is not set. Details:
+[Admin JWT Secret](docs/01-getting-started/configuration.md#admin-jwt-secret).
 
 Example (HTTP):
 ```bash

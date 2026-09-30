@@ -35,6 +35,10 @@ services:
       - S4_ROOT_PASSWORD=${S4_ROOT_PASSWORD:-password12345}
       - S4_ACCESS_KEY_ID=${S4_ACCESS_KEY_ID:-my-access-key-one}
       - S4_SECRET_ACCESS_KEY=${S4_SECRET_ACCESS_KEY:-my-secret-key-one}
+      # Unset: a random JWT secret at every start, so console sessions end on restart.
+      # To keep them, set a value of at least 32 bytes, generated once: openssl rand -hex 32.
+      # Any credential here also has a _FILE form for Docker secrets, e.g.
+      # S4_ROOT_PASSWORD_FILE=/run/secrets/s4_pass (remove the plain variable then).
       #- S4_JWT_SECRET=
       #- S4_MAX_UPLOAD_SIZE=5GB
       #- S4_LIFECYCLE_ENABLED=true

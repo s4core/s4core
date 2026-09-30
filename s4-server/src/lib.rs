@@ -23,6 +23,7 @@ pub mod config;
 pub mod edition;
 pub mod lifecycle_worker;
 pub mod multipart_cleanup_worker;
+pub mod secrets;
 
 mod app;
 

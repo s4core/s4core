@@ -35,14 +35,21 @@ docker run -d \
 ### Run with IAM
 
 ```bash
+openssl rand -hex 32 > jwt_secret   # once; keep it with your other secrets
+
 docker run -d \
   --name s4-server \
   -p 9000:9000 \
   -v s4-data:/data \
   -e S4_ROOT_PASSWORD=password12345 \
-  -e S4_JWT_SECRET=your-256-bit-secret \
+  -e S4_JWT_SECRET="$(cat jwt_secret)" \
   s4-server:latest
 ```
+
+Without `S4_JWT_SECRET` a single node signs admin tokens with a random secret generated at
+every start, so admin sessions end on restart. Setting it keeps them, as long as the value stays
+the same: generate it once, not in every `docker run`. A secret shorter than 32 bytes stops the
+start — see [Admin JWT Secret](../01-getting-started/configuration.md#admin-jwt-secret).
 
 ### Run with TLS
 
@@ -141,6 +148,57 @@ docker compose -f docker-compose-single-node.yml logs -f
 # Server only
 docker compose -f docker-compose-single-node.yml logs -f s4core
 ```
+
+## Credentials from Docker Secrets
+
+Every credential can be read from a file by appending `_FILE` to its variable
+(`S4_ROOT_USERNAME`, `S4_ROOT_PASSWORD`, `S4_ACCESS_KEY_ID`, `S4_SECRET_ACCESS_KEY`,
+`S4_JWT_SECRET`). Docker mounts each secret as a file under `/run/secrets/`, so the values stay out
+of `docker inspect`, the process environment and the compose file. The rules are in the
+[configuration reference](../01-getting-started/configuration.md#secrets-from-files-_file).
+
+```yaml
+services:
+  s4core:
+    image: s4core/s4core:latest
+    ports:
+      - "9000:9000"
+    volumes:
+      - s4-data:/data
+    environment:
+      - S4_ROOT_USERNAME_FILE=/run/secrets/s4_user
+      - S4_ROOT_PASSWORD_FILE=/run/secrets/s4_pass
+      - S4_ACCESS_KEY_ID_FILE=/run/secrets/s4_access_key
+      - S4_SECRET_ACCESS_KEY_FILE=/run/secrets/s4_secret_key
+      - S4_JWT_SECRET_FILE=/run/secrets/s4_jwt_secret
+    secrets: [s4_user, s4_pass, s4_access_key, s4_secret_key, s4_jwt_secret]
+
+secrets:
+  s4_user:
+    file: ./secrets/s4_user
+  s4_pass:
+    file: ./secrets/s4_pass
+  s4_access_key:
+    file: ./secrets/s4_access_key
+  s4_secret_key:
+    file: ./secrets/s4_secret_key
+  s4_jwt_secret:
+    file: ./secrets/s4_jwt_secret
+
+volumes:
+  s4-data:
+```
+
+Create the files once, for example `openssl rand -hex 32 > secrets/s4_jwt_secret`. In Docker Swarm,
+declare the secrets as `external: true` and create them with `docker secret create`. If a file is
+missing or empty, or a variable is set together with its `_FILE` form, the server stops at startup
+and names the variable.
+
+The server runs as user `s4` (uid 1000) inside the container. Docker Compose without Swarm
+bind-mounts a secret file with its owner and mode from the host, so a file readable only by root
+cannot be read and the start fails with `Permission denied`. Give the files to uid 1000:
+`sudo chown 1000 secrets/* && sudo chmod 400 secrets/*`. Swarm mounts secrets readable by everyone in
+the container, so there nothing needs to change.
 
 ## Volume Management
 

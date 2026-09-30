@@ -42,6 +42,14 @@ Each node needs these variables:
 | `S4_ACCESS_KEY_ID` | S3 access key (must match across all nodes) |
 | `S4_SECRET_ACCESS_KEY` | S3 secret key (must match across all nodes) |
 
+With IAM (`S4_ROOT_PASSWORD` set, or IAM users left from an earlier start), every node also needs
+`S4_JWT_SECRET`, at least 32 bytes and the same value on all of them: a token issued by one node is
+then accepted by the others, whichever one the load balancer picks. A cluster or gateway node
+without it refuses to start and names the variable. Generate the value once
+(`openssl rand -hex 32`) and give every node that value. Any credential can come from a file
+instead, through its `_FILE` form — see
+[Secrets from Files](../01-getting-started/configuration.md#secrets-from-files-_file).
+
 Start order does not matter. A node announces itself to its seeds over UDP, and
 keeps announcing for as long as it knows no peer, so a node that comes up before
 its seeds still joins once they are listening. This makes starting a whole
@@ -287,18 +295,24 @@ New buckets are automatically created in the pool with the most free space. Exis
 
 ### Health Check
 
+The admin API needs a SuperUser token:
+
 ```bash
+TOKEN=$(curl -s -X POST http://any-node:9000/api/admin/login \
+    -H "Content-Type: application/json" \
+    -d '{"username": "root", "password": "YOUR_PASSWORD"}' | jq -r '.token')
+
 # Cluster-wide health
-curl http://any-node:9000/admin/cluster/health
+curl -H "Authorization: Bearer $TOKEN" http://any-node:9000/api/admin/cluster/health
 
 # Individual node health
-curl http://any-node:9000/admin/node/health
+curl -H "Authorization: Bearer $TOKEN" http://any-node:9000/api/admin/node/health
 
 # Cluster topology (pools, nodes, assignments)
-curl http://any-node:9000/admin/cluster/topology
+curl -H "Authorization: Bearer $TOKEN" http://any-node:9000/api/admin/cluster/topology
 
 # Repair status (anti-entropy progress)
-curl http://any-node:9000/admin/cluster/repair-status
+curl -H "Authorization: Bearer $TOKEN" http://any-node:9000/api/admin/cluster/repair-status
 ```
 
 ### Key Metrics

@@ -11,15 +11,62 @@ This page is the complete reference. Feature pages link here rather than repeati
 |----------|-------------|---------|---------|
 | `S4_BIND` | Bind host address | `127.0.0.1:9000` | `0.0.0.0:9000` |
 | `S4_DATA_DIR` | Base directory for storage data | System temp dir | `/var/lib/s4` |
-| `S4_ACCESS_KEY_ID` | Access key for S3 authentication | Auto-generated dev key | `myaccesskey` |
-| `S4_SECRET_ACCESS_KEY` | Secret key for S3 authentication | Auto-generated dev key | `mysecretkey` |
+| `S4_ACCESS_KEY_ID` | Access key for S3 authentication. Set to an empty value, it switches login with these keys off | Random dev key at every start | `myaccesskey` |
+| `S4_SECRET_ACCESS_KEY` | Secret key for S3 authentication. Set to an empty value, it switches login with these keys off | Random dev key at every start | `mysecretkey` |
 | `S4_ROOT_USERNAME` | Root admin username | `root` | `admin` |
 | `S4_ROOT_PASSWORD` | Root admin password (enables IAM when set) | None (IAM disabled) | `password12345` |
-| `S4_JWT_SECRET` | Secret key for signing JWT tokens | Auto-generated at startup (dev only) | `256-bit-crypto-random-string` |
+| `S4_JWT_SECRET` | Secret that signs admin JWTs, at least 32 bytes. Required, and identical on every node, in cluster and gateway mode with IAM — see [Admin JWT Secret](#admin-jwt-secret) | Single node: random, generated at every start (admin sessions end on restart) | Output of `openssl rand -hex 32`, generated once |
 | `S4_MAX_UPLOAD_SIZE` | Maximum upload size per request | `5GB` | `10GB`, `100MB`, `1024KB` |
 | `S4_TLS_CERT` | Path to TLS certificate (PEM) — enables HTTPS with `S4_TLS_KEY` | None (HTTP mode) | `/etc/ssl/certs/s4.pem` |
 | `S4_TLS_KEY` | Path to TLS private key (PEM) — enables HTTPS with `S4_TLS_CERT` | None (HTTP mode) | `/etc/ssl/private/s4-key.pem` |
 | `RUST_LOG` | Log level and filter | `s4_api=debug,s4_server=info` | `info`, `s4_ee=debug` |
+
+### Admin JWT Secret
+
+`S4_JWT_SECRET` signs admin tokens, and the admin API trusts the role inside any token signed with
+it, so it is as sensitive as the root password. The server refuses to start, with an error that
+names the variable, when:
+
+- `S4_JWT_SECRET` is shorter than 32 bytes. Anyone holding an admin token could guess a short
+  secret offline and sign a SuperUser token with it.
+- The node runs in cluster or gateway mode with IAM in use — `S4_ROOT_PASSWORD` set, or IAM users
+  left from an earlier start — and `S4_JWT_SECRET` is not set. Each node would sign with its own
+  random secret, and a token would work only on the node that issued it.
+
+Without `S4_JWT_SECRET` a single node generates a random secret at every start, so admin sessions
+end on restart. Generate the value once and keep it: a value generated anew at every start or on
+every node behaves like no value at all.
+
+### Secrets from Files (`_FILE`)
+
+Every credential above can be read from a file instead of the environment: append `_FILE` to
+the variable name and give the path. This is the Docker and Kubernetes secrets convention: the
+orchestrator mounts each secret as a file, so the value never shows up in `docker inspect`, in
+the process environment or in a compose file kept in git.
+
+| Variable | File variant |
+|----------|--------------|
+| `S4_ROOT_USERNAME` | `S4_ROOT_USERNAME_FILE` |
+| `S4_ROOT_PASSWORD` | `S4_ROOT_PASSWORD_FILE` |
+| `S4_ACCESS_KEY_ID` | `S4_ACCESS_KEY_ID_FILE` |
+| `S4_SECRET_ACCESS_KEY` | `S4_SECRET_ACCESS_KEY_FILE` |
+| `S4_JWT_SECRET` | `S4_JWT_SECRET_FILE` |
+
+The Enterprise licence has its own file variable, `S4_LICENSE_FILE` (see
+[Licensing](#licensing-enterprise-edition)).
+
+The rules are the same for every variable:
+
+- Trailing line breaks and a leading UTF-8 byte order mark are stripped from both forms, so
+  `echo value > file` works and a secret gives the same value from a file and from a variable.
+- An empty variable does not clash with its `_FILE` form, so `S4_ROOT_PASSWORD=${S4_ROOT_PASSWORD:-}`
+  in a compose template can sit next to `S4_ROOT_PASSWORD_FILE`. On its own, an empty user name,
+  root password or JWT secret counts as unset; empty S3 keys switch login with those keys off.
+- The server refuses to start, naming the variable, when both `NAME` and `NAME_FILE` are set,
+  or when the file cannot be read, is empty, is larger than 64 KiB or is not UTF-8 text. It
+  never falls back to a default in those cases.
+
+A Docker Compose example is in [Docker Deployment](../08-deployment/docker.md#credentials-from-docker-secrets).
 
 ## Lifecycle Policies
 
@@ -169,7 +216,7 @@ export S4_DATA_DIR=/tmp/s4-data
 export S4_BIND=0.0.0.0:9000
 export S4_DATA_DIR=/var/lib/s4
 export S4_ROOT_PASSWORD=your-strong-password
-export S4_JWT_SECRET=your-256-bit-crypto-random-string
+export S4_JWT_SECRET_FILE=/etc/s4/jwt_secret  # created once: openssl rand -hex 32 > /etc/s4/jwt_secret
 export S4_TLS_CERT=/etc/ssl/certs/s4.pem
 export S4_TLS_KEY=/etc/ssl/private/s4-key.pem
 export S4_MAX_UPLOAD_SIZE=10GB

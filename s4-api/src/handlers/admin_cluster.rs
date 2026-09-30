@@ -16,13 +16,13 @@
 //!
 //! These endpoints provide observability and management of the cluster:
 //!
-//! | Method | Path                          | Purpose                              |
-//! |--------|-------------------------------|--------------------------------------|
-//! | GET    | /admin/cluster/health         | Overall cluster health               |
-//! | GET    | /admin/cluster/topology       | Pool/node topology view              |
-//! | GET    | /admin/node/health            | Local node health                    |
-//! | POST   | /admin/node/drain             | Graceful drain for rolling upgrade   |
-//! | GET    | /admin/cluster/repair-status  | Anti-entropy repair status           |
+//! | Method | Path                             | Purpose                            |
+//! |--------|----------------------------------|------------------------------------|
+//! | GET    | /api/admin/cluster/health        | Overall cluster health             |
+//! | GET    | /api/admin/cluster/topology      | Pool/node topology view            |
+//! | GET    | /api/admin/node/health           | Local node health                  |
+//! | POST   | /api/admin/node/drain            | Graceful drain for rolling upgrade |
+//! | GET    | /api/admin/cluster/repair-status | Anti-entropy repair status         |
 //!
 //! All endpoints require `SuperUser` role via JWT authentication.
 
@@ -40,7 +40,7 @@ use serde_json::json;
 
 use crate::AppState;
 
-/// GET /admin/cluster/health
+/// GET /api/admin/cluster/health
 ///
 /// Returns overall cluster health status. In standalone mode, returns a
 /// single-node healthy response. In cluster mode, aggregates gossip state.
@@ -82,7 +82,7 @@ pub async fn cluster_health(
     Ok(Json(json!(health)))
 }
 
-/// GET /admin/cluster/topology
+/// GET /api/admin/cluster/topology
 ///
 /// Returns the cluster topology: pools, nodes, and their roles.
 /// In standalone mode, returns a minimal single-node topology.
@@ -111,7 +111,7 @@ pub async fn cluster_topology(
     }
 }
 
-/// GET /admin/node/health
+/// GET /api/admin/node/health
 ///
 /// Returns the health of the local node, including version info and uptime.
 pub async fn node_health(
@@ -143,7 +143,7 @@ pub async fn node_health(
     })))
 }
 
-/// POST /admin/node/drain
+/// POST /api/admin/node/drain
 ///
 /// Initiates a graceful drain of this node. The node will stop accepting
 /// new coordinated requests and wait for in-flight operations to complete.
@@ -171,7 +171,7 @@ pub async fn node_drain(
     })))
 }
 
-/// GET /admin/cluster/repair-status
+/// GET /api/admin/cluster/repair-status
 ///
 /// Returns the current anti-entropy repair status.
 pub async fn repair_status(

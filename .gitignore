@@ -1,0 +1,65 @@
+# Rust/Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.claude/
+.antigravitycli/
+.antigravity
+.antigravitycli
+.antigravity/
+.codegraph/
+# Local agent delegation transcripts and run artifacts
+/.agentboard/
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+.tmp/
+cache/
+*cache*
+
+# Data directories (for local development)
+/data/
+/volumes/
+/s4-data-*/
+*.redb
+*.redb.lock
+
+# EC v2 acceptance suite work directories: the runner's default root and the one
+# CI uses. A failed script's directory is kept there for inspection.
+/ec-v2-acceptance-suite/
+/ec-v2-ci-acceptance/
+# Script 54 keeps the logs of a failed run in its work directory.
+/secrets-jwt-test/
+/ci-secrets-jwt-test/
+
+# Coverage and profiling
+*.profraw
+*.profdata
+coverage/
+lcov.info
+tarpaulin-report.html
+
+# Frontend (Next.js)
+frontend/
+
+# WARP test files
+scripts/warp-mixed*

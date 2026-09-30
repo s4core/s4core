@@ -22,10 +22,11 @@
 
 use crate::cluster_bootstrap;
 use crate::compaction_worker::CompactionWorker;
-use crate::config::{Config, ServerMode};
+use crate::config::{Config, SecurityConfig, ServerMode};
 use crate::edition;
 use crate::lifecycle_worker::LifecycleWorker;
 use crate::multipart_cleanup_worker::MultipartCleanupWorker;
+use crate::secrets::{check_iam_users, resolve_jwt_secret, JwtSecret};
 use anyhow::{Context, Result};
 use axum::http::Uri;
 use axum::ServiceExt;
@@ -109,6 +110,8 @@ pub struct App {
     cluster_services: ClusterServices,
     /// Cluster node lifecycle tracker (drain/shutdown coordination).
     node_lifecycle: Arc<NodeLifecycle>,
+    /// Secret that signs and verifies admin JWTs.
+    jwt_secret: JwtSecret,
 }
 
 impl App {
@@ -120,6 +123,15 @@ impl App {
 
         // Validate cluster configuration early
         config.cluster.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Decide the admin JWT secret before touching storage: a secret that is
+        // too short, or a cluster node without the shared one, stops here.
+        let jwt_secret = resolve_jwt_secret(
+            config.security.jwt_secret.as_deref(),
+            config.cluster.mode,
+            config.security.root_password.is_some(),
+        )?;
+        log_jwt_secret(&jwt_secret, config.cluster.mode);
 
         // Log operating mode
         match config.cluster.mode {
@@ -179,6 +191,7 @@ impl App {
             cluster_limits,
             cluster_services,
             node_lifecycle,
+            jwt_secret,
         })
     }
 
@@ -198,9 +211,8 @@ impl App {
         info!("Storage path: {:?}", self.config.storage.data_path);
         info!("Metadata path: {:?}", self.config.storage.metadata_path);
 
-        // Create application state with credentials from config
-        // Credentials are loaded from S4_ACCESS_KEY_ID and S4_SECRET_ACCESS_KEY env vars
-        // Use chars() to safely handle multi-byte UTF-8 characters
+        // Credentials come from `Config::load`: S4_ACCESS_KEY_ID and S4_SECRET_ACCESS_KEY
+        // or their `_FILE` forms. Use chars() to safely handle multi-byte UTF-8 characters
         let key_preview: String = self.config.security.access_key_id.chars().take(8).collect();
         info!("Using access key: {}...", key_preview);
         info!(
@@ -249,11 +261,25 @@ impl App {
             &self.config.storage.data_path,
         )
         .await
+        .with_jwt_secret(self.jwt_secret.value())
         .with_default_bucket_storage_class(
             self.config.cluster.pool_storage_class().map_err(|e| anyhow::anyhow!(e))?,
         );
         if let Some(handle) = prometheus_handle {
             state = state.with_prometheus_handle(handle);
+        }
+
+        // IAM users left from an earlier start need the shared secret as much as
+        // S4_ROOT_PASSWORD does. Checked before the node joins the cluster, and
+        // only where the answer can stop the start.
+        if matches!(self.jwt_secret, JwtSecret::Generated(_)) && !self.config.cluster.is_single() {
+            let iam_users = state
+                .iam_storage
+                .list_users()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to read IAM users: {e}"))?
+                .len();
+            check_iam_users(&self.jwt_secret, self.config.cluster.mode, iam_users)?;
         }
 
         // Bootstrap cluster services if in cluster mode
@@ -285,8 +311,8 @@ impl App {
             None
         };
 
-        // Initialize root user from environment variables if configured
-        initialize_root_user(&state).await?;
+        // Initialize root user from the configured credentials, if any
+        initialize_root_user(&state, &self.config.security).await?;
 
         // Cleanup orphaned multipart temp files from previous server instance
         match state.part_store.cleanup_orphaned().await {
@@ -495,22 +521,35 @@ async fn shutdown_signal() {
     }
 }
 
-/// Initializes root user from environment variables if configured.
+/// Logs where the admin JWT secret came from, and what that means for sessions.
+fn log_jwt_secret(secret: &JwtSecret, mode: ServerMode) {
+    match secret {
+        JwtSecret::Generated(_) if mode == ServerMode::Single => tracing::warn!(
+            "S4_JWT_SECRET is not set: admin tokens are signed with a random secret \
+             generated at startup, so admin sessions end when the server restarts. \
+             Set S4_JWT_SECRET or S4_JWT_SECRET_FILE to keep them"
+        ),
+        JwtSecret::Generated(_) => tracing::warn!(
+            "S4_JWT_SECRET is not set: this node signs admin tokens with its own random \
+             secret, so a token works only on the node that issued it. Set the same \
+             S4_JWT_SECRET or S4_JWT_SECRET_FILE on every node"
+        ),
+        JwtSecret::Configured(_) => info!("Admin JWT secret: configured"),
+    }
+}
+
+/// Creates the root user from the configured credentials.
 ///
-/// Environment variables:
-/// - `S4_ROOT_USERNAME` - Username for root user (default: "root")
-/// - `S4_ROOT_PASSWORD` - Password for root user (required for initialization)
-///
-/// If root user already exists, this function does nothing.
-async fn initialize_root_user(state: &AppState) -> Result<()> {
+/// Credentials come from `S4_ROOT_USERNAME` (default `root`) and
+/// `S4_ROOT_PASSWORD`, or their `_FILE` forms. Nothing happens when no password
+/// is configured or the root user already exists.
+async fn initialize_root_user(state: &AppState, security: &SecurityConfig) -> Result<()> {
     use s4_features::iam::Role;
 
-    // Get root credentials from environment
-    let root_username = std::env::var("S4_ROOT_USERNAME").unwrap_or_else(|_| "root".to_string());
-    let root_password = match std::env::var("S4_ROOT_PASSWORD") {
-        Ok(password) => password,
-        Err(_) => {
-            // No root password configured - skip initialization
+    let root_username = security.root_username.clone();
+    let root_password = match &security.root_password {
+        Some(password) => password.clone(),
+        None => {
             info!("Root user initialization skipped (S4_ROOT_PASSWORD not set)");
             return Ok(());
         }

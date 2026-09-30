@@ -16,9 +16,23 @@
 
 use chrono::{Duration, Utc};
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use rand::{rngs::OsRng, RngCore};
 
 use super::error::IamError;
 use super::models::{JwtClaims, User};
+
+/// Shortest signing secret considered strong enough for HS256, in bytes.
+pub const MIN_SECRET_LEN: usize = 32;
+
+/// Generates a random signing secret: 32 bytes from the OS CSPRNG, hex-encoded.
+///
+/// Used whenever no secret is configured, so tokens are never signed with a
+/// value anyone could know in advance.
+pub fn generate_secret() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// JWT token manager.
 #[derive(Clone)]
@@ -134,6 +148,17 @@ mod tests {
         assert_eq!(claims.sub, "user123");
         assert_eq!(claims.username, "testuser");
         assert_eq!(claims.role, Role::Writer);
+    }
+
+    #[test]
+    fn generated_secrets_are_long_random_and_hex() {
+        let first = generate_secret();
+        let second = generate_secret();
+
+        assert_eq!(first.len(), 64);
+        assert!(first.len() >= MIN_SECRET_LEN);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(first, second);
     }
 
     #[test]

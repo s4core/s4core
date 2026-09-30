@@ -191,16 +191,17 @@ Background scrubber verifies data integrity and auto-heals from replicas.
 
 ### Admin API (Cluster)
 
+Every route needs a SuperUser token from `POST /api/admin/login`, sent as
+`Authorization: Bearer <token>`.
+
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/admin/cluster/health` | GET | Cluster health, node statuses, epoch |
-| `/admin/cluster/topology` | GET | Pools, hash rings, node assignments |
-| `/admin/node/health` | GET | Individual node status and version |
-| `/admin/cluster/pool` | POST | Add a new pool (no downtime) |
-| `/admin/node/drain` | POST | Graceful drain for rolling upgrade |
-| `/admin/node/bootstrap` | POST | Full bootstrap for nodes offline > max_rejoin_downtime |
-| `/admin/cluster/scrub` | POST | Trigger manual data scrub |
-| `/admin/cluster/repair-status` | GET | Repair frontier, divergent keys, last repair time |
+| `/api/admin/cluster/health` | GET | Cluster health, node statuses, epoch |
+| `/api/admin/cluster/topology` | GET | Pools, hash rings, node assignments |
+| `/api/admin/node/health` | GET | Individual node status and version |
+| `/api/admin/node/drain` | POST | Graceful drain for rolling upgrade |
+| `/api/admin/cluster/repair-status` | GET | Repair frontier, divergent keys, last repair time |
+| `/api/admin/scrubber/run` | POST | On-demand CRC32 check of this node's volumes; reports damage, does not repair it |
 
 ### Cluster Configuration (Environment Variables)
 

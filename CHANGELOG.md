@@ -1,3 +1,40 @@
+# v1.1.1-secret-files
+
+# Secrets from Files and a Safe Admin JWT Secret
+
+**Release Overview**
+This release (8 commits) closes a security hole in the admin API and lets every credential come from Docker and Kubernetes secret files. Up to v1.1.0-erasure-coding, a server started without `S4_JWT_SECRET` signed admin tokens with a fixed secret that is public in the source code, so anyone who could reach its admin API could sign a SuperUser token for it. The admin JWT secret now has no built-in value, short secrets are refused, and a cluster that needs one shared secret will not start without it. If you cannot upgrade yet, set `S4_JWT_SECRET` to a random value of at least 32 bytes.
+
+## 🔒 Security (All Editions)
+* **No built-in JWT secret:** Without `S4_JWT_SECRET` a single node signs admin tokens with a random secret generated at every start. Tokens signed with the old fixed secret are rejected.
+* **Short JWT secrets are refused:** An `S4_JWT_SECRET` shorter than 32 bytes stops the start. Any issued token is enough to guess a short secret offline and then sign a SuperUser token with it.
+* **Cluster and gateway nodes need a shared secret:** With IAM in use — `S4_ROOT_PASSWORD` set, or IAM users on disk — a node in cluster or gateway mode refuses to start without `S4_JWT_SECRET`, before it joins the cluster. Otherwise every node would sign with a secret of its own, and a token would work only on the node that issued it.
+* **Random development S3 keys:** The keys used when `S4_ACCESS_KEY_ID` and `S4_SECRET_ACCESS_KEY` are unset come from the OS random generator instead of a hash of the start time.
+* **Secrets stay out of logs:** Secret values are redacted in debug output of the configuration.
+
+## 🚀 New Features (All Editions)
+* **Secrets from files (`_FILE`):** `S4_ROOT_USERNAME_FILE`, `S4_ROOT_PASSWORD_FILE`, `S4_ACCESS_KEY_ID_FILE`, `S4_SECRET_ACCESS_KEY_FILE` and `S4_JWT_SECRET_FILE` read the value from a file, the Docker and Kubernetes secrets convention: the values stay out of `docker inspect`, the process environment and the compose file. A leading byte order mark and trailing line breaks are stripped. Both forms set, or a file that is missing, empty, not UTF-8 or larger than 64 KiB, stops the start with the variable named.
+
+## 📚 Documentation
+* **Admin JWT Secret** and **Secrets from Files** sections in `docs/01-getting-started/configuration.md`, and a Docker Compose example with secrets in `docs/08-deployment/docker.md`, including the file permissions the container's `s4` user (uid 1000) needs.
+* **Cluster admin API paths:** The routes live under `/api/admin/...` and need a SuperUser token; the docs gave them as `/admin/...`. Three documented routes that never existed — `/cluster/pool`, `/node/bootstrap`, `/cluster/scrub` — are removed; the manual scrub is `POST /api/admin/scrubber/run`.
+
+## 🏗️ Build & Deployment
+* **New CI test:** `scripts/54-FILE-ENV-and-jwt-test.sh` checks the `_FILE` forms and every JWT secret rule against the CE build, the EE build without a licence and, where the licence is available, licensed EE.
+* **EC acceptance runs once per change:** The EC v1 and EC v2 acceptance suites, about an hour together, run on the feature branch and no longer again on `main`, where every change arrives already tested.
+* **CI tests the Community Edition binary again:** The ISA-L build had replaced it with the EE one at the same path, so the test jobs of a feature branch had been testing EE without a licence. A CI step now checks which edition each binary is.
+* **Release notes from the annotated tag:** `actions/checkout` turned the release tag into a lightweight one, and the release notes steps fell back to the tagged commit's message. That is how the GitHub release of v1.1.0-erasure-coding came out with one line from a CI commit instead of its notes. The tags are now fetched again before they are read.
+* **Website:** s4core.com is redesigned around the Enterprise erasure coding features.
+
+## ⚠️ Upgrade Notes
+* **Clusters and gateways with IAM:** Set the same `S4_JWT_SECRET`, at least 32 bytes, on every node before upgrading; the previous release already reads it. A node upgraded without it stops at once, and the rest keep quorum.
+* **`S4_JWT_SECRET` shorter than 32 bytes** refuses to start in every mode. Replace it with the output of `openssl rand -hex 32`, generated once and kept.
+* **Admin sessions:** Tokens issued before the upgrade are rejected unless `S4_JWT_SECRET` was set and stays the same; log in again. A single node without `S4_JWT_SECRET` ends admin sessions on every restart.
+* **Empty values:** An empty `S4_ROOT_USERNAME`, `S4_ROOT_PASSWORD` or `S4_JWT_SECRET` counts as unset. An empty `S4_ACCESS_KEY_ID` or `S4_SECRET_ACCESS_KEY` still switches login with these keys off.
+* **Trailing line breaks** in a credential set directly are stripped, as in its file form.
+* **Data format and cluster protocol:** Unchanged. Nodes of this release and of v1.1.0-erasure-coding can run side by side during a rolling upgrade.
+
+
 # v1.1.0-erasure-coding
 
 # Federation Erasure Coding (Enterprise), Bit-Rot Healing & Cluster Resilience

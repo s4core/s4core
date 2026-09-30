@@ -32,7 +32,9 @@ use s4_cluster::{
 };
 use s4_core::storage::{BitcaskStorageEngine, StorageEngine};
 use s4_core::types::StorageClass;
-use s4_features::iam::{models::User, AuthService, IamStorage, JwtManager};
+use s4_features::iam::{
+    jwt::generate_secret as generate_jwt_secret, models::User, AuthService, IamStorage, JwtManager,
+};
 
 use crate::s3::errors::S3Error;
 use serde::Deserialize;
@@ -130,20 +132,13 @@ impl AppState {
         };
         let iam_storage = Arc::new(IamStorage::new(iam_storage_engine));
 
-        // Get JWT secret from environment or use default for development
-        let jwt_secret = std::env::var("S4_JWT_SECRET").unwrap_or_else(|_| {
-            "default-jwt-secret-change-me-in-production-minimum-32-bytes".to_string()
-        });
-        let token_lifetime_hours = std::env::var("S4_JWT_LIFETIME_HOURS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(24);
-
-        // Create JWT manager
-        let jwt_manager = JwtManager::new(&jwt_secret, token_lifetime_hours);
-
-        // Create auth service (needs a clone of iam_storage since AuthService takes ownership)
-        let auth_service = Arc::new(AuthService::new((*iam_storage).clone(), jwt_manager));
+        // Sign tokens with a random secret until the server supplies the configured one
+        // through `with_jwt_secret`. Never a fixed value: a secret anyone can read in the
+        // source lets anyone mint an admin token.
+        let auth_service = Arc::new(AuthService::new(
+            (*iam_storage).clone(),
+            JwtManager::new(&generate_jwt_secret(), jwt_lifetime_hours()),
+        ));
 
         // Initialize disk-backed part store for multipart uploads
         let part_store = Arc::new(
@@ -169,6 +164,19 @@ impl AppState {
             ec_admin_service: Arc::new(NoopEcAdminService),
             ec_object_runtime: Arc::new(NoopEcObjectRuntime),
         }
+    }
+
+    /// Signs and verifies admin JWTs with `secret` from now on.
+    ///
+    /// Tokens issued before the call stop validating, so set it before the
+    /// router starts serving. Every node of a cluster must use the same secret,
+    /// or a token issued by one node is rejected by the others.
+    pub fn with_jwt_secret(mut self, secret: &str) -> Self {
+        self.auth_service = Arc::new(AuthService::new(
+            (*self.iam_storage).clone(),
+            JwtManager::new(secret, jwt_lifetime_hours()),
+        ));
+        self
     }
 
     /// Sets the Prometheus handle for rendering metrics.
@@ -218,6 +226,14 @@ impl AppState {
     pub fn is_cluster_mode(&self) -> bool {
         self.write_coordinator.is_some()
     }
+}
+
+/// Admin JWT lifetime in hours (`S4_JWT_LIFETIME_HOURS`, default 24).
+fn jwt_lifetime_hours() -> i64 {
+    std::env::var("S4_JWT_LIFETIME_HOURS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(24)
 }
 
 /// Adapter to make BitcaskStorageEngine work with StorageEngine trait for IAM.
