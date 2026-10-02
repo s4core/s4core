@@ -26,12 +26,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use s4_cluster::rpc::server::RpcServerHandle;
 use s4_cluster::{
-    AntiEntropyConfig, AntiEntropyService, BucketPlacement, ClusterConfig, ClusterEvent,
-    ClusterLimits, DataScrubber, DistributedGcService, DistributedListCoordinator, Edition,
-    FilesystemCapacity, GcConfig, GossipConfig, GossipIdentity, GossipService, HealingContext,
-    HintedHandoffConfig, HintedHandoffManager, HybridClock, IdempotencyTracker, ListTimeouts,
-    MultipartReplicaStorage, NodeAddr, NodeCapacityProvider, NodeClient, NodeClientConfig, NodeId,
-    NodeMeta, NodeRpcServer, PlacementRouter, PoolConfig, PoolId, QuorumReadCoordinator,
+    AntiEntropyConfig, AntiEntropyService, BucketPlacement, ClusterAdminService, ClusterConfig,
+    ClusterEvent, ClusterLimits, DataScrubber, DistributedGcService, DistributedListCoordinator,
+    Edition, FilesystemCapacity, GcConfig, GossipConfig, GossipIdentity, GossipService,
+    HealingContext, HintDelivery, HintedHandoffConfig, HintedHandoffManager, HybridClock,
+    IdempotencyTracker, ListTimeouts, MultipartReplicaStorage, NodeAddr, NodeCapacityProvider,
+    NodeClient, NodeClientConfig, NodeClusterAdmin, NodeId, NodeMeta, NodeRpcServer, PeerNames,
+    PlacementRouter, PoolConfig, PoolId, PoolRoster, PoolShape, QuorumReadCoordinator,
     QuorumWriteCoordinator, ReadRepairService, ReadTimeouts, ReplicaMultipartHandler,
     ReplicaReadHandler, ReplicaWriteHandler, RpcServerConfig, ScrubberConfig, TombstonePolicy,
     WriteTimeouts, PROTOCOL_VERSION, S4_VERSION,
@@ -84,6 +85,31 @@ impl StorageEngine for SharedStorageAdapter {
     ) -> Result<(), s4_core::error::StorageError> {
         let storage = self.0.write().await;
         storage.delete_object(bucket, key).await
+    }
+
+    // Must be delegated explicitly: the trait's default checks the generation
+    // under the read lock and then deletes whatever is there under the write
+    // lock, so a write landing in between would be deleted unchecked. Hint
+    // delivery and EC purge rely on this delete touching only the generation
+    // they name.
+    async fn delete_object_if_hlc(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected_hlc_timestamp: u64,
+        expected_hlc_logical: u32,
+        expected_origin_node_id: u128,
+    ) -> Result<bool, s4_core::error::StorageError> {
+        let storage = self.0.write().await;
+        storage
+            .delete_object_if_hlc(
+                bucket,
+                key,
+                expected_hlc_timestamp,
+                expected_hlc_logical,
+                expected_origin_node_id,
+            )
+            .await
     }
 
     // Must be delegated explicitly: the trait's default refuses, because
@@ -452,6 +478,9 @@ pub struct ClusterState {
     pub ec_admin_service: Option<EcAdminServiceHandle>,
     /// Enterprise Erasure Coding S3 object runtime, when this pool is EC.
     pub ec_object_runtime: Option<EcObjectRuntimeHandle>,
+    /// What the cluster routes of the admin API report, read from the same
+    /// state as the metrics.
+    pub cluster_admin_service: Arc<dyn ClusterAdminService>,
     /// Background task handles to abort on shutdown.
     pub background_handles: Vec<tokio::task::JoinHandle<()>>,
     /// gRPC server handle (for graceful shutdown).
@@ -630,6 +659,19 @@ pub async fn bootstrap_cluster(
         "Cluster configuration validated"
     );
 
+    // Every cluster metric exists from here on, at zero, before any service
+    // below records one. Peers are named as S4_POOL_NODES names them; this
+    // node is the member configured at its own gRPC address.
+    s4_cluster::register_cluster_metrics(
+        &cluster_cfg.pools[0].name,
+        &pool_members
+            .iter()
+            .filter(|member| member.addr != grpc_addr)
+            .map(|member| member.name.clone())
+            .collect::<Vec<_>>(),
+        cluster_cfg.epoch,
+    );
+
     // -----------------------------------------------------------------------
     // 3b. Refuse the start if a live pool member already answers for us
     // -----------------------------------------------------------------------
@@ -750,10 +792,13 @@ pub async fn bootstrap_cluster(
     // -----------------------------------------------------------------------
     // 7. Create RPC client pool
     // -----------------------------------------------------------------------
-    let rpc_client = Arc::new(NodeClient::new(
-        gossip_handle.clone(),
-        NodeClientConfig::default(),
-    ));
+    // Peers are named in metrics after `S4_POOL_NODES`; the names are filled
+    // in below, once each configured member is matched to its identity.
+    let peer_names = Arc::new(PeerNames::default());
+    let rpc_client = Arc::new(
+        NodeClient::new(gossip_handle.clone(), NodeClientConfig::default())
+            .with_peer_names(peer_names.clone()),
+    );
 
     // -----------------------------------------------------------------------
     // 8. Create StorageEngine adapter for cluster components
@@ -887,6 +932,22 @@ pub async fn bootstrap_cluster(
     if let Err(error) = peer_record.save(data_dir) {
         tracing::warn!(%error, "could not record what this node learned about its pool");
     }
+    peer_names.set(
+        pool_members
+            .iter()
+            .zip(pool_nodes_ids.iter())
+            .map(|(member, node_id)| (*node_id, member.name.clone())),
+    );
+    // From here on gossip reports which of those members it holds alive.
+    let pool_roster = PoolRoster::new(
+        cluster_cfg.pools[0].name.clone(),
+        node_id,
+        pool_members
+            .iter()
+            .zip(pool_nodes_ids.iter())
+            .map(|(member, node_id)| (*node_id, member.name.clone())),
+    );
+    gossip_handle.report_membership(pool_roster.clone());
 
     // -----------------------------------------------------------------------
     // 10b. Validate edition compatibility across the pool
@@ -1078,11 +1139,12 @@ pub async fn bootstrap_cluster(
     // Only the Enterprise branch below reassigns it, so a CE build sees a
     // binding it never mutates.
     #[cfg_attr(not(feature = "enterprise"), allow(unused_mut))]
-    let mut rpc_server = NodeRpcServer::new(node_id, Arc::new(node_meta), gossip_handle.clone())
-        .with_replica_handler(replica_write)
-        .with_multipart_handler(replica_multipart)
-        .with_read_handler(replica_read)
-        .with_anti_entropy(anti_entropy.clone());
+    let mut rpc_server =
+        NodeRpcServer::new(node_id, Arc::new(node_meta.clone()), gossip_handle.clone())
+            .with_replica_handler(replica_write)
+            .with_multipart_handler(replica_multipart)
+            .with_read_handler(replica_read)
+            .with_anti_entropy(anti_entropy.clone());
 
     // Auto-tiering records an access on whichever node served it, so a node
     // deciding that an object has gone cold has to ask its peers first.
@@ -1132,12 +1194,19 @@ pub async fn bootstrap_cluster(
     // -----------------------------------------------------------------------
     // 13. Create hinted handoff manager
     // -----------------------------------------------------------------------
-    let hint_config = HintedHandoffConfig::new(data_dir);
-    let hints = Arc::new(HintedHandoffManager::new(
-        hint_config,
-        gossip_handle.clone(),
-        rpc_client.clone(),
+    let hint_config = HintedHandoffConfig::new(data_dir).with_ttl(Duration::from_secs(
+        u64::from(cluster_config.hint_ttl_hours) * 3600,
     ));
+    // Reads every hint log an earlier run left, up to the per-target limit:
+    // file work that belongs off the runtime's threads.
+    let hints = {
+        let rpc_client = rpc_client.clone();
+        Arc::new(
+            tokio::task::spawn_blocking(move || HintedHandoffManager::new(hint_config, rpc_client))
+                .await
+                .context("Failed to load the hint logs")?,
+        )
+    };
 
     // -----------------------------------------------------------------------
     // 14. Create read repair service
@@ -1147,6 +1216,7 @@ pub async fn bootstrap_cluster(
     // -----------------------------------------------------------------------
     // 15. Create quorum coordinators
     // -----------------------------------------------------------------------
+    let write_timeouts = WriteTimeouts::default();
     let write_coordinator = Arc::new(
         QuorumWriteCoordinator::new(
             node_id,
@@ -1156,7 +1226,7 @@ pub async fn bootstrap_cluster(
             clock.clone(),
             hints.clone(),
             &cluster_cfg,
-            WriteTimeouts::default(),
+            write_timeouts.clone(),
         )
         .with_multipart_storage(multipart_storage),
     );
@@ -1191,6 +1261,22 @@ pub async fn bootstrap_cluster(
     // -----------------------------------------------------------------------
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut background_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // Hinted handoff maintenance: removes the hints that outlived the TTL and
+    // brings the replicas gossip holds alive to the current state of the keys
+    // they missed, read from the other replicas. A write a hint names may
+    // still be landing on them for as long as a replica write may take.
+    let hint_delivery = HintDelivery::new(
+        read_coordinator.clone(),
+        rpc_client.clone(),
+        gossip_handle.clone(),
+        node_id,
+        cluster_cfg.epoch,
+    )
+    .with_settle_time(write_timeouts.replica_write_timeout);
+    background_handles.push(tokio::spawn(
+        hints.run_maintenance(Some(hint_delivery), shutdown_rx.clone()),
+    ));
 
     #[cfg(feature = "enterprise")]
     if let Some(service) = ec_operations_service {
@@ -1422,6 +1508,27 @@ pub async fn bootstrap_cluster(
         );
     }
 
+    // The admin API reads the membership the metrics count and the counters
+    // the services above increment next to their metrics.
+    let (replication_factor, write_quorum, read_quorum) =
+        cluster_cfg.effective_quorum(&cluster_cfg.pools[0]);
+    let cluster_admin_service: Arc<dyn ClusterAdminService> = Arc::new(NodeClusterAdmin::new(
+        gossip_handle.clone(),
+        node_meta,
+        PoolShape {
+            roster: pool_roster,
+            pool_id: pool_id.0,
+            storage_class: cluster_cfg.pools[0].storage_class,
+            replication_factor,
+            write_quorum,
+            read_quorum,
+            epoch: cluster_cfg.epoch,
+        },
+        anti_entropy.metrics().clone(),
+        gc_service.metrics().clone(),
+        scrubber.metrics().clone(),
+    ));
+
     // Store shutdown sender so we can signal workers on shutdown
     // (we'll drop it in app.rs shutdown sequence)
     let shutdown_handle = tokio::spawn(async move {
@@ -1440,6 +1547,7 @@ pub async fn bootstrap_cluster(
         list_coordinator,
         ec_admin_service,
         ec_object_runtime,
+        cluster_admin_service,
         background_handles,
         rpc_handle,
     })
@@ -1772,6 +1880,9 @@ fn unix_time_secs() -> u64 {
 }
 
 #[cfg(test)]
+mod bucket_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use s4_core::storage::ReadOptions;
@@ -2088,6 +2199,42 @@ mod tests {
         let (body, record) = adapter.get_object("bucket", "object.bin").await.expect("read back");
         assert_eq!(body, b"payload");
         assert!(!record.is_erasure_coded());
+    }
+
+    /// A conditional delete checks the generation and deletes under one write
+    /// lock. A write that lands while the delete waits for the lock is checked
+    /// like any other generation, not deleted unseen.
+    #[tokio::test]
+    async fn a_conditional_delete_leaves_a_write_that_landed_while_it_waited() {
+        let (adapter, _temp) = test_adapter().await;
+        let adapter = Arc::new(adapter);
+        let at = |wall: u64| {
+            HashMap::from([
+                ("_s4_hlc_wall".to_string(), wall.to_string()),
+                ("_s4_hlc_logical".to_string(), "0".to_string()),
+                ("_s4_hlc_node_id".to_string(), "1".to_string()),
+            ])
+        };
+        adapter
+            .put_object("bucket", "key", b"version 10", "text/plain", &at(10))
+            .await
+            .expect("write version 10");
+
+        let held = adapter.0.read().await;
+        let delete = tokio::spawn({
+            let adapter = adapter.clone();
+            async move { adapter.delete_object_if_hlc("bucket", "key", 10, 0, 1).await }
+        });
+        // The delete is now waiting for the lock this test holds.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        held.put_object("bucket", "key", b"version 20", "text/plain", &at(20))
+            .await
+            .expect("write version 20");
+        drop(held);
+
+        assert!(!delete.await.expect("delete task").expect("delete"));
+        let (body, record) = adapter.get_object("bucket", "key").await.expect("read back");
+        assert_eq!((body, record.hlc_timestamp), (b"version 20".to_vec(), 20));
     }
 
     #[tokio::test]

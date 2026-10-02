@@ -67,7 +67,7 @@ Such a write therefore carries a reserved metadata key,
 - the dedup entry for that content is moved to the copy just written, so the
   next writer of the same content lands on the healthy one;
 - a replica applies it even if it has already applied a write with the same
-  operation id, because a heal is not a retry (decision EC2-164).
+  operation id, because a heal is not a retry.
 
 The key describes the write, not the object: it is stripped before the record is
 persisted and never appears in object metadata. Ordinary writes are unaffected

@@ -106,6 +106,37 @@ impl HlcTimestamp {
         }
     }
 
+    /// The HLC of a stored record, the same on every read path and replica.
+    ///
+    /// A record written without an HLC (in single mode, before the node
+    /// joined a cluster, or by a path that bypasses the coordinators) gets one
+    /// made up from its modification time, with node 0: no node issued it. A
+    /// copy repaired from such a record is written with that same HLC, so it
+    /// stays recognisable as made up on every replica it reaches.
+    pub fn of_record(record: &s4_core::IndexRecord) -> Self {
+        if record.hlc_timestamp > 0 {
+            Self::from_record(
+                record.hlc_timestamp,
+                record.hlc_logical,
+                record.origin_node_id,
+            )
+        } else {
+            Self {
+                wall_time: record.modified_at / 1_000_000, // nanos → millis
+                logical: 0,
+                node_id: 0,
+            }
+        }
+    }
+
+    /// Whether no node issued this timestamp: it was made up for a record
+    /// written without an HLC ([`Self::of_record`]), or it is zero. Such a
+    /// timestamp orders a record only roughly, and no record that carries
+    /// one may be taken for a write the cluster ordered.
+    pub fn is_made_up(&self) -> bool {
+        self.node_id == 0
+    }
+
     /// Convert to protobuf representation.
     pub fn to_proto(self) -> proto::HybridTimestamp {
         proto::HybridTimestamp {
@@ -330,6 +361,31 @@ mod tests {
         assert_eq!(ts.wall_time, 1000);
         assert_eq!(ts.logical, 5);
         assert_eq!(ts.node_id, 42);
+    }
+
+    /// A record keeps the HLC it was written with; one written without gets
+    /// one made up from its modification time, with node 0, wherever it is
+    /// read.
+    #[test]
+    fn a_record_without_an_hlc_gets_a_made_up_one_with_node_0() {
+        let mut record = s4_core::IndexRecord::new(1, 0, 3, [0; 32], "\"e\"".into(), "".into());
+        record.modified_at = 2_500_000_000;
+        let made_up = HlcTimestamp::of_record(&record);
+        assert_eq!(made_up, HlcTimestamp::from_record(2_500, 0, 0));
+        assert!(made_up.is_made_up());
+
+        record.hlc_timestamp = 1_000;
+        record.hlc_logical = 5;
+        record.origin_node_id = 42;
+        let issued = HlcTimestamp::of_record(&record);
+        assert_eq!(issued, HlcTimestamp::from_record(1_000, 5, 42));
+        assert!(!issued.is_made_up());
+
+        // A copy repaired from a record without an HLC stores the made-up
+        // one, and is still told apart from a write the cluster ordered.
+        record.hlc_logical = 0;
+        record.origin_node_id = 0;
+        assert!(HlcTimestamp::of_record(&record).is_made_up());
     }
 
     #[test]

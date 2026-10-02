@@ -22,8 +22,9 @@ use std::time::Instant;
 /// Middleware that records HTTP request count and latency metrics.
 ///
 /// Records two metrics via the `metrics` crate:
-/// - `http_requests_total` (counter): incremented per request, labeled by method and status.
-/// - `http_request_duration_seconds` (histogram): request latency, labeled by method.
+/// - `http_requests_total` (counter): incremented per request once it is answered,
+///   labeled by method, status and path.
+/// - `http_request_duration_seconds` (histogram): request latency, labeled by method and path.
 ///
 /// Path labels are normalized to avoid high cardinality (bucket names and object keys
 /// are replaced with placeholders).
@@ -38,7 +39,8 @@ pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     let status = response.status().as_u16().to_string();
     let path = normalize_path(&raw_path);
 
-    metrics::counter!("http_requests_total", "method" => method.clone(), "status" => status, "path" => path.clone());
+    metrics::counter!("http_requests_total", "method" => method.clone(), "status" => status, "path" => path.clone())
+        .increment(1);
     metrics::histogram!("http_request_duration_seconds", "method" => method, "path" => path)
         .record(duration);
 
@@ -49,12 +51,14 @@ pub async fn metrics_middleware(request: Request, next: Next) -> Response {
 ///
 /// - `/` → `/`
 /// - `/metrics` → `/metrics`
-/// - `/api/admin/...` → kept as-is
+/// - `/health` → `/health`, not `/{bucket}`: a load balancer's health checks would
+///   otherwise be counted as bucket listings
+/// - `/api/admin/...` → `/api/admin`
 /// - `/api/stats` → `/api/stats`
 /// - `/{bucket}` → `/{bucket}`
 /// - `/{bucket}/{key...}` → `/{bucket}/{key}`
 fn normalize_path(path: &str) -> String {
-    if path == "/" || path == "/metrics" || path == "/api/stats" {
+    if path == "/" || path == "/metrics" || path == "/health" || path == "/api/stats" {
         return path.to_string();
     }
     if path.starts_with("/api/admin") {
@@ -81,6 +85,11 @@ mod tests {
     #[test]
     fn test_normalize_path_metrics() {
         assert_eq!(normalize_path("/metrics"), "/metrics");
+    }
+
+    #[test]
+    fn test_normalize_path_health() {
+        assert_eq!(normalize_path("/health"), "/health");
     }
 
     #[test]

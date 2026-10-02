@@ -27,8 +27,9 @@ use axum::{
     Router,
 };
 use s4_cluster::{
-    DistributedListCoordinator, EcAdminService, EcObjectRuntime, NoopEcAdminService,
-    NoopEcObjectRuntime, QuorumReadCoordinator, QuorumWriteCoordinator,
+    ClusterAdminService, DistributedListCoordinator, EcAdminService, EcObjectRuntime,
+    NoopClusterAdminService, NoopEcAdminService, NoopEcObjectRuntime, QuorumReadCoordinator,
+    QuorumWriteCoordinator,
 };
 use s4_core::storage::{BitcaskStorageEngine, StorageEngine};
 use s4_core::types::StorageClass;
@@ -92,6 +93,12 @@ pub struct AppState {
     pub ec_admin_service: Arc<dyn EcAdminService>,
     /// Edition-injected Erasure Coding S3 object runtime hooks.
     pub ec_object_runtime: Arc<dyn EcObjectRuntime>,
+    /// What the cluster routes of the admin API report: the pool, this node,
+    /// anti-entropy and the scrubber. A single node reports nothing.
+    pub cluster_admin_service: Arc<dyn ClusterAdminService>,
+    /// The usage of the pool a cluster node last counted, reused for a few
+    /// seconds by the bucket statistics and `/api/stats`.
+    pub usage_cache: Arc<crate::handlers::usage::UsageCache>,
 }
 
 impl AppState {
@@ -163,6 +170,8 @@ impl AppState {
             default_bucket_storage_class: StorageClass::Standard,
             ec_admin_service: Arc::new(NoopEcAdminService),
             ec_object_runtime: Arc::new(NoopEcObjectRuntime),
+            cluster_admin_service: Arc::new(NoopClusterAdminService),
+            usage_cache: Arc::default(),
         }
     }
 
@@ -219,6 +228,12 @@ impl AppState {
     /// Sets the EC object runtime implementation.
     pub fn with_ec_object_runtime(mut self, runtime: Arc<dyn EcObjectRuntime>) -> Self {
         self.ec_object_runtime = runtime;
+        self
+    }
+
+    /// Sets what the cluster routes of the admin API report.
+    pub fn with_cluster_admin_service(mut self, service: Arc<dyn ClusterAdminService>) -> Self {
+        self.cluster_admin_service = service;
         self
     }
 

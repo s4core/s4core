@@ -23,8 +23,19 @@
 //! All downstream code receives these through dependency injection and never
 //! checks the edition directly.
 
-use s4_cluster::{ClusterLimits, ClusterServices};
+use s4_cluster::{ClusterLimits, ClusterServices, S4_VERSION};
 use tracing::info;
+
+/// What this start decided about the edition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedEdition {
+    /// The limits the node runs under.
+    pub limits: ClusterLimits,
+    /// When the Enterprise licence the node runs under expires, in seconds
+    /// since the Unix epoch; `None` when it runs without one. An expired
+    /// licence still counts: the node keeps running as Enterprise, degraded.
+    pub license_expires_at: Option<i64>,
+}
 
 /// Human-readable edition label for logs and /health endpoint.
 pub fn edition_label() -> &'static str {
@@ -44,14 +55,42 @@ pub fn edition_label() -> &'static str {
 /// - **EE build** (`cargo build --features enterprise`): Loads the license key
 ///   and extracts limits from it. Falls back to CE limits on any error.
 pub fn resolve_cluster_limits() -> ClusterLimits {
+    resolve_edition().limits
+}
+
+/// Resolve the edition: the limits of [`resolve_cluster_limits`], and the
+/// expiry of the licence they come from.
+pub fn resolve_edition() -> ResolvedEdition {
     #[cfg(feature = "enterprise")]
     {
-        resolve_enterprise_limits()
+        resolve_enterprise_edition()
     }
     #[cfg(not(feature = "enterprise"))]
     {
         info!("Running in Community Edition mode (1 pool, 3 nodes)");
-        ClusterLimits::community()
+        ResolvedEdition {
+            limits: ClusterLimits::community(),
+            license_expires_at: None,
+        }
+    }
+}
+
+/// Publishes `s4_build_info` and, under an Enterprise licence,
+/// `s4_license_expiry_timestamp_seconds`.
+///
+/// The edition in `s4_build_info` is the one the node runs as, not the one it
+/// was built as: an Enterprise build without a licence runs, and reports, as
+/// `ce`. Called once the Prometheus recorder is installed — recorded before
+/// that, both would go nowhere.
+pub fn record_edition_metrics(edition: &ResolvedEdition) {
+    let label = if edition.limits.is_community() {
+        "ce"
+    } else {
+        "ee"
+    };
+    metrics::gauge!("s4_build_info", "version" => S4_VERSION, "edition" => label).set(1.0);
+    if let Some(expires_at) = edition.license_expires_at {
+        metrics::gauge!("s4_license_expiry_timestamp_seconds").set(expires_at as f64);
     }
 }
 
@@ -76,10 +115,11 @@ pub fn build_cluster_services(_limits: &ClusterLimits) -> ClusterServices {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "enterprise")]
-fn resolve_enterprise_limits() -> ClusterLimits {
+fn resolve_enterprise_edition() -> ResolvedEdition {
     match s4_ee::load_license() {
         Ok(license) => {
-            if license.is_expired() {
+            let license_expires_at = Some(license.expires_at.timestamp());
+            let limits = if license.is_expired() {
                 tracing::warn!(
                     customer = %license.customer,
                     expired_at = %license.expires_at,
@@ -96,6 +136,10 @@ fn resolve_enterprise_limits() -> ClusterLimits {
                     "Enterprise license validated"
                 );
                 limits_from_capabilities(&license.capabilities)
+            };
+            ResolvedEdition {
+                limits,
+                license_expires_at,
             }
         }
         Err(s4_ee::LicenseError::NotFound) => {
@@ -104,14 +148,20 @@ fn resolve_enterprise_limits() -> ClusterLimits {
                  to activate Enterprise Edition. Running in Community Edition mode \
                  (1 pool, max 3 nodes)."
             );
-            ClusterLimits::community()
+            ResolvedEdition {
+                limits: ClusterLimits::community(),
+                license_expires_at: None,
+            }
         }
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 "Enterprise license validation failed — falling back to Community Edition mode"
             );
-            ClusterLimits::community()
+            ResolvedEdition {
+                limits: ClusterLimits::community(),
+                license_expires_at: None,
+            }
         }
     }
 }
@@ -146,6 +196,14 @@ fn build_enterprise_services(limits: &ClusterLimits) -> ClusterServices {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// The exposition `/metrics` would serve after [`record_edition_metrics`].
+#[cfg(test)]
+fn render(edition: &ResolvedEdition) -> String {
+    let recorder = s4_api::prometheus::builder().expect("bucket bounds").build_recorder();
+    metrics::with_local_recorder(&recorder, || record_edition_metrics(edition));
+    recorder.handle().render()
+}
+
 #[cfg(test)]
 #[cfg(not(feature = "enterprise"))]
 mod tests {
@@ -160,6 +218,21 @@ mod tests {
     fn ce_resolve_limits_returns_community() {
         let limits = resolve_cluster_limits();
         assert_eq!(limits, ClusterLimits::community());
+    }
+
+    #[test]
+    fn ce_reports_its_build_and_no_licence() {
+        let edition = resolve_edition();
+        assert_eq!(edition.license_expires_at, None);
+
+        let exposition = render(&edition);
+        assert!(
+            exposition.contains(&format!(
+                "s4_build_info{{version=\"{S4_VERSION}\",edition=\"ce\"}} 1\n"
+            )),
+            "{exposition}"
+        );
+        assert!(!exposition.contains("s4_license_expiry_timestamp_seconds"));
     }
 
     #[test]
@@ -266,6 +339,40 @@ mod tests_ee {
         assert!(limits.allow_audit_log);
         assert!(limits.allow_erasure_coding);
         // _guard drops here → clear_env() runs automatically.
+    }
+
+    /// A node under a licence reports when it expires, and reports itself as
+    /// `ee`; the same build without one reports `ce` and no expiry.
+    #[test]
+    fn ee_reports_the_expiry_of_the_licence_it_runs_under() {
+        let _guard = EnvGuard::acquire();
+        std::env::set_var("S4_LICENSE_DEV", "1");
+
+        let edition = resolve_edition();
+        let expires_at = edition.license_expires_at.expect("a dev licence has an expiry");
+        let in_a_year = (chrono::Utc::now() + chrono::Duration::days(365)).timestamp();
+        assert!(
+            (in_a_year - expires_at).abs() < 5,
+            "{expires_at} vs {in_a_year}"
+        );
+
+        let exposition = render(&edition);
+        assert!(
+            exposition.contains(&format!(
+                "s4_license_expiry_timestamp_seconds {expires_at}\n"
+            )),
+            "{exposition}"
+        );
+        assert!(exposition.contains(&format!(
+            "s4_build_info{{version=\"{S4_VERSION}\",edition=\"ee\"}} 1\n"
+        )));
+
+        std::env::remove_var("S4_LICENSE_DEV");
+        let without = resolve_edition();
+        assert_eq!(without.license_expires_at, None);
+        let exposition = render(&without);
+        assert!(!exposition.contains("s4_license_expiry_timestamp_seconds"));
+        assert!(exposition.contains("edition=\"ce\""));
     }
 
     #[test]

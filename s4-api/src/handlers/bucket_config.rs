@@ -58,9 +58,12 @@ pub async fn get_bucket_cors(
 ) -> impl IntoResponse {
     debug!("GetBucketCors: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -99,9 +102,12 @@ pub async fn put_bucket_cors(
 ) -> impl IntoResponse {
     info!("PutBucketCors: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -160,9 +166,12 @@ pub async fn delete_bucket_cors(
 ) -> impl IntoResponse {
     info!("DeleteBucketCors: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -194,9 +203,12 @@ pub async fn get_bucket_versioning(
 ) -> impl IntoResponse {
     debug!("GetBucketVersioning: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -229,9 +241,12 @@ pub async fn put_bucket_versioning(
 ) -> impl IntoResponse {
     info!("PutBucketVersioning: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -352,9 +367,12 @@ pub async fn get_bucket_lifecycle(
 ) -> impl IntoResponse {
     debug!("GetBucketLifecycle: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -389,9 +407,12 @@ pub async fn put_bucket_lifecycle(
 ) -> impl IntoResponse {
     info!("PutBucketLifecycle: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -454,9 +475,12 @@ pub async fn delete_bucket_lifecycle(
 ) -> impl IntoResponse {
     info!("DeleteBucketLifecycle: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -531,9 +555,12 @@ pub async fn get_bucket_location(
 ) -> impl IntoResponse {
     debug!("GetBucketLocation: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -564,9 +591,12 @@ pub async fn get_bucket_policy(
 ) -> impl IntoResponse {
     debug!("GetBucketPolicy: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -615,9 +645,12 @@ pub async fn put_bucket_policy(
 ) -> impl IntoResponse {
     info!("PutBucketPolicy: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -657,9 +690,12 @@ pub async fn delete_bucket_policy(
 ) -> impl IntoResponse {
     info!("DeleteBucketPolicy: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -680,9 +716,12 @@ pub async fn get_bucket_policy_status(
 ) -> impl IntoResponse {
     debug!("GetBucketPolicyStatus: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -729,9 +768,12 @@ pub async fn put_bucket_encryption(
 ) -> impl IntoResponse {
     debug!("PutBucketEncryption: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -772,9 +814,12 @@ pub async fn get_bucket_encryption(
 ) -> impl IntoResponse {
     debug!("GetBucketEncryption: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -805,9 +850,12 @@ pub async fn delete_bucket_encryption(
 ) -> impl IntoResponse {
     debug!("DeleteBucketEncryption: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }

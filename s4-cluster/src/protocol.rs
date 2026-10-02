@@ -63,6 +63,16 @@ pub const EC_V2_MIN_PROTOCOL_VERSION: u32 = 2;
 /// least this version (decision EC2-084, point 4).
 pub const EC_SET_LAYOUT_MIN_PROTOCOL_VERSION: u32 = 3;
 
+/// Lowest protocol version whose node deletes one exact generation of an
+/// object when a delete carries `expected_source_hlc`.
+///
+/// The field arrived with the erasure-coding work while the protocol was still
+/// at 1, and a node that predates it reads such a delete as an unconditional
+/// one. Every release that advertises 2 or more has it (v1.1.0 onwards; v1.0.0
+/// advertises 1 and has not), so hint delivery sends a conditional delete only
+/// to a node at this version or above.
+pub const CONDITIONAL_DELETE_MIN_PROTOCOL_VERSION: u32 = 2;
+
 /// S4 server version string embedded in gossip metadata.
 pub const S4_VERSION: &str = env!("CARGO_PKG_VERSION");
 

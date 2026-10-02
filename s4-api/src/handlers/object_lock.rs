@@ -58,9 +58,12 @@ pub async fn get_bucket_object_lock_configuration(
 ) -> impl IntoResponse {
     debug!("GetBucketObjectLockConfiguration: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -104,9 +107,12 @@ pub async fn put_bucket_object_lock_configuration(
 ) -> impl IntoResponse {
     info!("PutBucketObjectLockConfiguration: {}", bucket);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }

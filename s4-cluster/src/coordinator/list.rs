@@ -28,6 +28,7 @@ use std::time::Duration;
 use s4_core::StorageEngine;
 use tracing::{debug, error, warn};
 
+use crate::cluster_metrics::{observe_quorum, QuorumOperation};
 use crate::conflict;
 use crate::error::ClusterError;
 use crate::hlc::HlcTimestamp;
@@ -51,6 +52,21 @@ pub struct ListEntry {
     pub hlc: HlcTimestamp,
     /// Version ID.
     pub version_id: Option<String>,
+}
+
+impl ListEntry {
+    /// The entry for a record in local storage, with the HLC a replica would
+    /// report for it: entries from different nodes are merged by HLC.
+    fn of_record(key: String, record: s4_core::IndexRecord) -> Self {
+        Self {
+            hlc: HlcTimestamp::of_record(&record),
+            key,
+            size: record.size,
+            content_type: record.content_type,
+            etag: record.etag,
+            version_id: record.version_id,
+        }
+    }
 }
 
 /// Result of a distributed list operation.
@@ -127,6 +143,20 @@ impl DistributedListCoordinator {
         max_keys: usize,
         continuation_token: Option<&str>,
     ) -> Result<DistributedListResult, ClusterError> {
+        observe_quorum(
+            QuorumOperation::List,
+            self.list_inner(bucket, prefix, max_keys, continuation_token),
+        )
+        .await
+    }
+
+    async fn list_inner(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        max_keys: usize,
+        continuation_token: Option<&str>,
+    ) -> Result<DistributedListResult, ClusterError> {
         let pool_nodes = self.router.pool_nodes(bucket)?;
 
         // Single-node bypass
@@ -165,18 +195,7 @@ impl DistributedListCoordinator {
                             node_id,
                             entries: entries
                                 .into_iter()
-                                .map(|(key, record)| ListEntry {
-                                    key,
-                                    size: record.size,
-                                    content_type: record.content_type,
-                                    etag: record.etag,
-                                    hlc: HlcTimestamp {
-                                        wall_time: record.modified_at / 1_000_000, // nanos → millis
-                                        logical: 0,
-                                        node_id: node_id.0,
-                                    },
-                                    version_id: record.version_id,
-                                })
+                                .map(|(key, record)| ListEntry::of_record(key, record))
                                 .collect(),
                         },
                         Ok(Err(e)) => NodeListResult::Error {
@@ -338,18 +357,7 @@ impl DistributedListCoordinator {
         let entries: Vec<ListEntry> = objects
             .into_iter()
             .take(max_keys)
-            .map(|(key, record)| ListEntry {
-                key,
-                size: record.size,
-                content_type: record.content_type,
-                etag: record.etag,
-                hlc: HlcTimestamp {
-                    wall_time: record.modified_at / 1_000_000, // nanos → millis
-                    logical: 0,
-                    node_id: self.local_node_id.0,
-                },
-                version_id: record.version_id,
-            })
+            .map(|(key, record)| ListEntry::of_record(key, record))
             .collect();
 
         let next_token = if is_truncated {
@@ -435,6 +443,63 @@ mod tests {
         assert_eq!(result.entries.len(), 2);
         assert_eq!(result.nodes_responded, 1);
         assert!(!result.is_truncated);
+    }
+
+    /// Entries from different nodes are merged by HLC, so a local entry
+    /// carries the HLC a replica would report for it: the one it was written
+    /// with, not the time this node stored it; for a record written without
+    /// one, the made-up HLC with node 0.
+    #[tokio::test]
+    async fn a_local_entry_carries_the_hlc_its_record_was_written_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            s4_core::storage::BitcaskStorageEngine::new(
+                dir.path().join("volumes"),
+                dir.path().join("metadata"),
+                10 * 1024 * 1024,
+                4096,
+                false,
+            )
+            .await
+            .unwrap(),
+        );
+        let issued = HlcTimestamp::from_record(5, 3, 7);
+        let metadata = HashMap::from([
+            ("_s4_hlc_wall".to_string(), issued.wall_time.to_string()),
+            ("_s4_hlc_logical".to_string(), issued.logical.to_string()),
+            ("_s4_hlc_node_id".to_string(), issued.node_id.to_string()),
+        ]);
+        storage
+            .put_object("bucket", "issued", b"a", "text/plain", &metadata)
+            .await
+            .unwrap();
+        storage
+            .put_object("bucket", "plain", b"b", "text/plain", &HashMap::new())
+            .await
+            .unwrap();
+        let plain = storage.head_object("bucket", "plain").await.unwrap();
+        let gossip = Arc::new(GossipHandle::new_for_testing(Default::default()));
+        let coordinator = DistributedListCoordinator::new(
+            NodeId(1),
+            storage,
+            Arc::new(NodeClient::new(gossip, NodeClientConfig::default())),
+            Arc::new(PlacementRouter::single_node(NodeId(1))),
+            1,
+            ListTimeouts::default(),
+        );
+
+        let result = coordinator.list("bucket", "", 100, None).await.unwrap();
+        let hlc_of =
+            |key: &str| result.entries.iter().find(|entry| entry.key == key).map(|entry| entry.hlc);
+        assert_eq!(hlc_of("issued"), Some(issued));
+        assert_eq!(
+            hlc_of("plain"),
+            Some(HlcTimestamp::from_record(
+                plain.modified_at / 1_000_000,
+                0,
+                0
+            ))
+        );
     }
 
     #[tokio::test]
@@ -677,5 +742,21 @@ mod tests {
                 etag: "\"m\"".into(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn a_listing_is_one_list_operation() {
+        let metrics = crate::test_metrics::TestMetrics::install();
+        let coordinator = setup_single_node();
+
+        coordinator.list("bucket", "", 10, None).await.expect("listing");
+
+        assert_eq!(
+            metrics.value(
+                "s4_quorum_operations_total",
+                &[("operation", "list"), ("outcome", "ok")]
+            ),
+            Some(1.0)
+        );
     }
 }

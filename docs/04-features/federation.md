@@ -1,6 +1,6 @@
 # Federation (Distributed Mode)
 
-> **Status:** All phases (1–10) implemented. Conflict resolution (HLC+LWW), anti-entropy (Merkle trees), distributed tombstone GC, bit rot protection, and cluster operations are complete.
+> **Status:** Gossip membership, quorum replication, conflict resolution (HLC+LWW), read repair on quorum reads, hinted handoff, bit rot protection and cluster operations work. The background anti-entropy of a replicated pool is built but not started, and so tombstone GC purges nothing yet — see [Anti-Entropy](#anti-entropy-merkle-trees).
 
 S4 supports a **leaderless distributed mode** where multiple nodes form a cluster and replicate data using quorum protocols. This provides high availability and horizontal scaling while maintaining S3 API compatibility.
 
@@ -54,8 +54,12 @@ Each node gets a unique UUID (persisted in `data_dir/node_id`) on first startup.
 
 Nodes discover each other via seed addresses and use the **SWIM protocol** (via the `foca` crate) for failure detection:
 
-- **Alive → Suspect:** Node fails to respond to ping (5 s timeout)
-- **Suspect → Dead:** Node fails indirect probes through K=3 other nodes (30 s timeout)
+- **Alive → Dead:** a node that stops answering pings, directly and through other nodes, is
+  suspected by gossip and reported down 5 s later; S4 then marks it dead
+- **Dead → Alive:** the node is alive again as soon as it is heard from. A node declared dead
+  while it was paused or cut off by the network is told so by the first peer it reaches and
+  rejoins under its next incarnation; every node keeps announcing itself to the seeds it does not
+  see alive, so a healed network split closes on its own within seconds
 - **Metadata propagation:** Each node broadcasts its capacity, version, and pool membership via gossip
 
 ### Inter-Node Communication (gRPC)
@@ -74,16 +78,72 @@ For the recommended deployment (pool size = RF = 3), every node in the pool stor
 
 For larger pools (pool size > RF), a consistent hash ring with 128 virtual nodes per physical node routes keys to the correct RF replicas.
 
+### Buckets
+
+A bucket exists while its marker does, and the marker is written and read through the same quorums
+as objects. CreateBucket and DeleteBucket change it through a write quorum, from the S3 API and
+the admin API alike, and every request that writes to, lists or deletes from a bucket first reads
+it through a read quorum: PUT, CopyObject, multipart uploads, DeleteObject, DeleteObjects,
+listings, tagging and bucket configuration. Since R + W > N, a bucket created through any node
+takes writes through every other at once, and one deleted through any node answers `NoSuchBucket`
+everywhere. A read of one object asks for its bucket only when the object is not found, so GET
+tells `NoSuchBucket` from `NoSuchKey` without slowing the reads that find their object; HEAD,
+whose 404 has no body, does not ask. When too few replicas answer to tell whether the bucket
+exists, the request answers `503` and writes nothing.
+
+As with S3's own bucket operations, deleting a bucket is not atomic with requests already past
+their check: an object written in the same instant as its bucket is deleted can outlive it.
+
 ### Hinted Handoff
 
-When a replica is temporarily unreachable during a write:
-1. The coordinator stores a **hint** locally (persisted to disk)
-2. When the replica comes back online (detected via gossip), hints are delivered
-3. Hints have a TTL (default: 3 hours) — after expiry, anti-entropy handles catch-up
+When a write or a delete does not land on a replica — the replica refused it, did not answer
+within the replica timeout (60 s), or gossip holds it dead — the coordinator stores a **hint** for
+it: this key on this replica may be behind. A replica that takes the write, even after the client
+already has its answer, gets no hint, so a healthy cluster stores none. A node never hints itself.
+
+A hint holds the bucket, the key and the HLC of the missed operation, not the object. The hints for
+one replica are appended to one log on the coordinator's disk, up to 1 GB; a hint that does not fit
+is dropped and counted in `s4_hints_dropped_total{reason="full"}`. Hints older than
+`S4_HINT_TTL_HOURS` (3 hours) are removed — at most a quarter of that later — and counted as
+`expired`; `0` keeps no hints at all.
+
+Every 30 seconds the coordinator delivers its hints to the replicas gossip holds alive. A hint
+does not replay the operation: the coordinator reads the key from every other replica and brings
+the returned one to the newest version it finds.
+
+- **The key exists.** Its copy is written to the replica with that version's HLC, so a replica that
+  already has something newer keeps it.
+- **No other replica has the key.** The replica's record is removed only if it is no newer than
+  the operation the replica missed, and only by that record's exact HLC.
+- **The key is erasure coded now.** No copy is written; the hint counts as
+  `dropped{reason="superseded"}`.
+- **The other replicas disagree.** A replica that took a delete simply has no key, which cannot be
+  told from one that never got the write. So a copy is written only when no other replica lacks
+  the key, or when as many of them hold it as a confirmed write leaves behind (with `W=2` and three
+  replicas, both others). Otherwise the copy may be one that missed a delete, and writing it would
+  bring the deleted key back: nothing is written, and the hint counts as
+  `dropped{reason="ambiguous"}` — unless the replica already holds that version or a newer one.
+
+Hints for a key may therefore be delivered in any order and more than once. A hint whose key cannot
+be settled now waits for a later pass without holding up the others: another replica did not
+answer or gossip holds it down, or the write the hint names may still be landing on the other
+replicas (for up to the 60-second replica write timeout after the hint was taken). Only a replica
+that stops answering stops the delivery of its own hints until the next pass. A replica that refuses
+what it is sent is counted as `rejected`. So is a node too old to delete one exact version (before
+v1.1.0), which is not sent such a delete at all, and a copy a replica reported with no HLC at all,
+which the replica's LWW could not weigh. After a restart, a node delivers the hints it left on disk.
+
+One window stays open, the same one read repair has: a key deleted in the moment between the read
+and the write to the replica comes back on that replica. With `W=1` the rule above cannot tell a
+missed delete from a missed write either. Anti-entropy is meant to be the backstop for these, for
+hints that expired or were dropped, and for writes a coordinator crashed before hinting; on a
+replicated pool it does not run yet (see [Anti-Entropy](#anti-entropy-merkle-trees)).
 
 ### Read Repair
 
 When a quorum read detects that replicas have different versions of an object, the coordinator asynchronously sends the latest version to stale replicas. This is transparent to the client and does not add latency to reads.
+
+Only the full quorum read does this — the one a CopyObject uses to read its source. A GET streams the object from the replica with the latest version and repairs nothing.
 
 ## Write Path (Distributed)
 
@@ -101,7 +161,8 @@ Client PUT /bucket/key
        |       (each ACK means: blob written + metadata stored + fsync done)
        +-- 6. Return 200 OK to client
        |
-       +-- If <W ACKs: return 503, store hints for offline replicas
+       +-- If <W ACKs: return 503
+       +-- A replica whose write failed or timed out gets a hint
 ```
 
 ## Read Path (Distributed)
@@ -131,25 +192,39 @@ S4 uses **Hybrid Logical Clocks (HLC)** for causal ordering and **Last-Writer-Wi
 - Concurrent writes to the same key are resolved deterministically: highest HLC wins, with `node_id` as tiebreaker
 - All nodes arrive at the same winner for any conflict — no coordination needed
 - Clock skew > 500ms is logged as a warning
+- A record written without an HLC (stored in `single` mode, before the node joined a cluster) is
+  ordered by its modification time, with node 0 in place of a node ID, on every node and every read
+  path. Read repair and hinted handoff write that timestamp with the copies they make, so the copies
+  stay recognizable as made up. A replica's LWW does not weigh its own record without an HLC, so
+  hinted handoff writes such a copy only to a replica that holds nothing newer. A delete hint
+  removes a replica's record without an HLC that is no newer than the delete; a newer one is left
+  in place (`rejected`)
 - Clients can use `If-Match` / `If-None-Match` for conditional writes
 
 ## Anti-Entropy (Merkle Trees)
 
-Background service that detects and repairs divergences between replicas every 10 minutes.
+Each node builds a **Merkle tree** over its keys at start, keeps it in memory, updates it on every
+replica write and answers a peer that asks to compare trees. The background loop that would run
+the comparisons is **not started** on a replicated pool: no node runs a round, whatever
+`S4_ANTI_ENTROPY_INTERVAL_SECS` says, and `s4_anti_entropy_rounds_total` stays at 0. A replica
+that missed writes its hints did not cover stays behind until a quorum read repairs it.
 
-**How it works:**
-1. Each node maintains a persisted **Merkle tree** (BLAKE3 hashes, stored in fjall) over its key ranges
-2. Every 10 minutes, each node exchanges Merkle root hashes with a random replica
-3. If roots differ, the tree is traversed to find divergent keys in O(log K) comparisons
-4. Divergent keys are synced to the latest version
-5. **Repair frontier** tracks per-replica reconciliation progress — used for safe tombstone purge
+What a round does, as the tests run it:
+1. Compares its Merkle root with a random live replica's
+2. If the roots differ, asks that replica for its copy of each key this node holds, up to 1000
+3. Takes every copy newer than its own; each such key counts in
+   `s4_anti_entropy_divergent_keys_total` and in `s4_anti_entropy_repairs_total{outcome}`
+4. Moves the **repair frontier** for that replica — only when it repaired something
 
 ## Distributed Tombstones & GC
 
 Deletes create tombstones that must live long enough for all replicas to see them.
 
 - **GC grace period:** 7 days (configurable via `S4_GC_GRACE_DAYS`)
-- **Tombstone purge** requires: `age > gc_grace` AND repair frontier confirms all replicas have synced
+- **Tombstone purge** requires: `age > gc_grace` AND repair frontier confirms all replicas have synced.
+  The frontier moves only in anti-entropy rounds and never for the node itself, so no tombstone is
+  purged yet: `s4_tombstones_purged_total` stays at 0, and `s4_tombstones_active` counts what each
+  GC pass leaves
 - **Zombie resurrection protection:** If a node is offline > `max_rejoin_downtime` (3 days), it must full-bootstrap instead of incremental repair
 - **Deduplication:** Remains per-node (no cross-node dedup coordination). Mark-sweep GC runs every 24 hours instead of ref-count decrement
 
@@ -175,17 +250,19 @@ Background scrubber verifies data integrity and auto-heals from replicas.
 
 ### Graceful Shutdown
 
-1. Stop accepting new coordinated requests
-2. Wait for in-flight operations (timeout: 30s)
-3. Flush pending hints
-4. Broadcast `NodeStatus::Left` via gossip
-5. Sync fjall, close volumes, exit
+On `SIGTERM`:
+
+1. Stop accepting connections and finish the HTTP requests in flight
+2. Sync fjall, close volumes, exit
+
+The node does not announce that it is leaving: peers mark it dead through gossip, as after a
+crash, and store a hint for each write it misses.
 
 ### Rolling Upgrades
 
-1. Pre-check: all nodes alive, anti-entropy caught up, no pending hints
-2. Drain one node → upgrade binary → restart → health check
-3. Validate: PUT/GET/DELETE test, inter-node communication, anti-entropy
+1. Pre-check: every node answers `/health`
+2. Stop one node with `SIGTERM` → upgrade binary → restart → wait for `/health`
+3. Validate: PUT/GET/DELETE through the restarted node
 4. Repeat for remaining nodes one at a time
 5. Protocol versioning ensures backward compatibility within minor versions
 
@@ -196,12 +273,16 @@ Every route needs a SuperUser token from `POST /api/admin/login`, sent as
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/admin/cluster/health` | GET | Cluster health, node statuses, epoch |
-| `/api/admin/cluster/topology` | GET | Pools, hash rings, node assignments |
-| `/api/admin/node/health` | GET | Individual node status and version |
-| `/api/admin/node/drain` | POST | Graceful drain for rolling upgrade |
-| `/api/admin/cluster/repair-status` | GET | Repair frontier, divergent keys, last repair time |
+| `/api/admin/cluster/health` | GET | Members of the pool by status, `healthy`/`degraded`/`critical` by the quorum every key can still reach, epoch |
+| `/api/admin/cluster/topology` | GET | The pool, its quorum and every configured member with status, addresses and version |
+| `/api/admin/node/health` | GET | The node asked: identity, name, pool, addresses, version, uptime |
+| `/api/admin/node/drain` | POST | Not implemented: answers `501`. Stop the node with `SIGTERM` instead |
+| `/api/admin/cluster/repair-status` | GET | Anti-entropy rounds, divergent and repaired keys, last repair time, frontier lag, tombstones held and purged |
+| `/api/admin/scrubber/status` | GET | Background scrubber: blobs checked, damage found and healed, scan progress |
 | `/api/admin/scrubber/run` | POST | On-demand CRC32 check of this node's volumes; reports damage, does not repair it |
+
+Every answer is the view of the node asked and matches its `/metrics`; what each one means is in
+[Clustering → Health Check](../08-deployment/clustering.md#health-check).
 
 ### Cluster Configuration (Environment Variables)
 
@@ -221,9 +302,9 @@ Every route needs a SuperUser token from `POST /api/admin/login`, sent as
 | `S4_READ_QUORUM` | Read quorum (R) | `2` |
 | `S4_GC_GRACE_DAYS` | Tombstone GC grace period (days) | `7` |
 | `S4_MAX_REJOIN_DOWNTIME_DAYS` | Max offline days before full bootstrap required | `3` |
-| `S4_ANTI_ENTROPY_INTERVAL_SECS` | Anti-entropy Merkle exchange interval | `600` |
+| `S4_ANTI_ENTROPY_INTERVAL_SECS` | Anti-entropy Merkle exchange interval; no effect yet, the rounds are not started | `600` |
 | `S4_SCRUBBER_FULL_SCAN_DAYS` | Full CRC32 scrub cycle (days) | `30` |
-| `S4_HINT_TTL_HOURS` | Hinted handoff TTL | `3` |
+| `S4_HINT_TTL_HOURS` | How long a hint is kept; `0` keeps none | `3` |
 
 ### Docker Compose (3-Node Cluster)
 

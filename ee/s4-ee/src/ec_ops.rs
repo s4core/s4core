@@ -17234,23 +17234,21 @@ mod tests {
             }
         }
 
+        // Declared before the service, so the service is dropped first and the
+        // directory removed after it.
+        let tmp = tempfile::tempdir().unwrap();
         let service = {
             let _guard = TieringEnvGuard::acquire();
             std::env::set_var(crate::ec_rejoin::REJOIN_GATE_ENABLED_ENV, "false");
             let _reset = RejoinEnvReset;
-            let tmp = tempfile::tempdir().unwrap();
-            let service = EcOperationsService::open(
+            EcOperationsService::open(
                 tmp.path(),
                 "ec",
                 active_set_registry(1),
                 test_set_builder(1),
                 NodeId(1),
             )
-            .unwrap();
-            // The directory has to outlive the service, and this test never
-            // reopens it.
-            std::mem::forget(tmp);
-            service
+            .unwrap()
         };
 
         let status = service

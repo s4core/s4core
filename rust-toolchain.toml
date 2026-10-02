@@ -1,0 +1,8 @@
+# The Rust release every build of this repository uses: local builds, CI and
+# the GitHub mirror. Without it each CI run takes whatever stable is newest, and
+# a new clippy fails the pipeline on code nobody changed. Moving to a newer
+# release is a commit of its own: change the version here and in the
+# `FROM rust:` line of the Dockerfile, then run fmt, clippy, docs and the tests.
+[toolchain]
+channel = "1.99.0"
+components = ["rustfmt", "clippy"]

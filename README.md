@@ -42,7 +42,7 @@ This approach ensures:
 
 ### Prerequisites
 
-- Rust 1.70 or later
+- Rust through [rustup](https://rustup.rs): the release is pinned in `rust-toolchain.toml`, and `rustup toolchain install` in the repository installs it
 - Linux (recommended) or macOS
 
 ### Building from Source
@@ -522,10 +522,13 @@ S4 supports leaderless quorum replication for high availability. A cluster is co
 - SWIM gossip for failure detection, gRPC for data replication
 - Buckets are pinned to pools; horizontal scaling = adding new pools
 - HLC + LWW conflict resolution (deterministic, no coordination)
-- Anti-entropy via Merkle trees (background repair every 10 min)
-- Distributed tombstone GC with zombie resurrection protection
+- Hinted handoff: a replica that missed writes is brought up to date once it is back
+- Merkle trees for anti-entropy; the background rounds of a replicated pool are not started yet,
+  so tombstone GC, which waits for them, purges nothing yet
 - Bit rot detection and auto-healing from replicas
-- Rolling upgrades, graceful shutdown, admin API for cluster ops
+- Rolling upgrades, graceful shutdown on SIGTERM, admin API for cluster health and topology
+- Prometheus metrics of membership, quorum, peers, hinted handoff and repair on every node, and a
+  Grafana dashboard ([Prometheus Metrics → Cluster](docs/06-monitoring/prometheus-metrics.md#cluster))
 
 **Quick start (3-node cluster):**
 
@@ -551,7 +554,7 @@ For detailed architecture, Docker Compose examples, and configuration reference,
 
 S4 Federation Erasure Coding is an Enterprise Edition feature enabled with `S4_POOL_TYPE=ec` in cluster mode and a license that includes the `erasure_coding` capability.
 
-Current v1 status: the Enterprise runtime wires staged hot RF=3 writes, transcode workers, EC cutover reads, repair, anti-entropy, scrub, tombstone/orphan GC, hot-copy purge gates, metrics, and admin diagnostics. EC health reports `runtime_ready` for active runtime wiring and keeps `production_ready=false` unless the EE artifact was built after the EC v1 readiness suite with `S4_EC_V1_CI_ACCEPTANCE_PASSED=true`.
+Current v1 status: the Enterprise runtime wires staged hot RF=3 writes, transcode workers, EC cutover reads, repair, anti-entropy, scrub, tombstone/orphan GC, hot-copy purge gates, metrics, and admin diagnostics. EC health reports `runtime_ready` for active runtime wiring and keeps `production_ready=false` unless the EE build is marked as accepted for production with `S4_EC_V1_CI_ACCEPTANCE_PASSED=true`.
 
 For EE setup, profiles, environment variables, and cluster examples, see [ee/README.md](ee/README.md#s4-federation-erasure-coding) and [docs/04-features/erasure-coding.md](docs/04-features/erasure-coding.md).
 

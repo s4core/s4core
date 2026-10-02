@@ -11,8 +11,8 @@ foundation for lower-overhead distributed pools. It is configured with
 > the normal S3 hot RF=3 object path are wired in the Enterprise runtime.
 > Admin health separates `runtime_ready` from `production_ready`:
 > `runtime_ready=true` means the local runtime workers and data paths are
-> active, while `production_ready=true` also requires an EE build compiled with
-> `S4_EC_V1_CI_ACCEPTANCE_PASSED=true` after the EC v1 readiness suite passes.
+> active, while `production_ready=true` also requires an EE build marked as
+> accepted for production with `S4_EC_V1_CI_ACCEPTANCE_PASSED=true`.
 
 ## Requirements
 
@@ -106,7 +106,7 @@ wired at runtime and what still blocks final production readiness:
 | Transcode worker runtime | Wired for staged hot-to-EC conversion |
 | Multipart staged EC | Wired through hot RF=3 completion and staged EC metadata |
 | Orphan physical shard purger | Wired through admin GC and runtime ports |
-| EC v1 CI acceptance | Required for `production_ready=true` |
+| Build accepted for production (`S4_EC_V1_CI_ACCEPTANCE_PASSED`) | Required for `production_ready=true` |
 | Inline EC writes | Disabled by default |
 | Auto-tiering | Disabled by default |
 | Multi-set pools | Disabled by default; adding a set needs every pool node on EC v2 |
@@ -665,10 +665,7 @@ the replica saying "I have already applied this write":
   resending the same write after a timeout and wrong for a shard that was
   rebuilt again: the bytes there are gone or rotten now.
 
-That is what makes a shard which rots twice come back twice. Both halves are
-held by tests, and `scripts/21-ec-manifest-authority-bitrot-test.sh` rots the
-same shard twice on a running cluster and requires its bytes back after each
-repair.
+That is what makes a shard which rots twice come back twice.
 
 ### Which repair runs next
 
@@ -759,8 +756,7 @@ shards and its local parity — is still unrecoverable, and so is any pattern
 that leaves fewer than `k` independent equations.
 
 **What it costs.** Measured on a 6 MiB chunk, one core, portable engine
-(decision EC2-104; LRC always uses the portable engine, because its local
-parity is XOR):
+(LRC always uses the portable engine, because its local parity is XOR):
 
 | Route | `ec-lrc-small` | `ec-lrc-standard` | `ec-lrc-dense` |
 |---|---|---|---|
@@ -794,11 +790,8 @@ with `S4_EC_TEST_HOOKS_ENABLED=true`, holds one node's LRC recovery to the two
 fast paths: it decodes, repairs and publishes a failure matrix exactly as an
 EC v1 node did, and refuses the patterns only the solver reaches. The flag is
 read once at startup and changes recovery only — encoding is untouched, so a
-node carrying it writes the same shards as any other.
-`scripts/46-ec-lrc-solver-test.sh` uses it to put both editions of the decoder
-over the same shards, which is what a rolling upgrade does. It is test
-scaffolding: in production it would only remove a recovery path the cluster
-already has.
+node carrying it writes the same shards as any other. It is test scaffolding:
+in production it would only remove a recovery path the cluster already has.
 
 ### Reading only what is needed
 
@@ -832,7 +825,7 @@ of its chunk. Watch it with
 
 Measured on a live `ec-rs-small` (4+2) pool of six nodes, each in a zone of its
 own, holding a 5 MiB object in five 1 MiB chunks — a 256 KiB shard — read
-through one node (`scripts/51-ec-minimal-read-test.sh`):
+through one node:
 
 | Request | Fetches | Bytes | Of which crossed a zone |
 |---------|---------|-------|-------------------------|
@@ -935,7 +928,7 @@ curl -s http://localhost:9000/api/admin/ec/pools/my-pool/health \
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `S4_EC_V1_CI_ACCEPTANCE_PASSED` | unset | Build-time flag. Set to `true` only for EE artifacts built after the EC v1 readiness suite passes. Without this attestation, health may report `runtime_ready=true` but keeps `production_ready=false`. |
+| `S4_EC_V1_CI_ACCEPTANCE_PASSED` | unset | Build-time flag that marks an EE build as accepted for production. Without it, health may report `runtime_ready=true` but keeps `production_ready=false`. |
 
 ### GC, Orphans, and Tiering
 
@@ -1032,7 +1025,7 @@ worker.** Such an object is stored as a manifest of its segments and has no
 hash of the whole, so the worker cannot give the transcode a source check it
 could pass, and it leaves the object on its RF=3 replicas. A multipart object
 written into an EC pool the ordinary way is still encoded on its way in: there
-the completion computes the hash itself (decision EC2-204).
+the completion computes the hash itself.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -1711,7 +1704,8 @@ The answer has four parts:
   inside one erasure set count: shards live on the nodes of a specific set, so a
   manifest of another set could not reference them. `ignoring_set_boundary` and
   `lost_to_set_boundary_bytes` show what that boundary costs.
-- `decision` — the measurement read against the thresholds of decision EC2-121.
+- `decision` — the `verdict` (`go`, `conditional`, `no_go` or `inconclusive`),
+  the `reason` for it, and the thresholds it was read against.
 
 **A report that did not cover the pool decides nothing.** A node that was not
 read is not a node without duplicates, and a walk that stopped at the scan limit
@@ -1731,10 +1725,9 @@ as empty.
 *manifests*. It is usually not a second copy on disk: shards are written through
 the ordinary object path, which reuses a blob whose content hash the node
 already holds, and an erasure set has a fixed slot-to-node assignment, so
-identical objects encode to identical shards on identical nodes. This is what
-decision EC2-122 concluded, and why dedup at the erasure-coding tier was not
-built. Use the report to observe content repetition, not to estimate reclaimable
-space.
+identical objects encode to identical shards on identical nodes, which is why
+the erasure-coding tier has no deduplication of its own. Use the report to
+observe content repetition, not to estimate reclaimable space.
 
 ### Failure matrix
 
@@ -2084,9 +2077,7 @@ nothing more: reads and writes below quorum answer `503`, and EC reads fail
 closed. Slots whose owner is not visible are listed in `slot_owners.not_seen_alive`
 of `GET /api/admin/ec/pools/:pool/health`.
 
-To go back to requiring full visibility, there is no switch — it is a one-line
-predicate in `s4-server/src/cluster_bootstrap.rs`; the reasoning is in decision
-record `EC2-203`.
+There is no switch to require full visibility again.
 
 **Two machines under one identity is the other thing you must not do**, and this
 one the server stops for you. Before joining gossip, a starting node asks every
@@ -2446,32 +2437,6 @@ local. A cluster that spreads deletes across nodes therefore reclaims space more
 slowly than one that sends them to the node that wrote the objects. The data is
 correct either way — only the timeliness of the reclaim is affected.
 
-## Validation
-
-The Phase 15 readiness runner is:
-
-```bash
-S4_LICENSE_KEY=your-license-key \
-  ./scripts/39-ec-v1-production-readiness-suite.sh \
-  --tier part2 \
-  --binary ./target/release/s4-server
-```
-
-Use `--tier full` before publishing an EE EC release. The full tier runs the
-Part-2 acceptance scripts, compatibility coverage, deterministic chaos tests,
-Docker/HAProxy no-sticky tests, and the standard client smoke test. The smoke
-test can also be run against an existing EC endpoint:
-
-```bash
-AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
-S4_EC_SMOKE_ENDPOINT=http://127.0.0.1:9000 \
-  ./scripts/38-ec-standard-client-smoke-test.sh
-```
-
-E2E scripts check `runtime_ready` so they can validate a candidate build. The
-final release artifact should be rebuilt with
-`S4_EC_V1_CI_ACCEPTANCE_PASSED=true` only after the required suite has passed.
-
 ## Metrics
 
 Every metric in the first list below carries an `erasure_set` label naming the
@@ -2723,7 +2688,7 @@ so some objects look colder than they are.
 | A node logs `keeps its recorded layout, which differs from the one this node's topology labels give` | The labels changed after the set's layout was recorded, or differ between nodes | Nothing moved and nothing needs repair. Make `S4_EC_NODE_TOPOLOGY` identical on every node |
 | `GET` of older EC objects returns `503` after labels changed | A node of an older release, which recomputes layouts from labels, is serving the pool | Restore the previous `S4_EC_NODE_TOPOLOGY` on the older nodes and upgrade them before changing labels |
 | EC health reports `runtime_ready=false` | One or more local data-path workers or runtime ports are not active | Check `.runtime.production_ready_blockers`, worker env vars, and cluster bootstrap logs |
-| EC health reports `runtime_ready=true` and `production_ready=false` | Runtime is wired, but this binary lacks EC v1 CI acceptance attestation | Run the readiness suite in CI and rebuild the EE artifact with `S4_EC_V1_CI_ACCEPTANCE_PASSED=true` |
+| EC health reports `runtime_ready=true` and `production_ready=false` | Runtime is wired, but this build is not marked as accepted for production | Use a release EE build; a build from source reports this unless built with `S4_EC_V1_CI_ACCEPTANCE_PASSED=true` |
 | Object is missing from `ListObjectsV2` but `GET` and `HEAD` still return it | Its namespace entry was lost by a cutover from before S4 kept it | Run the anti-entropy pass, or wait for it: it rebuilds the entry from the manifest |
 
 ### Erasure coding and the bucket listing

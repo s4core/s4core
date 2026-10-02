@@ -217,6 +217,7 @@ impl DistributedGcService {
         self.metrics.tombstones_purged.fetch_add(purged, Ordering::Relaxed);
         self.metrics.tombstones_active.store(remaining, Ordering::Relaxed);
         self.metrics.cycles_completed.fetch_add(1, Ordering::Relaxed);
+        crate::cluster_metrics::record_tombstone_gc_pass(purged, remaining);
 
         Ok(PurgeCycleStats {
             scanned,
@@ -411,6 +412,52 @@ mod tests {
         assert_eq!(
             service.metrics().cycles_completed.load(Ordering::Relaxed),
             2
+        );
+    }
+
+    /// A pass reports the tombstones it purged, adding up over passes, and
+    /// the ones it left, as they stand after the latest pass.
+    #[tokio::test]
+    async fn a_pass_reports_what_it_purged_and_what_is_left() {
+        let metrics = crate::test_metrics::TestMetrics::install();
+        let (_dir, db) = setup_test_db().await;
+        db.put("bucket/ancient", &make_tombstone(1000)).await.unwrap();
+        db.put("bucket/young", &make_tombstone(hlc::now_millis())).await.unwrap();
+
+        let n1 = NodeId(1);
+        let mut frontier = RepairFrontier::new();
+        frontier.advance(
+            &KeyRange::new(0, u64::MAX),
+            n1,
+            crate::clock::hlc::HlcTimestamp {
+                wall_time: hlc::now_millis(),
+                logical: 0,
+                node_id: 0,
+            },
+        );
+        let service = DistributedGcService::new(
+            make_gc_config(3600),
+            db,
+            Arc::new(RwLock::new(frontier)),
+            Arc::new(RwLock::new(vec![n1])),
+        );
+
+        service.run_purge_cycle().await.unwrap();
+        assert_eq!(metrics.value("s4_tombstones_purged_total", &[]), Some(1.0));
+        assert_eq!(metrics.value("s4_tombstones_active", &[]), Some(1.0));
+
+        service.run_purge_cycle().await.unwrap();
+        assert_eq!(metrics.value("s4_tombstones_purged_total", &[]), Some(1.0));
+        assert_eq!(metrics.value("s4_tombstones_active", &[]), Some(1.0));
+
+        // The admin API reads these counters, not the metrics.
+        let counters = service.metrics();
+        assert_eq!(
+            (
+                counters.tombstones_purged.load(Ordering::Relaxed),
+                counters.tombstones_active.load(Ordering::Relaxed)
+            ),
+            (1, 1)
         );
     }
 }

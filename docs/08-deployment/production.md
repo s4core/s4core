@@ -117,13 +117,14 @@ Set up alerts for:
 
 ### Health Checks
 
-Use the stats endpoint for health checks:
+Use the health endpoint for liveness and readiness probes:
 
 ```bash
-curl -f http://localhost:9000/api/stats
+curl -f http://localhost:9000/health
 ```
 
-Returns `200 OK` when the server is running.
+Returns `200 OK` when the server is running. Do not probe `/api/stats`: it counts every object,
+and on a cluster node every object of the pool.
 
 ## Backup
 

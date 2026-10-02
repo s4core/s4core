@@ -171,8 +171,8 @@ normal S3 hot RF=3 object path are wired in the Enterprise runtime.
 PUT/COPY/POST/multipart completion record EC layout or transcode metadata after
 the hot quorum commit. EC admin health reports `runtime_ready=true` when the
 local runtime workers and data paths are active. It reports
-`production_ready=true` only for EE artifacts built with
-`S4_EC_V1_CI_ACCEPTANCE_PASSED=true` after the EC v1 readiness suite passes.
+`production_ready=true` only for EE builds marked as accepted for production
+with `S4_EC_V1_CI_ACCEPTANCE_PASSED=true`.
 
 ### Minimal EC Pool Configuration
 
@@ -279,7 +279,7 @@ LRC v1 requires `S4_EC_K` to be divisible by `S4_EC_LRC_L`.
 | `S4_EC_TIERING_COLD_AFTER_SECS` | `2592000` | Cold-object age for future auto-tiering |
 | `S4_EC_TIERING_SCAN_LIMIT` | `4096` | Future tiering scan limit |
 | `S4_EC_ADMIN_SCAN_LIMIT` | `4096` | Max EC metadata records scanned by one admin request |
-| `S4_EC_V1_CI_ACCEPTANCE_PASSED` | unset | Build-time release attestation. Set to `true` only after the EC v1 readiness suite passes. |
+| `S4_EC_V1_CI_ACCEPTANCE_PASSED` | unset | Build-time flag that marks an EE build as accepted for production. |
 
 Topology labels use node names from `S4_POOL_NODES`:
 
@@ -290,25 +290,6 @@ S4_EC_NODE_TOPOLOGY='node-1:zone=z1,rack=r1,host=h1,disk_group=d1;node-2:zone=z2
 Full architecture notes, run examples, admin endpoints, and current release
 gates are documented in
 [docs/04-features/erasure-coding.md](../docs/04-features/erasure-coding.md).
-
-### EC v1 Readiness Validation
-
-Run the Phase 15 readiness suite before publishing an EC-capable EE artifact:
-
-```bash
-S4_LICENSE_KEY=your-license-key \
-  ./scripts/39-ec-v1-production-readiness-suite.sh \
-  --tier full \
-  --binary ./target/release/s4-server
-```
-
-For standard client smoke against an already running EC endpoint:
-
-```bash
-AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
-S4_EC_SMOKE_ENDPOINT=http://127.0.0.1:9000 \
-  ./scripts/38-ec-standard-client-smoke-test.sh
-```
 
 ## Obtaining a License
 

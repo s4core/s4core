@@ -54,9 +54,10 @@ use tokio_stream::{Stream, StreamExt};
 use tokio_util::io::StreamReader;
 use tracing::{debug, error, info, warn};
 
+use crate::cluster_metrics::{observe_quorum, QuorumOperation};
 use crate::config::ClusterConfig;
 use crate::error::ClusterError;
-use crate::hints::{Hint, HintOperation, HintedHandoffManager};
+use crate::hints::{HintEntry, HintedHandoffManager};
 use crate::hlc::{HlcTimestamp, HybridClock};
 use crate::identity::{NodeId, PoolId};
 use crate::placement::PlacementRouter;
@@ -258,6 +259,21 @@ impl QuorumWriteCoordinator {
         content_type: &str,
         metadata: &HashMap<String, String>,
     ) -> Result<QuorumWriteResult, ClusterError> {
+        observe_quorum(
+            QuorumOperation::Write,
+            self.write_inner(bucket, key, data, content_type, metadata),
+        )
+        .await
+    }
+
+    async fn write_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        content_type: &str,
+        metadata: &HashMap<String, String>,
+    ) -> Result<QuorumWriteResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
         let metadata = self.metadata_with_pool_storage_class(decision.pool_id, metadata);
         let replicas = &decision.replicas;
@@ -330,11 +346,13 @@ impl QuorumWriteCoordinator {
                     topology_epoch: self.topology_epoch,
                 };
                 let timeout_dur = self.timeouts.replica_write_timeout;
+                let hints = self.hints.clone();
+                let hint = HintEntry::written(bucket, key, hlc);
 
                 tokio::spawn(async move {
                     let result = timeout(timeout_dur, client.send_write(node_id, request)).await;
 
-                    match result {
+                    let outcome = match result {
                         Ok(Ok(resp)) if resp.success => ReplicaResult::Success {
                             node_id,
                             etag: String::new(),
@@ -354,7 +372,9 @@ impl QuorumWriteCoordinator {
                             node_id,
                             error: "replica write timeout".into(),
                         },
-                    }
+                    };
+                    hint_if_failed(&hints, &outcome, hint);
+                    outcome
                 })
             };
 
@@ -382,46 +402,10 @@ impl QuorumWriteCoordinator {
             })
             .unwrap_or_default();
 
-        // Store hints for every replica that did not ACK before the client
-        // quorum response. Slow replicas may still finish successfully; replay
-        // uses the same operation id and is idempotent.
-        let hint_nodes = unacked_replica_nodes(replicas, &results, None);
-        for node_id in &hint_nodes {
-            let hint = Hint {
-                target_node: node_id.0,
-                operation: HintOperation::Write {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    data: data.to_vec(),
-                    content_hash: content_hash.to_vec(),
-                    content_type: content_type.to_string(),
-                    metadata: metadata.clone(),
-                    operation_id: operation_id.to_be_bytes().to_vec(),
-                    version_id: None,
-                    topology_epoch: self.topology_epoch,
-                },
-                created_at: crate::hlc::now_millis(),
-                ttl_ms: Duration::from_secs(3 * 3600).as_millis() as u64,
-            };
-
-            let hints = self.hints.clone();
-            let node_id = *node_id;
-            tokio::spawn(async move {
-                if let Err(e) = hints.store_hint(hint).await {
-                    error!(
-                        target_node = %node_id,
-                        error = %e,
-                        "failed to store hint"
-                    );
-                }
-            });
-        }
-
         info!(
             bucket = %bucket,
             key = %key,
             acked = acked.len(),
-            hinted = hint_nodes.len(),
             "quorum write completed"
         );
 
@@ -440,7 +424,11 @@ impl QuorumWriteCoordinator {
         bucket: &str,
         key: &str,
     ) -> Result<QuorumDeleteResult, ClusterError> {
-        self.delete_with_expected_hlc(bucket, key, None).await
+        observe_quorum(
+            QuorumOperation::Delete,
+            self.delete_with_expected_hlc(bucket, key, None),
+        )
+        .await
     }
 
     /// Execute a quorum physical purge only if replicas still store the expected HLC.
@@ -450,7 +438,11 @@ impl QuorumWriteCoordinator {
         key: &str,
         expected_source_hlc: HlcTimestamp,
     ) -> Result<QuorumDeleteResult, ClusterError> {
-        self.delete_with_expected_hlc(bucket, key, Some(expected_source_hlc)).await
+        observe_quorum(
+            QuorumOperation::Delete,
+            self.delete_with_expected_hlc(bucket, key, Some(expected_source_hlc)),
+        )
+        .await
     }
 
     /// Allocate a coordinator HLC for metadata-only delete commits.
@@ -554,10 +546,15 @@ impl QuorumWriteCoordinator {
                     expected_source_hlc: expected_source_hlc.map(|hlc| hlc.to_proto()),
                 };
                 let timeout_dur = self.timeouts.replica_write_timeout;
+                let hints = self.hints.clone();
+                let hint = match expected_source_hlc {
+                    Some(expected) => HintEntry::purge(bucket, key, hlc, expected),
+                    None => HintEntry::deleted(bucket, key, hlc),
+                };
 
                 tokio::spawn(async move {
                     let result = timeout(timeout_dur, client.send_delete(node_id, request)).await;
-                    match result {
+                    let outcome = match result {
                         Ok(Ok(resp)) if resp.success => ReplicaResult::Success {
                             node_id,
                             etag: String::new(),
@@ -577,7 +574,9 @@ impl QuorumWriteCoordinator {
                             node_id,
                             error: "replica delete timeout".into(),
                         },
-                    }
+                    };
+                    hint_if_failed(&hints, &outcome, hint);
+                    outcome
                 })
             };
 
@@ -592,43 +591,6 @@ impl QuorumWriteCoordinator {
             return Err(ClusterError::QuorumNotMet {
                 needed: self.write_quorum,
                 achieved: acked,
-            });
-        }
-
-        // Store hints for every replica that did not ACK before quorum.
-        let hint_nodes = unacked_replica_nodes(replicas, &results, None);
-        for node_id in &hint_nodes {
-            let operation = if let Some(expected) = expected_source_hlc {
-                HintOperation::DeleteIfHlc {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    expected_source_hlc: expected,
-                    operation_id: operation_id.to_be_bytes().to_vec(),
-                    version_id: None,
-                    topology_epoch: self.topology_epoch,
-                }
-            } else {
-                HintOperation::Delete {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    operation_id: operation_id.to_be_bytes().to_vec(),
-                    version_id: None,
-                    topology_epoch: self.topology_epoch,
-                }
-            };
-            let hint = Hint {
-                target_node: node_id.0,
-                operation,
-                created_at: crate::hlc::now_millis(),
-                ttl_ms: Duration::from_secs(3 * 3600).as_millis() as u64,
-            };
-
-            let hints = self.hints.clone();
-            let node_id = *node_id;
-            tokio::spawn(async move {
-                if let Err(e) = hints.store_hint(hint).await {
-                    error!(target_node = %node_id, error = %e, "failed to store delete hint");
-                }
             });
         }
 
@@ -657,6 +619,27 @@ impl QuorumWriteCoordinator {
     /// object stays listable there, but that node's space is reclaimed later,
     /// by EC reconciliation rather than by a hint.
     pub async fn detach_object_data_if_hlc(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected_source_hlc: HlcTimestamp,
+        erasure_set_id: u64,
+        ec_topology_epoch: u64,
+    ) -> Result<QuorumDeleteResult, ClusterError> {
+        observe_quorum(
+            QuorumOperation::Write,
+            self.detach_object_data_if_hlc_inner(
+                bucket,
+                key,
+                expected_source_hlc,
+                erasure_set_id,
+                ec_topology_epoch,
+            ),
+        )
+        .await
+    }
+
+    async fn detach_object_data_if_hlc_inner(
         &self,
         bucket: &str,
         key: &str,
@@ -832,6 +815,20 @@ impl QuorumWriteCoordinator {
         data: &[u8],
         expected_source_hlc: HlcTimestamp,
     ) -> Result<QuorumDeleteResult, ClusterError> {
+        observe_quorum(
+            QuorumOperation::Write,
+            self.attach_object_data_if_hlc_inner(bucket, key, data, expected_source_hlc),
+        )
+        .await
+    }
+
+    async fn attach_object_data_if_hlc_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        expected_source_hlc: HlcTimestamp,
+    ) -> Result<QuorumDeleteResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
         let replicas = &decision.replicas;
         let operation_uuid = uuid::Uuid::new_v4();
@@ -1001,6 +998,19 @@ impl QuorumWriteCoordinator {
         key: &str,
         record: &IndexRecord,
     ) -> Result<usize, ClusterError> {
+        observe_quorum(
+            QuorumOperation::Write,
+            self.restore_namespace_entry_inner(bucket, key, record),
+        )
+        .await
+    }
+
+    async fn restore_namespace_entry_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        record: &IndexRecord,
+    ) -> Result<usize, ClusterError> {
         let decision = self.router.route(bucket, key)?;
         let replicas = &decision.replicas;
         let operation_id = uuid::Uuid::new_v4().as_u128();
@@ -1134,6 +1144,21 @@ impl QuorumWriteCoordinator {
 
     /// Create a native multipart upload session on a quorum of replicas.
     pub async fn create_multipart_upload(
+        &self,
+        upload_id: &str,
+        bucket: &str,
+        key: &str,
+        content_type: &str,
+        metadata: &HashMap<String, String>,
+    ) -> Result<QuorumMultipartCreateResult, ClusterError> {
+        observe_quorum(
+            QuorumOperation::Multipart,
+            self.create_multipart_upload_inner(upload_id, bucket, key, content_type, metadata),
+        )
+        .await
+    }
+
+    async fn create_multipart_upload_inner(
         &self,
         upload_id: &str,
         bucket: &str,
@@ -1277,6 +1302,32 @@ impl QuorumWriteCoordinator {
 
     /// Upload one native multipart part to a quorum of replicas from a stream.
     pub async fn upload_multipart_part_streaming<S>(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        body_stream: S,
+        content_length: u64,
+    ) -> Result<QuorumMultipartPartResult, ClusterError>
+    where
+        S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
+    {
+        observe_quorum(
+            QuorumOperation::Multipart,
+            self.upload_multipart_part_streaming_inner(
+                bucket,
+                key,
+                upload_id,
+                part_number,
+                body_stream,
+                content_length,
+            ),
+        )
+        .await
+    }
+
+    async fn upload_multipart_part_streaming_inner<S>(
         &self,
         bucket: &str,
         key: &str,
@@ -1708,6 +1759,19 @@ impl QuorumWriteCoordinator {
         key: &str,
         upload_id: &str,
     ) -> Result<QuorumMultipartListPartsResult, ClusterError> {
+        observe_quorum(
+            QuorumOperation::Multipart,
+            self.list_multipart_parts_inner(bucket, key, upload_id),
+        )
+        .await
+    }
+
+    async fn list_multipart_parts_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<QuorumMultipartListPartsResult, ClusterError> {
         let replicas_total = self.router.route(bucket, key)?.replicas.len() as u8;
         let inspections = self.inspect_multipart_upload(bucket, key, upload_id).await?;
         let replicas_responded = inspections.len() as u8;
@@ -1742,6 +1806,20 @@ impl QuorumWriteCoordinator {
     /// Complete a native multipart upload on a quorum of replicas.
     #[allow(clippy::too_many_arguments)]
     pub async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        manifest_parts: &[(u32, String)],
+    ) -> Result<QuorumMultipartCompleteResult, ClusterError> {
+        observe_quorum(
+            QuorumOperation::Multipart,
+            self.complete_multipart_upload_inner(bucket, key, upload_id, manifest_parts),
+        )
+        .await
+    }
+
+    async fn complete_multipart_upload_inner(
         &self,
         bucket: &str,
         key: &str,
@@ -1921,6 +1999,19 @@ impl QuorumWriteCoordinator {
         key: &str,
         upload_id: &str,
     ) -> Result<QuorumMultipartCreateResult, ClusterError> {
+        observe_quorum(
+            QuorumOperation::Multipart,
+            self.abort_multipart_upload_inner(bucket, key, upload_id),
+        )
+        .await
+    }
+
+    async fn abort_multipart_upload_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<QuorumMultipartCreateResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
         let replicas = &decision.replicas;
         let operation_id = uuid::Uuid::new_v4().as_u128();
@@ -2088,6 +2179,21 @@ impl QuorumWriteCoordinator {
         content_type: &str,
         metadata: &HashMap<String, String>,
     ) -> Result<QuorumWriteResult, ClusterError> {
+        observe_quorum(
+            QuorumOperation::Write,
+            self.replicate_to_remotes_inner(bucket, key, data, content_type, metadata),
+        )
+        .await
+    }
+
+    async fn replicate_to_remotes_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        content_type: &str,
+        metadata: &HashMap<String, String>,
+    ) -> Result<QuorumWriteResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
         let metadata = self.metadata_with_pool_storage_class(decision.pool_id, metadata);
         let replicas = &decision.replicas;
@@ -2132,11 +2238,13 @@ impl QuorumWriteCoordinator {
                 topology_epoch: self.topology_epoch,
             };
             let timeout_dur = self.timeouts.replica_write_timeout;
+            let hints = self.hints.clone();
+            let hint = HintEntry::written(bucket, key, hlc);
 
             let handle = tokio::spawn(async move {
                 let result = timeout(timeout_dur, client.send_write(node_id, request)).await;
 
-                match result {
+                let outcome = match result {
                     Ok(Ok(resp)) if resp.success => ReplicaResult::Success {
                         node_id,
                         etag: String::new(),
@@ -2154,7 +2262,9 @@ impl QuorumWriteCoordinator {
                         node_id,
                         error: "replica write timeout".into(),
                     },
-                }
+                };
+                hint_if_failed(&hints, &outcome, hint);
+                outcome
             });
 
             handles.push(handle);
@@ -2173,44 +2283,10 @@ impl QuorumWriteCoordinator {
             });
         }
 
-        // Store hints for remote replicas that did not ACK before quorum.
-        let hint_nodes = unacked_replica_nodes(replicas, &results, Some(self.local_node_id));
-        for node_id in &hint_nodes {
-            let hint = Hint {
-                target_node: node_id.0,
-                operation: HintOperation::Write {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    data: data.to_vec(),
-                    content_hash: content_hash.to_vec(),
-                    content_type: content_type.to_string(),
-                    metadata: metadata.clone(),
-                    operation_id: operation_id.to_be_bytes().to_vec(),
-                    version_id: None,
-                    topology_epoch: self.topology_epoch,
-                },
-                created_at: crate::hlc::now_millis(),
-                ttl_ms: Duration::from_secs(3 * 3600).as_millis() as u64,
-            };
-
-            let hints = self.hints.clone();
-            let node_id = *node_id;
-            tokio::spawn(async move {
-                if let Err(e) = hints.store_hint(hint).await {
-                    error!(
-                        target_node = %node_id,
-                        error = %e,
-                        "failed to store hint for multipart replication"
-                    );
-                }
-            });
-        }
-
         info!(
             bucket = %bucket,
             key = %key,
             acked = acked.len() + 1, // +1 for local
-            hinted = hint_nodes.len(),
             "multipart remote replication completed"
         );
 
@@ -2490,14 +2566,6 @@ impl ReplicaResult {
     fn is_success(&self) -> bool {
         matches!(self, ReplicaResult::Success { .. })
     }
-
-    fn node_id(&self) -> NodeId {
-        match self {
-            ReplicaResult::Success { node_id, .. }
-            | ReplicaResult::Failure { node_id, .. }
-            | ReplicaResult::EpochMismatch { node_id } => *node_id,
-        }
-    }
 }
 
 fn compute_sha256(data: &[u8]) -> Vec<u8> {
@@ -2506,22 +2574,18 @@ fn compute_sha256(data: &[u8]) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-fn unacked_replica_nodes(
-    replicas: &[NodeId],
-    results: &[ReplicaResult],
-    exclude: Option<NodeId>,
-) -> Vec<NodeId> {
-    let acked_nodes: Vec<NodeId> = results
-        .iter()
-        .filter(|result| result.is_success())
-        .map(ReplicaResult::node_id)
-        .collect();
-
-    replicas
-        .iter()
-        .copied()
-        .filter(|node_id| Some(*node_id) != exclude && !acked_nodes.contains(node_id))
-        .collect()
+/// Leaves `hint` for a remote replica whose own write or delete did not land.
+///
+/// Decided by the replica's own outcome, whenever it arrives: a replica that
+/// answers after the client already has its quorum is not behind, and one
+/// that fails or times out is, whether or not the quorum was met without it.
+/// An epoch mismatch is not hinted — delivery would meet the same check — and
+/// the local replica never gets here: its write goes on after the client's
+/// answer, and a failing local disk is not something a retry would fix.
+fn hint_if_failed(hints: &Arc<HintedHandoffManager>, outcome: &ReplicaResult, hint: HintEntry) {
+    if let ReplicaResult::Failure { node_id, .. } = outcome {
+        hints.store_in_background(*node_id, hint);
+    }
 }
 
 fn compute_native_multipart_etag(parts: &[MultipartPartRecord]) -> String {
@@ -2638,12 +2702,8 @@ mod tests {
         let router = Arc::new(PlacementRouter::single_node(node_id));
         let clock = Arc::new(HybridClock::new(node_id));
         let hint_config = HintedHandoffConfig::new(tmp.path());
-        let hints = Arc::new(HintedHandoffManager::new(
-            hint_config,
-            gossip,
-            rpc_client.clone(),
-        ));
-        let storage = Arc::new(MockStorage);
+        let hints = Arc::new(HintedHandoffManager::new(hint_config, rpc_client.clone()));
+        let storage = Arc::new(MockStorage::default());
 
         let config = ClusterConfig::default();
         let coordinator = QuorumWriteCoordinator::new(
@@ -2671,12 +2731,8 @@ mod tests {
         let rpc_client = Arc::new(NodeClient::new(gossip.clone(), NodeClientConfig::default()));
         let clock = Arc::new(HybridClock::new(node_id));
         let hint_config = HintedHandoffConfig::new(tmp.path());
-        let hints = Arc::new(HintedHandoffManager::new(
-            hint_config,
-            gossip,
-            rpc_client.clone(),
-        ));
-        let storage = Arc::new(MockStorage);
+        let hints = Arc::new(HintedHandoffManager::new(hint_config, rpc_client.clone()));
+        let storage = Arc::new(MockStorage::default());
         let config = ClusterConfig {
             pools: vec![PoolConfig {
                 pool_id,
@@ -2856,26 +2912,6 @@ mod tests {
         assert_eq!(success_nodes, vec![NodeId(2), NodeId(3)]);
     }
 
-    #[test]
-    fn unacked_replica_nodes_includes_failed_and_pending_nodes() {
-        let replicas = [NodeId(1), NodeId(2), NodeId(3)];
-        let results = vec![
-            ReplicaResult::Failure {
-                node_id: NodeId(1),
-                error: "down".to_string(),
-            },
-            ReplicaResult::Success {
-                node_id: NodeId(2),
-                etag: "etag".to_string(),
-            },
-        ];
-
-        assert_eq!(
-            unacked_replica_nodes(&replicas, &results, None),
-            vec![NodeId(1), NodeId(3)]
-        );
-    }
-
     #[tokio::test]
     async fn collect_multipart_inspections_waits_beyond_first_success_quorum() {
         let (coordinator, _tmp) = setup_single_node();
@@ -2966,7 +3002,27 @@ mod tests {
     }
 
     /// Minimal mock for unit tests.
-    struct MockStorage;
+    /// Storage that takes every write and delete, or, when it `refuses`,
+    /// none of them.
+    #[derive(Default)]
+    struct MockStorage {
+        refuses: bool,
+    }
+
+    impl MockStorage {
+        fn refusing() -> Self {
+            Self { refuses: true }
+        }
+
+        fn check(&self) -> Result<(), s4_core::StorageError> {
+            if self.refuses {
+                return Err(s4_core::StorageError::Io(std::io::Error::other(
+                    "disk refuses",
+                )));
+            }
+            Ok(())
+        }
+    }
 
     #[async_trait::async_trait]
     impl StorageEngine for MockStorage {
@@ -2978,6 +3034,7 @@ mod tests {
             _content_type: &str,
             _metadata: &HashMap<String, String>,
         ) -> Result<String, s4_core::StorageError> {
+            self.check()?;
             Ok("\"mock-etag\"".into())
         }
         async fn get_object(
@@ -2988,7 +3045,7 @@ mod tests {
             Err(s4_core::StorageError::ObjectNotFound { key: "mock".into() })
         }
         async fn delete_object(&self, _b: &str, _k: &str) -> Result<(), s4_core::StorageError> {
-            Ok(())
+            self.check()
         }
         async fn head_object(
             &self,
@@ -3119,5 +3176,497 @@ mod tests {
                 etag: "\"mock-etag\"".into(),
             })
         }
+    }
+
+    // ---- Quorum operations, as the metrics count them ----
+
+    use crate::test_metrics::TestMetrics;
+
+    const OPS: &str = "s4_quorum_operations_total";
+
+    /// Node 1 of a three-node pool, RF=3 and W=2, whose two peers gossip holds
+    /// dead: a write reaches the local replica and nothing else.
+    fn setup_three_nodes_two_dead() -> (QuorumWriteCoordinator, tempfile::TempDir) {
+        use crate::gossip::NodeState;
+        use crate::identity::{NodeCapacity, NodeMeta, NodeStatus};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let local = NodeId(1);
+        let addr = |n: u128| NodeAddr {
+            grpc_addr: format!("127.0.0.1:{}", 19400 + n).parse().unwrap(),
+            http_addr: format!("127.0.0.1:{}", 19500 + n).parse().unwrap(),
+            gossip_addr: format!("127.0.0.1:{}", 19600 + n).parse().unwrap(),
+        };
+        let pool_id = PoolId::new(1);
+        let config = ClusterConfig {
+            pools: vec![PoolConfig {
+                pool_id,
+                name: "pool-1".to_string(),
+                nodes: (1..=3).map(addr).collect(),
+                replication_factor: Some(3),
+                write_quorum: Some(2),
+                read_quorum: Some(2),
+                storage_class: StorageClass::Standard,
+            }],
+            default_replication_factor: 3,
+            default_write_quorum: 2,
+            default_read_quorum: 2,
+            ..ClusterConfig::default()
+        };
+        let resolver: HashMap<_, _> = (1..=3).map(|n| (addr(n).grpc_addr, NodeId(n))).collect();
+        let placement = BucketPlacement::from_entries([("bucket".to_string(), pool_id)]);
+        let router = Arc::new(PlacementRouter::new(&config, local, placement, &resolver).unwrap());
+        let members = (2..=3)
+            .map(|n| {
+                let state = NodeState {
+                    meta: NodeMeta {
+                        node_id: NodeId(n),
+                        node_name: format!("node-{n}"),
+                        addr: addr(n),
+                        pool_id,
+                        topology_epoch: 1,
+                        protocol_version: 1,
+                        capacity: NodeCapacity::default(),
+                        started_at: 0,
+                        s4_version: "0.1.0".into(),
+                        edition: crate::identity::Edition::Community,
+                    },
+                    status: NodeStatus::Dead,
+                    last_seen: std::time::Instant::now(),
+                };
+                (NodeId(n), state)
+            })
+            .collect();
+        let gossip = Arc::new(GossipHandle::new_for_testing(members));
+        let rpc_client = Arc::new(NodeClient::new(gossip.clone(), NodeClientConfig::default()));
+        let hints = Arc::new(HintedHandoffManager::new(
+            HintedHandoffConfig::new(tmp.path()),
+            rpc_client.clone(),
+        ));
+        let coordinator = QuorumWriteCoordinator::new(
+            local,
+            Arc::new(MockStorage::default()),
+            rpc_client,
+            router,
+            Arc::new(HybridClock::new(local)),
+            hints,
+            &config,
+            WriteTimeouts::default(),
+        );
+        (coordinator, tmp)
+    }
+
+    #[tokio::test]
+    async fn each_operation_is_counted_once_with_its_outcome_and_duration() {
+        let metrics = TestMetrics::install();
+        let (coordinator, _tmp) = setup_single_node();
+
+        coordinator
+            .write("bucket", "key", b"data", "text/plain", &HashMap::new())
+            .await
+            .expect("single-node write");
+        coordinator.delete("bucket", "key").await.expect("single-node delete");
+        // The unary part upload hands its body to the streaming one: one
+        // multipart operation, not two, whatever its outcome.
+        let _ = coordinator
+            .upload_multipart_part("bucket", "key", "upload", 1, b"part".to_vec())
+            .await;
+
+        assert_eq!(
+            metrics.value(OPS, &[("operation", "write"), ("outcome", "ok")]),
+            Some(1.0)
+        );
+        assert_eq!(
+            metrics.value(OPS, &[("operation", "delete"), ("outcome", "ok")]),
+            Some(1.0)
+        );
+        assert_eq!(metrics.sum(OPS, &[("operation", "multipart")]), 1.0);
+        assert_eq!(metrics.sum(OPS, &[]), 3.0);
+        assert_eq!(
+            metrics.value(
+                "s4_quorum_duration_seconds_count",
+                &[("operation", "write")]
+            ),
+            Some(1.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_below_the_write_quorum_is_quorum_not_met_and_never_ok() {
+        let metrics = TestMetrics::install();
+        let (coordinator, _tmp) = setup_three_nodes_two_dead();
+
+        let result =
+            coordinator.write("bucket", "key", b"data", "text/plain", &HashMap::new()).await;
+
+        assert!(
+            matches!(
+                result,
+                Err(ClusterError::QuorumNotMet {
+                    needed: 2,
+                    achieved: 1
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            metrics.value(
+                OPS,
+                &[("operation", "write"), ("outcome", "quorum_not_met")]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            metrics.value(OPS, &[("operation", "write"), ("outcome", "ok")]),
+            None
+        );
+        // The replicas that failed are the two dead peers, each counted once.
+        for peer in [NodeId(2), NodeId(3)] {
+            assert_eq!(
+                metrics.value(
+                    "s4_peer_requests_total",
+                    &[("peer", peer.to_string().as_str()), ("outcome", "skipped")]
+                ),
+                Some(1.0),
+                "{}",
+                metrics.render()
+            );
+        }
+    }
+
+    // ---- Hints, left by each replica's own outcome ----
+
+    use crate::hints::{HintEntry, HintKind};
+
+    /// How a peer of the test pool answers a write or a delete.
+    #[derive(Clone, Copy)]
+    enum Peer {
+        /// Takes it and answers at once.
+        Answers,
+        /// Takes it and answers after this long: after the client already
+        /// has its quorum.
+        AnswersAfter(Duration),
+        /// Runs on another topology epoch and refuses it for that.
+        OtherEpoch,
+        /// Held dead by gossip: skipped at once.
+        Dead,
+    }
+
+    /// Node 1 of a three-node pool, RF=3 and W=2, with the local storage
+    /// given and nodes 2 and 3 answering as `peers` says.
+    struct TestPool {
+        coordinator: QuorumWriteCoordinator,
+        hints: Arc<HintedHandoffManager>,
+        _servers: Vec<crate::rpc::server::RpcServerHandle>,
+        _tmp: tempfile::TempDir,
+    }
+
+    /// Listens on `listen` and forwards every connection to `to`, but only
+    /// after `delay`: a replica that takes the write and answers late.
+    async fn start_slow_proxy(
+        listen: std::net::SocketAddr,
+        to: std::net::SocketAddr,
+        delay: Duration,
+    ) {
+        let listener = tokio::net::TcpListener::bind(listen).await.unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if let Ok(mut outbound) = tokio::net::TcpStream::connect(to).await {
+                        let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                    }
+                });
+            }
+        });
+    }
+
+    async fn setup_pool(local: MockStorage, peers: [Peer; 2], base_port: u16) -> TestPool {
+        use crate::gossip::NodeState;
+        use crate::identity::{NodeCapacity, NodeMeta, NodeStatus};
+        use crate::replica::ReplicaWriteHandler;
+        use crate::rpc::server::{NodeRpcServer, RpcServerConfig};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let local_id = NodeId(1);
+        // A test listens on `base_port + 1..=6` and nothing else: gRPC of
+        // nodes 1 to 3, then the proxies of late peers. The HTTP and gossip
+        // addresses are never opened.
+        let grpc_port = |n: u128| base_port + n as u16;
+        let proxied_port = |n: u128| base_port + 3 + n as u16;
+        let addr = |n: u128| NodeAddr {
+            grpc_addr: format!("127.0.0.1:{}", grpc_port(n)).parse().unwrap(),
+            http_addr: format!("127.0.0.1:{}", 9000 + n).parse().unwrap(),
+            gossip_addr: format!("127.0.0.1:{}", 9200 + n).parse().unwrap(),
+        };
+        let pool_id = PoolId::new(1);
+        let config = ClusterConfig {
+            pools: vec![PoolConfig {
+                pool_id,
+                name: "pool-1".to_string(),
+                nodes: (1..=3).map(addr).collect(),
+                replication_factor: Some(3),
+                write_quorum: Some(2),
+                read_quorum: Some(2),
+                storage_class: StorageClass::Standard,
+            }],
+            default_replication_factor: 3,
+            default_write_quorum: 2,
+            default_read_quorum: 2,
+            ..ClusterConfig::default()
+        };
+        let meta = |n: u128| NodeMeta {
+            node_id: NodeId(n),
+            node_name: format!("node-{n}"),
+            addr: addr(n),
+            pool_id,
+            topology_epoch: config.epoch,
+            protocol_version: 1,
+            capacity: NodeCapacity::default(),
+            started_at: 0,
+            s4_version: "0.1.0".into(),
+            edition: crate::identity::Edition::Community,
+        };
+
+        let mut servers = Vec::new();
+        let mut members = HashMap::new();
+        for (n, peer) in (2..=3).zip(peers) {
+            let status = match peer {
+                Peer::Dead => NodeStatus::Dead,
+                _ => NodeStatus::Alive,
+            };
+            members.insert(
+                NodeId(n),
+                NodeState {
+                    meta: meta(n),
+                    status,
+                    last_seen: std::time::Instant::now(),
+                },
+            );
+            if let Peer::Dead = peer {
+                continue;
+            }
+            let epoch = match peer {
+                Peer::OtherEpoch => config.epoch + 1,
+                _ => config.epoch,
+            };
+            // A late peer is reached through a proxy on its advertised port.
+            let listen = match peer {
+                Peer::AnswersAfter(_) => format!("127.0.0.1:{}", proxied_port(n)).parse().unwrap(),
+                _ => addr(n).grpc_addr,
+            };
+            let server = NodeRpcServer::new(
+                NodeId(n),
+                Arc::new(meta(n)),
+                Arc::new(GossipHandle::new_for_testing(HashMap::new())),
+            )
+            .with_replica_handler(Arc::new(ReplicaWriteHandler::new(
+                Arc::new(MockStorage::default()),
+                Arc::new(crate::idempotency::IdempotencyTracker::new()),
+                epoch,
+            )));
+            servers.push(
+                server
+                    .start(RpcServerConfig {
+                        bind_addr: listen,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap(),
+            );
+            if let Peer::AnswersAfter(delay) = peer {
+                start_slow_proxy(addr(n).grpc_addr, listen, delay).await;
+            }
+        }
+
+        let resolver: HashMap<_, _> = (1..=3).map(|n| (addr(n).grpc_addr, NodeId(n))).collect();
+        let placement = BucketPlacement::from_entries([("bucket".to_string(), pool_id)]);
+        let router =
+            Arc::new(PlacementRouter::new(&config, local_id, placement, &resolver).unwrap());
+        let gossip = Arc::new(GossipHandle::new_for_testing(members));
+        let rpc_client = Arc::new(NodeClient::new(gossip, NodeClientConfig::default()));
+        let hints = Arc::new(HintedHandoffManager::new(
+            HintedHandoffConfig::new(tmp.path()),
+            rpc_client.clone(),
+        ));
+        let coordinator = QuorumWriteCoordinator::new(
+            local_id,
+            Arc::new(local),
+            rpc_client,
+            router,
+            Arc::new(HybridClock::new(local_id)),
+            hints.clone(),
+            &config,
+            WriteTimeouts::default(),
+        );
+        TestPool {
+            coordinator,
+            hints,
+            _servers: servers,
+            _tmp: tmp,
+        }
+    }
+
+    impl TestPool {
+        /// The hints for `node` once `count` of them have landed; hints are
+        /// written on tasks of their own, after the replica's outcome.
+        async fn hints_once(&self, node: u128, count: usize) -> Vec<HintEntry> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let hints = self.hints.hints_for(NodeId(node)).await;
+                if hints.len() >= count || std::time::Instant::now() >= deadline {
+                    return hints;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        async fn no_hints_anywhere(&self) -> bool {
+            for node in 1..=3 {
+                if self.hints.pending(NodeId(node)).await > 0 {
+                    return false;
+                }
+            }
+            true
+        }
+    }
+
+    /// The slowest replica used to be hinted on every write, even when it
+    /// took the write a moment after the client had its answer.
+    #[tokio::test]
+    async fn a_replica_that_answers_after_the_quorum_gets_no_hint() {
+        let late = Duration::from_millis(400);
+        let pool = setup_pool(
+            MockStorage::default(),
+            [Peer::Answers, Peer::AnswersAfter(late)],
+            19750,
+        )
+        .await;
+
+        let started = std::time::Instant::now();
+        pool.coordinator
+            .write("bucket", "key", b"data", "text/plain", &HashMap::new())
+            .await
+            .expect("the local node and node 2 make the quorum");
+        assert!(
+            started.elapsed() < late,
+            "the client must have its answer before node 3 answers"
+        );
+
+        tokio::time::sleep(late * 2).await;
+        assert!(
+            pool.no_hints_anywhere().await,
+            "no replica missed the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_replica_that_misses_a_write_gets_one_hint_with_its_hlc() {
+        let pool = setup_pool(MockStorage::default(), [Peer::Answers, Peer::Dead], 19758).await;
+
+        let written = pool
+            .coordinator
+            .write("bucket", "key", b"data", "text/plain", &HashMap::new())
+            .await
+            .expect("the local node and node 2 make the quorum");
+
+        let hints = pool.hints_once(3, 1).await;
+        assert_eq!(hints.len(), 1, "{hints:?}");
+        assert_eq!(
+            (hints[0].bucket.as_str(), hints[0].key.as_str()),
+            ("bucket", "key")
+        );
+        assert_eq!(hints[0].kind, HintKind::Written);
+        assert_eq!(hints[0].hlc, written.hlc);
+        assert_eq!(pool.hints.pending(NodeId(1)).await, 0);
+        assert_eq!(pool.hints.pending(NodeId(2)).await, 0);
+    }
+
+    /// The local node is never its own hint target: a write it could not
+    /// make is not one a retry from here would make either.
+    #[tokio::test]
+    async fn the_local_node_never_hints_itself() {
+        let pool = setup_pool(
+            MockStorage::refusing(),
+            [Peer::Answers, Peer::Answers],
+            19766,
+        )
+        .await;
+
+        pool.coordinator
+            .write("bucket", "key", b"data", "text/plain", &HashMap::new())
+            .await
+            .expect("nodes 2 and 3 make the quorum");
+        pool.coordinator
+            .delete("bucket", "key")
+            .await
+            .expect("nodes 2 and 3 make the quorum");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(pool.no_hints_anywhere().await);
+    }
+
+    /// A replica on another topology epoch refuses for that reason, and
+    /// delivery would meet the same check: no hint.
+    #[tokio::test]
+    async fn a_replica_on_another_epoch_gets_no_hint() {
+        let pool = setup_pool(
+            MockStorage::default(),
+            [Peer::Answers, Peer::OtherEpoch],
+            19774,
+        )
+        .await;
+
+        pool.coordinator
+            .write("bucket", "key", b"data", "text/plain", &HashMap::new())
+            .await
+            .expect("the local node and node 2 make the quorum");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(pool.no_hints_anywhere().await);
+    }
+
+    #[tokio::test]
+    async fn deletes_purges_and_multipart_replication_hint_the_replica_that_missed_them() {
+        let pool = setup_pool(MockStorage::default(), [Peer::Answers, Peer::Dead], 19782).await;
+        let generation = HlcTimestamp::from_record(5, 0, 1);
+
+        let deleted = pool.coordinator.delete("bucket", "gone").await.expect("delete");
+        let purged = pool
+            .coordinator
+            .delete_if_hlc("bucket", "cold", generation)
+            .await
+            .expect("purge");
+        let replicated = pool
+            .coordinator
+            .replicate_to_remotes(
+                "bucket",
+                "assembled",
+                b"data",
+                "text/plain",
+                &HashMap::new(),
+            )
+            .await
+            .expect("node 2 makes the remote quorum");
+
+        let mut hints = pool.hints_once(3, 3).await;
+        hints.sort_by(|a, b| a.key.cmp(&b.key));
+        let got: Vec<_> = hints.iter().map(|h| (h.key.as_str(), h.kind, h.hlc)).collect();
+        assert_eq!(
+            got,
+            [
+                ("assembled", HintKind::Written, replicated.hlc),
+                (
+                    "cold",
+                    HintKind::Purge {
+                        expected: generation
+                    },
+                    purged.hlc
+                ),
+                ("gone", HintKind::Deleted, deleted.hlc),
+            ]
+        );
+        assert_eq!(pool.hints.pending(NodeId(1)).await, 0);
+        assert_eq!(pool.hints.pending(NodeId(2)).await, 0);
     }
 }

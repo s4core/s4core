@@ -48,7 +48,6 @@ config = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 metrics = { workspace = true }
-metrics-exporter-prometheus = { workspace = true }
 
 # Async
 async-trait = "0.1"

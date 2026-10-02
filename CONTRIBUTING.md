@@ -6,7 +6,7 @@ Thank you for your interest in contributing to S4! This document provides guidel
 
 ### Prerequisites
 
-- Rust 1.70 or later
+- Rust through [rustup](https://rustup.rs): the release is pinned in `rust-toolchain.toml`, and `rustup toolchain install` in the repository installs it
 - Git
 - Linux or macOS (Windows support is experimental)
 

@@ -88,9 +88,12 @@ pub async fn create_multipart_upload(
 ) -> impl IntoResponse {
     info!("CreateMultipartUpload: bucket={}, key={}", bucket, key);
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -191,9 +194,12 @@ pub async fn upload_part(
         }
     };
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -782,9 +788,12 @@ pub async fn complete_multipart_upload(
         }
     };
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -1228,6 +1237,9 @@ pub async fn list_parts(
         bucket, key, upload_id, max_parts, part_number_marker
     );
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let all_parts = if let Some(write_coord) = state.write_coordinator.clone() {
         match write_coord.list_multipart_parts(&bucket, &key, &upload_id).await {
             Ok(result) => {

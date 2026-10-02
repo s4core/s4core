@@ -54,6 +54,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, info, trace, warn};
 
+use crate::cluster_metrics::{self, PoolRoster};
 use crate::error::ClusterError;
 use crate::identity::{GossipIdentity, NodeId, NodeMeta, NodeStatus};
 
@@ -96,12 +97,13 @@ pub struct GossipConfig {
     pub bind_addr: SocketAddr,
     /// Seed node gossip addresses for initial discovery.
     pub seeds: Vec<SocketAddr>,
-    /// How often an isolated node re-announces itself to its seeds.
+    /// How often a node re-announces itself to the seeds it does not see alive.
     ///
     /// An announcement is a UDP datagram: if the seed's socket is not bound
     /// yet, it is silently lost, and nothing else would ever bring this node
     /// into the cluster. Only a seed receives announcements, so no peer would
-    /// discover it either.
+    /// discover it either. The same announcements bring the two sides of a
+    /// healed network split back together.
     pub seed_reannounce_interval: Duration,
     /// How often to broadcast local metadata (default: 30 s).
     pub meta_broadcast_interval: Duration,
@@ -115,9 +117,8 @@ impl Default for GossipConfig {
             bind_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 9200)),
             seeds: Vec::new(),
             meta_broadcast_interval: Duration::from_secs(30),
-            // Short, because it only runs while the node is alone: it stops as
-            // soon as a single peer is known, and a node still isolated after a
-            // second is a node whose seeds were not listening yet.
+            // Short, because it only sends while a seed is missing: one
+            // datagram per missing seed, none once the whole pool is up.
             seed_reannounce_interval: Duration::from_secs(1),
             max_packet_size: 1400,
         }
@@ -292,6 +293,27 @@ struct LocalCapacity {
     measured_at: Instant,
 }
 
+/// The pool whose membership this node reports in its metrics, once bootstrap
+/// has named it.
+///
+/// The lock also orders the reports: each one reads the member map only after
+/// taking it, so the report of a later change can never be overwritten by that
+/// of an earlier one.
+type RosterCell = std::sync::Arc<Mutex<Option<PoolRoster>>>;
+
+/// Reports the membership of the roster, if one is set, from the member map as
+/// it is now.
+fn publish_membership(
+    roster: &RosterCell,
+    members: &std::sync::Arc<std::sync::RwLock<HashMap<NodeId, NodeState>>>,
+) {
+    let roster = roster.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(roster) = roster.as_ref() {
+        let members = members.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        cluster_metrics::publish_membership(roster, &members);
+    }
+}
+
 /// Handle returned by [`GossipService::start`] for querying cluster state.
 pub struct GossipHandle {
     /// Current view of all known cluster members.
@@ -300,9 +322,22 @@ pub struct GossipHandle {
     local_node_id: NodeId,
     /// This node's own capacity, refreshed by the gossip loop.
     local_capacity: std::sync::Arc<std::sync::RwLock<LocalCapacity>>,
+    /// The pool whose membership the gossip loop reports.
+    roster: RosterCell,
 }
 
 impl GossipHandle {
+    /// Starts reporting the membership of `roster` in `s4_cluster_nodes` and
+    /// `s4_cluster_peer_up`: right away, and again after every change gossip
+    /// makes to the member map.
+    ///
+    /// Called once bootstrap has matched every configured member to its
+    /// identity; before that, the map cannot be read against the pool.
+    pub fn report_membership(&self, roster: PoolRoster) {
+        *self.roster.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(roster);
+        publish_membership(&self.roster, &self.members);
+    }
+
     /// Return a snapshot of all known member states.
     pub fn members(&self) -> HashMap<NodeId, NodeState> {
         self.members.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
@@ -378,6 +413,7 @@ impl GossipHandle {
                 capacity: crate::identity::NodeCapacity::default(),
                 measured_at: Instant::now(),
             })),
+            roster: RosterCell::default(),
         }
     }
 
@@ -668,16 +704,19 @@ impl GossipService {
             measured_at: Instant::now(),
         }));
 
+        let roster = RosterCell::default();
         let handle = GossipHandle {
             members: members.clone(),
             local_node_id: local_identity.node_id,
             local_capacity: local_capacity.clone(),
+            roster: roster.clone(),
         };
 
         tokio::spawn(run_loop(
             socket,
             Mutex::new(foca),
             members,
+            roster,
             event_tx,
             meta_rx,
             local_identity,
@@ -703,6 +742,15 @@ fn build_foca_config(max_packet_size: usize) -> foca::Config {
     config.suspect_to_down_after = Duration::from_secs(5);
     config.remove_down_after = Duration::from_secs(30);
 
+    // Plain SWIM never tells a member it was declared down: its peers just
+    // drop what it sends. A node that stalled longer than the suspicion
+    // timeout — a stopped process, a frozen VM, a long pause — resumes still
+    // believing it is a member, gets no answers, declares its peers down in
+    // turn, and the two sides never speak again until one restarts. With this,
+    // a peer answers such a node that it is down; the node renews its identity
+    // (`GossipIdentity::renew`) and joins with the next incarnation.
+    config.notify_down_members = true;
+
     if let Ok(size) = max_packet_size.try_into() {
         config.max_packet_size = size;
     }
@@ -719,6 +767,7 @@ async fn run_loop(
     socket: UdpSocket,
     foca: Mutex<S4Foca>,
     members: std::sync::Arc<std::sync::RwLock<HashMap<NodeId, NodeState>>>,
+    roster: RosterCell,
     event_tx: mpsc::Sender<ClusterEvent>,
     mut meta_rx: mpsc::UnboundedReceiver<(NodeId, NodeMeta)>,
     mut local_identity: GossipIdentity,
@@ -744,14 +793,22 @@ async fn run_loop(
 
     // Announce to seed nodes.
     announce_to_seeds(&foca, &seeds, &local_identity, &socket, &timer_tx).await;
+    info!(seeds = seeds.len(), "announced to seed nodes");
 
-    // ...and keep announcing for as long as nobody has answered. An
-    // announcement is one UDP datagram: sent while the seed's socket is not
+    // ...and keep announcing to every seed this node does not see alive.
+    //
+    // An announcement is one UDP datagram: sent while the seed's socket is not
     // bound yet — which is ordinary when a whole cluster starts at once, or
     // during a rolling restart — it is silently lost. Nothing else would bring
     // this node in, because only a seed receives announcements, so no peer
-    // would ever discover it. The ticker stops mattering the moment a single
-    // member is known, and starts mattering again if the node is ever alone.
+    // would ever discover it.
+    //
+    // And once a network split has healed, nothing else would bring the two
+    // sides back together: each has declared the other dead, and nobody sends
+    // anything to a member it holds dead. A seed that still holds this node
+    // dead answers the announcement by telling it so (`notify_down_members`),
+    // and the node rejoins under a renewed identity; one that has forgotten it
+    // takes it as an ordinary join.
     let mut reannounce_interval = tokio::time::interval(seed_reannounce_interval);
     reannounce_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     reannounce_interval.tick().await;
@@ -781,6 +838,7 @@ async fn run_loop(
                             &socket,
                             &timer_tx,
                             &members,
+                            &roster,
                             &event_tx,
                             &mut local_identity,
                             &mut identities,
@@ -811,6 +869,7 @@ async fn run_loop(
                     &socket,
                     &timer_tx,
                     &members,
+                    &roster,
                     &event_tx,
                     &mut local_identity,
                     &mut identities,
@@ -823,7 +882,7 @@ async fn run_loop(
 
             // --- Received metadata from broadcast handler ---
             Some((node_id, meta)) = meta_rx.recv() => {
-                update_member_meta(&members, &local_identity, node_id, meta);
+                update_member_meta(&members, &roster, &local_identity, node_id, meta);
             }
 
             // --- Periodic local metadata broadcast ---
@@ -836,10 +895,11 @@ async fn run_loop(
                 broadcast_local_meta(&foca, &local_meta, &mut meta_version);
             }
 
-            // --- Re-announce while this node is alone ---
+            // --- Re-announce to the seeds this node does not see alive ---
             _ = reannounce_interval.tick() => {
-                if node_is_alone(&members, local_identity.node_id) {
-                    announce_to_seeds(&foca, &seeds, &local_identity, &socket, &timer_tx).await;
+                let missing = seeds_not_seen_alive(&members, &local_identity, &seeds);
+                if !missing.is_empty() {
+                    announce_to_seeds(&foca, &missing, &local_identity, &socket, &timer_tx).await;
                 }
             }
         }
@@ -850,22 +910,35 @@ async fn run_loop(
 // Helper functions
 // ---------------------------------------------------------------------------
 
-/// Whether this node knows of no member other than itself.
+/// The seeds no live peer of this node answers at: every seed but this node's
+/// own address while it knows no one, none once the whole pool is up.
 ///
-/// The local node is always in the map — foca reports it as a member — so
-/// emptiness is the wrong question and would never be true.
+/// A seed is matched by the gossip address a live member has. The local node
+/// is always in the map — foca reports it as a member — and never counts.
 ///
-/// A poisoned lock reads as "not alone": the recovery announcement is a
-/// best-effort nudge, and a node whose membership state is broken has a larger
-/// problem than a missed datagram.
-fn node_is_alone(
+/// A poisoned lock yields no seed: the announcement is a best-effort nudge, and
+/// a node whose membership state is broken has a larger problem than a missed
+/// datagram.
+fn seeds_not_seen_alive(
     members: &std::sync::Arc<std::sync::RwLock<HashMap<NodeId, NodeState>>>,
-    local_node_id: NodeId,
-) -> bool {
-    members
-        .read()
-        .map(|members| members.keys().all(|node_id| *node_id == local_node_id))
-        .unwrap_or(false)
+    local_identity: &GossipIdentity,
+    seeds: &[SocketAddr],
+) -> Vec<SocketAddr> {
+    let Ok(members) = members.read() else {
+        return Vec::new();
+    };
+    seeds
+        .iter()
+        .filter(|seed| **seed != local_identity.gossip_addr)
+        .filter(|seed| {
+            !members.iter().any(|(node_id, state)| {
+                *node_id != local_identity.node_id
+                    && state.status == NodeStatus::Alive
+                    && state.meta.addr.gossip_addr == **seed
+            })
+        })
+        .copied()
+        .collect()
 }
 
 fn lock_foca(foca: &Mutex<S4Foca>) -> std::sync::MutexGuard<'_, S4Foca> {
@@ -916,7 +989,7 @@ async fn announce_to_seeds(
             schedule_timer(timer_tx, duration, timer);
         }
 
-        info!(seed = %seed_addr, "announced to seed node");
+        debug!(seed = %seed_addr, "announced to seed node");
     }
 }
 
@@ -941,6 +1014,7 @@ fn refresh_local_capacity(
     };
 
     let measured = provider.measure();
+    cluster_metrics::set_node_disk(measured.total_bytes, measured.used_bytes);
     meta.capacity = measured.clone();
     let mut local = local_capacity.write().unwrap_or_else(|poisoned| poisoned.into_inner());
     *local = LocalCapacity {
@@ -983,6 +1057,7 @@ async fn process_outputs(
     socket: &UdpSocket,
     timer_tx: &mpsc::UnboundedSender<Timer<GossipIdentity>>,
     members: &std::sync::Arc<std::sync::RwLock<HashMap<NodeId, NodeState>>>,
+    roster: &RosterCell,
     event_tx: &mpsc::Sender<ClusterEvent>,
     local_identity: &mut GossipIdentity,
     identities: &mut IdentityTable,
@@ -1003,8 +1078,15 @@ async fn process_outputs(
     // Process notifications.
     let mut new_member = false;
     for notification in outputs.notifications {
-        new_member |=
-            handle_notification(notification, members, event_tx, local_identity, identities).await;
+        new_member |= handle_notification(
+            notification,
+            members,
+            roster,
+            event_tx,
+            local_identity,
+            identities,
+        )
+        .await;
     }
     new_member
 }
@@ -1125,6 +1207,7 @@ fn note_member_present(
 async fn handle_notification(
     notification: foca::OwnedNotification<GossipIdentity>,
     members: &std::sync::Arc<std::sync::RwLock<HashMap<NodeId, NodeState>>>,
+    roster: &RosterCell,
     event_tx: &mpsc::Sender<ClusterEvent>,
     local_identity: &mut GossipIdentity,
     identities: &mut IdentityTable,
@@ -1148,6 +1231,7 @@ async fn handle_notification(
             identities.insert(node_id, identity.clone());
             let (announced_meta, first_sighting) =
                 note_member_present(members, &identity, NodeStatus::Alive);
+            publish_membership(roster, members);
 
             let _ = event_tx.send(ClusterEvent::Joined(node_id, Box::new(announced_meta))).await;
             first_sighting
@@ -1181,6 +1265,7 @@ async fn handle_notification(
                     state.last_seen = Instant::now();
                 }
             }
+            publish_membership(roster, members);
 
             let _ = event_tx.send(ClusterEvent::Left(node_id)).await;
             false
@@ -1247,6 +1332,7 @@ async fn handle_notification(
                     &new,
                     displaced_status.unwrap_or(NodeStatus::Alive),
                 );
+                publish_membership(roster, members);
                 let _ = event_tx
                     .send(ClusterEvent::Joined(new.node_id, Box::new(announced_meta)))
                     .await;
@@ -1265,6 +1351,7 @@ async fn handle_notification(
             {
                 identities.remove(&old.node_id);
                 members.write().unwrap_or_else(|p| p.into_inner()).remove(&old.node_id);
+                publish_membership(roster, members);
                 let _ = event_tx.send(ClusterEvent::Left(old.node_id)).await;
             }
 
@@ -1296,6 +1383,7 @@ fn is_this_node(local_identity: &GossipIdentity, identity: &GossipIdentity) -> b
 
 fn update_member_meta(
     members: &std::sync::Arc<std::sync::RwLock<HashMap<NodeId, NodeState>>>,
+    roster: &RosterCell,
     local_identity: &GossipIdentity,
     node_id: NodeId,
     meta: NodeMeta,
@@ -1336,6 +1424,10 @@ fn update_member_meta(
             },
         );
         trace!(%node_id, "stored metadata for not-yet-joined node");
+        // A new member is a new status to count; new metadata of a known one
+        // changes no count.
+        drop(m);
+        publish_membership(roster, members);
     }
 }
 
@@ -1371,6 +1463,7 @@ mod tests {
                 capacity: crate::identity::NodeCapacity::default(),
                 measured_at: Instant::now(),
             })),
+            roster: RosterCell::default(),
         }
     }
 
@@ -1627,6 +1720,7 @@ mod tests {
         assert_eq!(config.probe_period, Duration::from_secs(1));
         assert_eq!(config.suspect_to_down_after, Duration::from_secs(5));
         assert_eq!(config.remove_down_after, Duration::from_secs(30));
+        assert!(config.notify_down_members);
     }
 
     #[tokio::test]
@@ -1952,6 +2046,334 @@ mod tests {
         );
     }
 
+    /// Starts a gossip node on a runtime and a thread of its own. While the
+    /// returned flag is set the whole runtime stands still — timers, socket,
+    /// replies — the way SIGSTOP stops a process, and its peers go on without
+    /// it. The thread ends once the test drops the flag.
+    fn start_pausable_node(
+        config: GossipConfig,
+        identity: GossipIdentity,
+        meta: NodeMeta,
+    ) -> (GossipHandle, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let paused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let node_paused = paused.clone();
+        let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime =
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            runtime.block_on(async move {
+                let (handle, _) = GossipService::start(config, identity, meta, None).await.unwrap();
+                handle_tx.send(handle).unwrap();
+                while std::sync::Arc::strong_count(&node_paused) > 1 {
+                    // Blocks this thread, and with it every task of the node.
+                    while node_paused.load(std::sync::atomic::Ordering::SeqCst)
+                        && std::sync::Arc::strong_count(&node_paused) > 1
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+        });
+        (handle_rx.recv().unwrap(), paused)
+    }
+
+    /// What node `viewer` holds node `of` to be.
+    fn status_of(
+        handles: &[GossipHandle],
+        ids: &[NodeId],
+        viewer: usize,
+        of: usize,
+    ) -> Option<NodeStatus> {
+        handles[viewer].members().get(&ids[of]).map(|s| s.status)
+    }
+
+    /// Whether every node holds every other one alive.
+    fn pool_is_whole(handles: &[GossipHandle], ids: &[NodeId]) -> bool {
+        (0..ids.len()).all(|viewer| {
+            (0..ids.len())
+                .filter(|of| *of != viewer)
+                .all(|of| status_of(handles, ids, viewer, of) == Some(NodeStatus::Alive))
+        })
+    }
+
+    /// Polls `done` until it holds; after `within`, fails with `what` and what
+    /// every node holds every node to be.
+    async fn wait_until(
+        what: &str,
+        within: Duration,
+        handles: &[GossipHandle],
+        ids: &[NodeId],
+        done: impl Fn() -> bool,
+    ) {
+        let deadline = Instant::now() + within;
+        while !done() {
+            let views: Vec<Vec<_>> = (0..ids.len())
+                .map(|viewer| {
+                    (0..ids.len()).map(|of| status_of(handles, ids, viewer, of)).collect()
+                })
+                .collect();
+            assert!(Instant::now() < deadline, "{what}; views: {views:?}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// A node that stalls until its peers declare it dead — a process stopped
+    /// with SIGSTOP, a frozen VM — comes back into the pool on its own once it
+    /// runs again. Nothing else would bring it back: its peers drop whatever it
+    /// sends, it gets no answers and declares them dead in turn, and the pool
+    /// stays split until one of the nodes restarts.
+    #[tokio::test]
+    async fn a_node_paused_until_declared_dead_rejoins_when_it_resumes() {
+        const NODES: usize = 3;
+        const PAUSED: usize = 1;
+        // Node 0 runs on this thread and reports its view of the pool.
+        let metrics = crate::test_metrics::TestMetrics::install();
+
+        let mut ids = Vec::new();
+        let mut addrs = Vec::new();
+        for _ in 0..NODES {
+            let socket = UdpSocket::bind(localhost(0)).await.unwrap();
+            addrs.push(socket.local_addr().unwrap());
+            drop(socket);
+            ids.push(NodeId::generate());
+        }
+
+        let mut handles = Vec::new();
+        let mut paused = None;
+        for idx in 0..NODES {
+            let config = GossipConfig {
+                bind_addr: addrs[idx],
+                seeds: addrs.clone(),
+                ..Default::default()
+            };
+            let identity = GossipIdentity {
+                node_id: ids[idx],
+                gossip_addr: addrs[idx],
+                incarnation: 1_700_000_000_000 + idx as u64,
+            };
+            let meta = test_meta(ids[idx], addrs[idx].port());
+            if idx == PAUSED {
+                let (handle, node_paused) = start_pausable_node(config, identity, meta);
+                handles.push(handle);
+                paused = Some(node_paused);
+            } else {
+                let (handle, _) = GossipService::start(config, identity, meta, None).await.unwrap();
+                handles.push(handle);
+            }
+        }
+        let paused = paused.unwrap();
+        let (handles, ids) = (&handles[..], &ids[..]);
+
+        wait_until(
+            "the pool never formed",
+            Duration::from_secs(10),
+            handles,
+            ids,
+            || pool_is_whole(handles, ids),
+        )
+        .await;
+        handles[0].report_membership(roster(ids[0], &ids[1..]));
+        assert_eq!(
+            node_counts(&metrics),
+            vec![Some(3.0), Some(0.0), Some(0.0), Some(0.0)]
+        );
+
+        paused.store(true, std::sync::atomic::Ordering::SeqCst);
+        wait_until(
+            "the running nodes never declared the paused one dead",
+            Duration::from_secs(20),
+            handles,
+            ids,
+            || {
+                (0..NODES)
+                    .filter(|viewer| *viewer != PAUSED)
+                    .all(|viewer| status_of(handles, ids, viewer, PAUSED) == Some(NodeStatus::Dead))
+            },
+        )
+        .await;
+        assert_eq!(
+            node_counts(&metrics),
+            vec![Some(2.0), Some(0.0), Some(1.0), Some(0.0)]
+        );
+        assert_eq!(peer_up(&metrics, "node-2"), Some(0.0));
+        assert_eq!(peer_up(&metrics, "node-3"), Some(1.0));
+        paused.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let resumed = Instant::now();
+        wait_until(
+            "the paused node never came back after it resumed",
+            Duration::from_secs(30),
+            handles,
+            ids,
+            || pool_is_whole(handles, ids),
+        )
+        .await;
+        eprintln!(
+            "the pool was whole again {:?} after the node resumed",
+            resumed.elapsed()
+        );
+        assert_eq!(
+            node_counts(&metrics),
+            vec![Some(3.0), Some(0.0), Some(0.0), Some(0.0)]
+        );
+        assert_eq!(peer_up(&metrics, "node-2"), Some(1.0));
+    }
+
+    /// Forwards what reaches `relay` to the socket of `node`, except, while
+    /// `split` holds, a datagram between `cut_off` and any other node: a
+    /// network the test can cut one node off from, and heal.
+    fn spawn_relay(
+        relay: UdpSocket,
+        node: SocketAddr,
+        cut_off: SocketAddr,
+        split: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 65_536];
+            while let Ok((len, from)) = relay.recv_from(&mut buf).await {
+                if split.load(std::sync::atomic::Ordering::SeqCst)
+                    && (from == cut_off) != (node == cut_off)
+                {
+                    continue;
+                }
+                let _ = relay.send_to(&buf[..len], node).await;
+            }
+        });
+    }
+
+    /// The two sides of a network split find each other again once it heals.
+    /// While it lasts each side declares the other dead, and nobody sends
+    /// anything to a member it holds dead — a healed network alone changes
+    /// nothing, and a node cut off for longer than the suspicion timeout would
+    /// stay out of the pool until it restarted.
+    #[tokio::test]
+    async fn a_node_cut_off_by_a_network_split_rejoins_once_it_heals() {
+        const NODES: usize = 3;
+        const CUT_OFF: usize = 2;
+
+        // Every node is known to its peers only by its relay's address.
+        let split = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut nodes = Vec::new();
+        let mut relays = Vec::new();
+        for _ in 0..NODES {
+            let socket = UdpSocket::bind(localhost(0)).await.unwrap();
+            nodes.push(socket.local_addr().unwrap());
+            drop(socket);
+            relays.push(UdpSocket::bind(localhost(0)).await.unwrap());
+        }
+        let relay_addrs: Vec<_> = relays.iter().map(|r| r.local_addr().unwrap()).collect();
+        for (relay, node) in relays.into_iter().zip(&nodes) {
+            spawn_relay(relay, *node, nodes[CUT_OFF], split.clone());
+        }
+
+        let ids: Vec<_> = (0..NODES).map(|_| NodeId::generate()).collect();
+        let mut handles = Vec::new();
+        for idx in 0..NODES {
+            let config = GossipConfig {
+                bind_addr: nodes[idx],
+                seeds: relay_addrs.clone(),
+                ..Default::default()
+            };
+            let identity = GossipIdentity {
+                node_id: ids[idx],
+                gossip_addr: relay_addrs[idx],
+                incarnation: 1_700_000_000_000 + idx as u64,
+            };
+            let meta = test_meta(ids[idx], relay_addrs[idx].port());
+            let (handle, _) = GossipService::start(config, identity, meta, None).await.unwrap();
+            handles.push(handle);
+        }
+        let (handles, ids) = (&handles[..], &ids[..]);
+
+        wait_until(
+            "the pool never formed",
+            Duration::from_secs(10),
+            handles,
+            ids,
+            || pool_is_whole(handles, ids),
+        )
+        .await;
+
+        split.store(true, std::sync::atomic::Ordering::SeqCst);
+        wait_until(
+            "the two sides never declared each other dead",
+            Duration::from_secs(20),
+            handles,
+            ids,
+            || {
+                (0..NODES).filter(|node| *node != CUT_OFF).all(|node| {
+                    status_of(handles, ids, node, CUT_OFF) == Some(NodeStatus::Dead)
+                        && status_of(handles, ids, CUT_OFF, node) == Some(NodeStatus::Dead)
+                })
+            },
+        )
+        .await;
+        // Held past every suspicion timer still running. foca sends a member it
+        // declares dead a notice of it, and one sent after the heal would bring
+        // the pool back together by luck — a split that outlasts the timers,
+        // as a real one does, gets no such notice.
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        split.store(false, std::sync::atomic::Ordering::SeqCst);
+
+        let healed = Instant::now();
+        wait_until(
+            "the split never closed after the network healed",
+            Duration::from_secs(30),
+            handles,
+            ids,
+            || pool_is_whole(handles, ids),
+        )
+        .await;
+        eprintln!(
+            "the pool was whole again {:?} after the network healed",
+            healed.elapsed()
+        );
+    }
+
+    /// A node announces itself to exactly the seeds no live peer answers at.
+    #[test]
+    fn a_node_announces_to_the_seeds_it_does_not_see_alive() {
+        let local = identity(NodeId(1), 9001, 1);
+        let seeds = [
+            localhost(9001),
+            localhost(9002),
+            localhost(9003),
+            localhost(9004),
+        ];
+        let members = std::sync::Arc::new(std::sync::RwLock::new(HashMap::new()));
+        {
+            let mut m = members.write().unwrap();
+            for (node_id, port, status) in [
+                (1, 9001, NodeStatus::Alive),
+                (2, 9002, NodeStatus::Alive),
+                (3, 9003, NodeStatus::Dead),
+            ] {
+                m.insert(
+                    NodeId(node_id),
+                    NodeState {
+                        meta: test_meta(NodeId(node_id), port),
+                        status,
+                        last_seen: Instant::now(),
+                    },
+                );
+            }
+        }
+
+        assert_eq!(
+            seeds_not_seen_alive(&members, &local, &seeds),
+            vec![localhost(9003), localhost(9004)],
+            "a seed held dead or never heard from is announced to, a live one and this node are not"
+        );
+
+        members.write().unwrap().retain(|node_id, _| *node_id == NodeId(1));
+        assert_eq!(
+            seeds_not_seen_alive(&members, &local, &seeds),
+            vec![localhost(9002), localhost(9003), localhost(9004)],
+            "a node that knows no one announces to every seed but itself"
+        );
+    }
+
     #[test]
     fn update_member_meta_creates_entry_for_unknown_node() {
         let members = std::sync::Arc::new(std::sync::RwLock::new(HashMap::new()));
@@ -1960,6 +2382,7 @@ mod tests {
 
         update_member_meta(
             &members,
+            &RosterCell::default(),
             &identity(NodeId(1), 9000, 1),
             node_id,
             meta.clone(),
@@ -1994,6 +2417,7 @@ mod tests {
         updated_meta.capacity.used_bytes = 500_000;
         update_member_meta(
             &members,
+            &RosterCell::default(),
             &identity(NodeId(1), 9000, 1),
             node_id,
             updated_meta.clone(),
@@ -2266,6 +2690,7 @@ mod tests {
     /// identity to be. Notifications take the same path they take in the loop.
     struct View {
         members: std::sync::Arc<std::sync::RwLock<HashMap<NodeId, NodeState>>>,
+        roster: RosterCell,
         local: GossipIdentity,
         identities: IdentityTable,
         event_tx: mpsc::Sender<ClusterEvent>,
@@ -2277,6 +2702,7 @@ mod tests {
             let (event_tx, events) = mpsc::channel(32);
             Self {
                 members: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
+                roster: RosterCell::default(),
                 identities: IdentityTable::from([(local.node_id, local.clone())]),
                 local,
                 event_tx,
@@ -2288,6 +2714,7 @@ mod tests {
             handle_notification(
                 notification,
                 &self.members,
+                &self.roster,
                 &self.event_tx,
                 &mut self.local,
                 &mut self.identities,
@@ -2296,7 +2723,7 @@ mod tests {
         }
 
         fn meta_arrived(&self, meta: NodeMeta) {
-            update_member_meta(&self.members, &self.local, meta.node_id, meta);
+            update_member_meta(&self.members, &self.roster, &self.local, meta.node_id, meta);
         }
 
         fn state(&self, node_id: NodeId) -> Option<NodeState> {
@@ -2309,6 +2736,14 @@ mod tests {
 
         fn grpc_port(&self, node_id: NodeId) -> Option<u16> {
             self.state(node_id).map(|state| state.meta.addr.grpc_addr.port())
+        }
+
+        /// A handle over this view, as bootstrap holds one over the loop's.
+        fn handle(&self) -> GossipHandle {
+            let mut handle = test_handle(self.members.clone());
+            handle.local_node_id = self.local.node_id;
+            handle.roster = self.roster.clone();
+            handle
         }
     }
 
@@ -2692,6 +3127,160 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Membership metrics
+    // -----------------------------------------------------------------------
+
+    /// `s4_cluster_nodes` of pool-1 by status, in the order alive, suspect,
+    /// dead, left; `None` for a series that is not there.
+    fn node_counts(metrics: &crate::test_metrics::TestMetrics) -> Vec<Option<f64>> {
+        ["alive", "suspect", "dead", "left"]
+            .iter()
+            .map(|status| {
+                metrics.value(
+                    "s4_cluster_nodes",
+                    &[("pool", "pool-1"), ("status", status)],
+                )
+            })
+            .collect()
+    }
+
+    fn peer_up(metrics: &crate::test_metrics::TestMetrics, peer: &str) -> Option<f64> {
+        metrics.value("s4_cluster_peer_up", &[("peer", peer)])
+    }
+
+    /// The roster of pool-1: this node as node-1 and its peers as node-2, ….
+    fn roster(local: NodeId, peers: &[NodeId]) -> PoolRoster {
+        let members = std::iter::once(local)
+            .chain(peers.iter().copied())
+            .enumerate()
+            .map(|(idx, node_id)| (node_id, format!("node-{}", idx + 1)));
+        PoolRoster::new("pool-1", local, members)
+    }
+
+    /// Alive → Dead → Alive shows in the metrics as each notification lands,
+    /// not at the next scrape of some other state. Suspect and Left are never
+    /// set by this code (plan EXTENDED-METRICS.md, context item 7); their rows
+    /// are there, at zero, so a dashboard needs no special case for them.
+    #[tokio::test]
+    async fn membership_metrics_follow_a_peer_down_and_back() {
+        let metrics = crate::test_metrics::TestMetrics::install();
+        let local = NodeId::generate();
+        let (up, flapping) = (NodeId::generate(), NodeId::generate());
+        let mut view = View::new(identity(local, 9000, 100));
+        view.notify(foca::OwnedNotification::MemberUp(identity(up, 9001, 10))).await;
+        view.notify(foca::OwnedNotification::MemberUp(identity(
+            flapping, 9002, 10,
+        )))
+        .await;
+        assert_eq!(
+            node_counts(&metrics),
+            vec![None; 4],
+            "nothing is reported before the pool is named"
+        );
+
+        view.handle().report_membership(roster(local, &[up, flapping]));
+        assert_eq!(
+            node_counts(&metrics),
+            vec![Some(3.0), Some(0.0), Some(0.0), Some(0.0)]
+        );
+        assert_eq!(peer_up(&metrics, "node-2"), Some(1.0));
+        assert_eq!(peer_up(&metrics, "node-3"), Some(1.0));
+        assert_eq!(
+            peer_up(&metrics, "node-1"),
+            None,
+            "a node is not its own peer"
+        );
+
+        view.notify(foca::OwnedNotification::MemberDown(identity(
+            flapping, 9002, 10,
+        )))
+        .await;
+        assert_eq!(
+            node_counts(&metrics),
+            vec![Some(2.0), Some(0.0), Some(1.0), Some(0.0)]
+        );
+        assert_eq!(peer_up(&metrics, "node-3"), Some(0.0));
+        assert_eq!(peer_up(&metrics, "node-2"), Some(1.0));
+
+        view.notify(foca::OwnedNotification::MemberUp(identity(
+            flapping, 9002, 11,
+        )))
+        .await;
+        assert_eq!(
+            node_counts(&metrics),
+            vec![Some(3.0), Some(0.0), Some(0.0), Some(0.0)]
+        );
+        assert_eq!(peer_up(&metrics, "node-3"), Some(1.0));
+    }
+
+    /// A configured member this node has never heard from is down as far as
+    /// this node can tell, and the pool's counts still add up to its size.
+    #[tokio::test]
+    async fn a_member_never_heard_from_counts_as_dead() {
+        let metrics = crate::test_metrics::TestMetrics::install();
+        let local = NodeId::generate();
+        let (heard, silent) = (NodeId::generate(), NodeId::generate());
+        let mut view = View::new(identity(local, 9000, 100));
+        view.notify(foca::OwnedNotification::MemberUp(identity(heard, 9001, 10))).await;
+
+        view.handle().report_membership(roster(local, &[heard, silent]));
+        assert_eq!(
+            node_counts(&metrics),
+            vec![Some(2.0), Some(0.0), Some(1.0), Some(0.0)]
+        );
+        assert_eq!(peer_up(&metrics, "node-3"), Some(0.0));
+
+        // Its metadata can arrive before its join; either makes it a member.
+        view.meta_arrived(test_meta(silent, 9002));
+        assert_eq!(
+            node_counts(&metrics),
+            vec![Some(3.0), Some(0.0), Some(0.0), Some(0.0)]
+        );
+        assert_eq!(peer_up(&metrics, "node-3"), Some(1.0));
+    }
+
+    /// Membership is counted by node, so a node that came back on another
+    /// address is one member, and so is a node whose previous run is still
+    /// being declared down. A node outside the pool is not counted at all.
+    #[tokio::test]
+    async fn a_node_is_counted_once_and_only_inside_its_pool() {
+        let metrics = crate::test_metrics::TestMetrics::install();
+        let local = NodeId::generate();
+        let (moving, stranger) = (NodeId::generate(), NodeId::generate());
+        let mut view = View::new(identity(local, 9000, 100));
+        view.handle().report_membership(roster(local, &[moving]));
+
+        view.notify(foca::OwnedNotification::MemberUp(identity(
+            moving, 9001, 10,
+        )))
+        .await;
+        view.notify(foca::OwnedNotification::MemberUp(identity(
+            moving, 9005, 20,
+        )))
+        .await;
+        view.notify(foca::OwnedNotification::MemberDown(identity(
+            moving, 9001, 10,
+        )))
+        .await;
+        view.notify(foca::OwnedNotification::MemberUp(identity(
+            stranger, 9007, 10,
+        )))
+        .await;
+
+        assert_eq!(view.grpc_port(moving), Some(9005));
+        assert_eq!(
+            node_counts(&metrics),
+            vec![Some(2.0), Some(0.0), Some(0.0), Some(0.0)]
+        );
+        assert_eq!(peer_up(&metrics, "node-2"), Some(1.0));
+        assert_eq!(
+            peer_up(&metrics, &stranger.to_string()),
+            None,
+            "a node outside the pool got a series"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Local capacity tracking
     // -----------------------------------------------------------------------
 
@@ -2699,7 +3288,8 @@ mod tests {
     /// receive it in the next broadcast, and local placement which reads it
     /// directly. Updating one without the other would cause them to drift apart.
     #[test]
-    fn refresh_local_capacity_updates_both_the_broadcast_and_the_local_view() {
+    fn refresh_local_capacity_updates_the_broadcast_the_local_view_and_the_metrics() {
+        let metrics = crate::test_metrics::TestMetrics::install();
         let mut meta = test_meta(NodeId(1), 9300);
         let cell = std::sync::Arc::new(std::sync::RwLock::new(LocalCapacity {
             capacity: meta.capacity.clone(),
@@ -2719,6 +3309,10 @@ mod tests {
         let local = cell.read().unwrap();
         assert_eq!(local.capacity.total_bytes, 900);
         assert_eq!(local.capacity.used_bytes, 400);
+
+        // The metrics show the same measurement the peers receive.
+        assert_eq!(metrics.value("s4_node_disk_total_bytes", &[]), Some(900.0));
+        assert_eq!(metrics.value("s4_node_disk_used_bytes", &[]), Some(400.0));
     }
 
     /// A caller that supplied no way to measure promised no fresh data. Passing
@@ -2726,6 +3320,7 @@ mod tests {
     /// capacity-aware placement would rely on.
     #[test]
     fn refresh_local_capacity_without_a_provider_leaves_the_numbers_alone() {
+        let metrics = crate::test_metrics::TestMetrics::install();
         let mut meta = test_meta(NodeId(1), 9300);
         let cell = std::sync::Arc::new(std::sync::RwLock::new(LocalCapacity {
             capacity: meta.capacity.clone(),
@@ -2740,6 +3335,11 @@ mod tests {
         let local = cell.read().unwrap();
         assert_eq!(local.capacity.total_bytes, 1_000_000);
         assert_eq!(local.capacity.used_bytes, 0);
+        assert_eq!(
+            metrics.value("s4_node_disk_total_bytes", &[]),
+            None,
+            "nothing was measured"
+        );
     }
 
     /// A node never appears in its own membership map, which is built from peer
@@ -2761,6 +3361,7 @@ mod tests {
                 },
                 measured_at: Instant::now(),
             })),
+            roster: RosterCell::default(),
         };
 
         let report = handle.node_capacity(local).unwrap();

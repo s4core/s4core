@@ -51,6 +51,7 @@
 pub mod capability;
 pub mod capacity;
 pub mod clock;
+pub mod cluster_admin;
 pub mod cluster_metrics;
 pub mod config;
 pub mod conflict;
@@ -73,6 +74,9 @@ pub mod replica;
 pub mod rpc;
 pub mod scrubber;
 pub mod traits;
+
+#[cfg(test)]
+mod test_metrics;
 
 /// Backward-compatible re-export of HLC types.
 ///
@@ -123,7 +127,7 @@ pub use gossip::{
     ClusterEvent, ClusterMembershipQuery, GossipConfig, GossipHandle, GossipService,
     NodeCapacityReport, NodeState,
 };
-pub use hints::{HintedHandoffConfig, HintedHandoffManager};
+pub use hints::{HintDelivery, HintedHandoffConfig, HintedHandoffManager, KeyStateSource};
 pub use idempotency::IdempotencyTracker;
 pub use identity::{
     get_or_create_node_id, load_node_identity, load_or_adopt_node_id, node_identity_path, Edition,
@@ -155,7 +159,15 @@ pub use traits::{
 };
 
 // Phase 10 re-exports.
-pub use cluster_metrics::{ClusterHealthStatus, HealthLevel, NodeHealthInfo, RepairStatus};
+pub use cluster_admin::{
+    health_level, ClusterAdminService, ClusterHealthStatus, ClusterTopology, HealthLevel,
+    NodeClusterAdmin, NodeHealthInfo, NodeTopology, NoopClusterAdminService, PoolShape,
+    PoolTopology, RepairStatus, ScrubberStatus,
+};
+pub use cluster_metrics::{
+    describe_metrics, register_cluster_metrics, CatalogEntry, CatalogLabel, MemberStatus,
+    MetricKind, MetricScope, PeerNames, PoolRoster, DURATION_BUCKETS_SECONDS, METRIC_CATALOG,
+};
 pub use lifecycle::{
     graceful_shutdown, InFlightGuard, NodeLifecycle, DEFAULT_DRAIN_TIMEOUT,
     GOSSIP_PROPAGATION_DELAY,

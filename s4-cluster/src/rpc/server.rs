@@ -627,19 +627,7 @@ impl s4_node_server::S4Node for NodeRpcServer {
             .map_err(cluster_error_to_status)?;
 
         let record = object_stream.record.clone();
-        let hlc = if record.hlc_timestamp > 0 {
-            crate::hlc::HlcTimestamp {
-                wall_time: record.hlc_timestamp,
-                logical: record.hlc_logical,
-                node_id: record.origin_node_id,
-            }
-        } else {
-            crate::hlc::HlcTimestamp {
-                wall_time: record.modified_at / 1_000_000,
-                logical: 0,
-                node_id: self.node_id.0,
-            }
-        };
+        let hlc = crate::hlc::HlcTimestamp::of_record(&record);
         let header = proto::ReadBlobChunk {
             payload: Some(proto::read_blob_chunk::Payload::Header(
                 proto::ReadBlobHeader {

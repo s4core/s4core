@@ -19,7 +19,7 @@
 //!
 //! 1. Stop accepting new coordinated requests
 //! 2. Wait for in-flight operations to complete (with timeout)
-//! 3. Flush pending hinted handoff hints
+//! 3. Leave pending hints on disk: they are delivered after the restart
 //! 4. Broadcast `NodeStatus::Left` via gossip
 //! 5. Wait for gossip propagation
 //! 6. Close gRPC connections
@@ -195,8 +195,10 @@ pub async fn graceful_shutdown(
         );
     }
 
-    // Step 3: Flush hints would happen here (via HintedHandoffManager)
-    info!("Flushing pending hinted handoff hints");
+    // Step 3: Every hint is on disk once it is stored, so there is nothing to
+    // flush. Delivery stops with the other background workers, and a segment
+    // it was in the middle of is delivered whole after the restart.
+    info!("Pending hints stay on disk and are delivered after the restart");
 
     // Step 4: Broadcast NodeStatus::Left via gossip
     info!("Broadcasting NodeStatus::Left to cluster");

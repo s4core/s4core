@@ -35,6 +35,7 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::{Request, Response, Status};
 use tracing::{debug, trace, warn};
 
+use crate::cluster_metrics::{PeerCall, PeerNames, PeerOutcome};
 use crate::ec_object::{EcContentDigest, EcContentDigestPage, EcTombstoneProbe};
 use crate::error::ClusterError;
 use crate::gossip::GossipHandle;
@@ -153,6 +154,7 @@ pub struct NodeClient {
     connections: DashMap<NodeId, CachedConnection>,
     gossip: Arc<GossipHandle>,
     config: NodeClientConfig,
+    peer_names: Arc<PeerNames>,
 }
 
 /// A pooled connection, together with the address it was opened to.
@@ -176,6 +178,48 @@ impl NodeClient {
             connections: DashMap::new(),
             gossip,
             config,
+            peer_names: Arc::new(PeerNames::default()),
+        }
+    }
+
+    /// Label calls in metrics with these peer names.
+    ///
+    /// The names are shared rather than copied: bootstrap creates the client
+    /// before it has matched the configured pool to identities, and fills the
+    /// names in afterwards.
+    pub fn with_peer_names(mut self, peer_names: Arc<PeerNames>) -> Self {
+        self.peer_names = peer_names;
+        self
+    }
+
+    /// The `peer` label of `node_id` in metrics.
+    pub(crate) fn peer_label(&self, node_id: NodeId) -> String {
+        self.peer_names.label(node_id)
+    }
+
+    /// Opens one call to `node_id` that bypasses the retry loop.
+    ///
+    /// Skipped when `check_alive` is set and gossip holds the node dead; an
+    /// error when no connection can be had. Either way the call is recorded
+    /// here and the caller only returns the error.
+    async fn open_call(
+        &self,
+        node_id: NodeId,
+        check_alive: bool,
+    ) -> Result<(PeerCall, S4NodeClient<Channel>), ClusterError> {
+        let call = PeerCall::start(self.peer_label(node_id));
+        if check_alive {
+            if let Err(error) = self.check_node_alive(node_id) {
+                call.finish(PeerOutcome::Skipped);
+                return Err(error);
+            }
+        }
+        match self.get_or_connect(node_id).await {
+            Ok(client) => Ok((call, client)),
+            Err(error) => {
+                call.finish(PeerOutcome::Error);
+                Err(error)
+            }
         }
     }
 
@@ -396,15 +440,11 @@ impl NodeClient {
         node_id: NodeId,
         request: proto::ReadObjectHeatRequest,
     ) -> Result<proto::ReadObjectHeatResponse, ClusterError> {
-        self.check_node_alive(node_id)?;
-        let mut client = self.get_or_connect(node_id).await?;
+        let (call, mut client) = self.open_call(node_id, true).await?;
         let mut req = Request::new(request);
         req.set_timeout(self.config.request_timeout);
-        let response = client
-            .read_object_heat(req)
-            .await
-            .map_err(|e| ClusterError::Rpc(format!("read object heat from {node_id}: {e}")))?;
-        Ok(response.into_inner())
+        finish_call(call, client.read_object_heat(req).await)
+            .map_err(|e| ClusterError::Rpc(format!("read object heat from {node_id}: {e}")))
     }
 
     /// Ask one node for the EC content digests it holds locally.
@@ -438,8 +478,7 @@ impl NodeClient {
         topology_epoch: u64,
         probes: &[EcTombstoneProbe],
     ) -> Result<Vec<bool>, ClusterError> {
-        self.check_node_alive(node_id)?;
-        let mut client = self.get_or_connect(node_id).await?;
+        let (call, mut client) = self.open_call(node_id, true).await?;
         let mut req = Request::new(proto::ProbeEcTombstonesRequest {
             coordinator_id: coordinator.to_bytes().to_vec(),
             topology_epoch,
@@ -457,11 +496,8 @@ impl NodeClient {
                 .collect(),
         });
         req.set_timeout(self.config.request_timeout);
-        let response = client
-            .probe_ec_tombstones(req)
-            .await
-            .map_err(|status| tombstone_probe_error(node_id, status))?
-            .into_inner();
+        let response = finish_call(call, client.probe_ec_tombstones(req).await)
+            .map_err(|status| tombstone_probe_error(node_id, *status))?;
         if !response.success {
             return Err(ClusterError::Rpc(format!(
                 "probe EC tombstones on {node_id}: {}",
@@ -488,18 +524,14 @@ impl NodeClient {
         coordinator: NodeId,
         max_entries: usize,
     ) -> Result<EcContentDigestPage, ClusterError> {
-        self.check_node_alive(node_id)?;
-        let mut client = self.get_or_connect(node_id).await?;
+        let (call, mut client) = self.open_call(node_id, true).await?;
         let mut req = Request::new(proto::ScanEcContentDigestsRequest {
             max_entries: u32::try_from(max_entries).unwrap_or(u32::MAX),
             coordinator_id: coordinator.to_bytes().to_vec(),
         });
         req.set_timeout(self.config.request_timeout);
-        let response = client
-            .scan_ec_content_digests(req)
-            .await
-            .map_err(|e| ClusterError::Rpc(format!("scan EC content digests on {node_id}: {e}")))?
-            .into_inner();
+        let response = finish_call(call, client.scan_ec_content_digests(req).await)
+            .map_err(|e| ClusterError::Rpc(format!("scan EC content digests on {node_id}: {e}")))?;
         if !response.success {
             return Err(ClusterError::Rpc(format!(
                 "scan EC content digests on {node_id}: {}",
@@ -566,15 +598,11 @@ impl NodeClient {
         node_id: NodeId,
         stream: impl Stream<Item = proto::UploadMultipartPartReplicaChunk> + Send + 'static,
     ) -> Result<proto::UploadMultipartPartReplicaResponse, ClusterError> {
-        self.check_node_alive(node_id)?;
-        let mut client = self.get_or_connect(node_id).await?;
+        let (call, mut client) = self.open_call(node_id, true).await?;
         let mut request = Request::new(stream);
         request.set_timeout(self.config.request_timeout);
-        let response = client
-            .upload_multipart_part_replica(request)
-            .await
-            .map_err(|e| ClusterError::Rpc(format!("multipart part stream to {node_id}: {e}")))?;
-        Ok(response.into_inner())
+        finish_call(call, client.upload_multipart_part_replica(request).await)
+            .map_err(|e| ClusterError::Rpc(format!("multipart part stream to {node_id}: {e}")))
     }
 
     /// Inspect multipart session and part metadata on a specific node.
@@ -711,12 +739,9 @@ impl NodeClient {
         node_id: NodeId,
         request: proto::RepairSyncRequest,
     ) -> Result<tonic::Streaming<proto::RepairSyncResponse>, ClusterError> {
-        let mut client = self.get_or_connect(node_id).await?;
-        let response = client
-            .repair_sync(request)
-            .await
-            .map_err(|e| ClusterError::Rpc(format!("repair sync to {node_id}: {e}")))?;
-        Ok(response.into_inner())
+        let (call, mut client) = self.open_call(node_id, false).await?;
+        finish_call(call, client.repair_sync(request).await)
+            .map_err(|e| ClusterError::Rpc(format!("repair sync to {node_id}: {e}")))
     }
 
     /// Start a streaming write to a node (for objects > 8MB).
@@ -725,12 +750,9 @@ impl NodeClient {
         node_id: NodeId,
         stream: impl Stream<Item = proto::WriteBlobChunk> + Send + 'static,
     ) -> Result<proto::WriteBlobResponse, ClusterError> {
-        let mut client = self.get_or_connect(node_id).await?;
-        let response = client
-            .write_blob_stream(Request::new(stream))
-            .await
-            .map_err(|e| ClusterError::Rpc(format!("streaming write to {node_id}: {e}")))?;
-        Ok(response.into_inner())
+        let (call, mut client) = self.open_call(node_id, false).await?;
+        finish_call(call, client.write_blob_stream(Request::new(stream)).await)
+            .map_err(|e| ClusterError::Rpc(format!("streaming write to {node_id}: {e}")))
     }
 
     /// Start a streaming read from a node (for objects > 8MB).
@@ -739,12 +761,9 @@ impl NodeClient {
         node_id: NodeId,
         request: proto::ReadBlobRequest,
     ) -> Result<tonic::Streaming<proto::ReadBlobChunk>, ClusterError> {
-        let mut client = self.get_or_connect(node_id).await?;
-        let response = client
-            .read_blob_stream(request)
-            .await
-            .map_err(|e| ClusterError::Rpc(format!("streaming read from {node_id}: {e}")))?;
-        Ok(response.into_inner())
+        let (call, mut client) = self.open_call(node_id, false).await?;
+        finish_call(call, client.read_blob_stream(request).await)
+            .map_err(|e| ClusterError::Rpc(format!("streaming read from {node_id}: {e}")))
     }
 
     /// Remove a cached connection (e.g., when a node is declared dead).
@@ -794,22 +813,39 @@ impl NodeClient {
         F: Fn(S4NodeClient<Channel>) -> Fut,
         Fut: std::future::Future<Output = Result<Response<R>, Status>>,
     {
+        // One call however many attempts it takes: what the caller asked for
+        // and how it ended, not how many times the transport tried.
+        let call = PeerCall::start(self.peer_label(node_id));
+
         // Fast-fail if gossip says the node is dead.
-        self.check_node_alive(node_id).map_err(RetryFailure::Cluster)?;
+        if let Err(error) = self.check_node_alive(node_id) {
+            call.finish(PeerOutcome::Skipped);
+            return Err(RetryFailure::Cluster(error));
+        }
 
         let mut backoff = self.config.initial_backoff;
 
         for attempt in 0..=self.config.max_retries {
-            let client = self.get_or_connect(node_id).await.map_err(RetryFailure::Cluster)?;
+            let client = match self.get_or_connect(node_id).await {
+                Ok(client) => client,
+                Err(error) => {
+                    call.finish(PeerOutcome::Error);
+                    return Err(RetryFailure::Cluster(error));
+                }
+            };
 
             match make_call(client).await {
-                Ok(response) => return Ok(response.into_inner()),
+                Ok(response) => {
+                    call.finish(PeerOutcome::Ok);
+                    return Ok(response.into_inner());
+                }
                 Err(status) => {
                     if !is_retryable(&status) || attempt == self.config.max_retries {
                         // Evict bad connections on transport errors.
                         if is_connection_error(&status) {
                             self.disconnect(&node_id);
                         }
+                        call.finish(peer_outcome(&status));
                         return Err(RetryFailure::Rpc {
                             attempts: attempt + 1,
                             status: Box::new(status),
@@ -917,6 +953,15 @@ impl NodeClient {
         }
         Ok(())
     }
+
+    /// Whether gossip holds `node_id` dead or gone, so that a call to it would
+    /// be skipped without being made.
+    pub(crate) fn is_down(&self, node_id: NodeId) -> bool {
+        matches!(
+            self.gossip.peer_status(&node_id),
+            Some(NodeStatus::Dead | NodeStatus::Left)
+        )
+    }
 }
 
 /// Open a gRPC channel to one address.
@@ -996,6 +1041,33 @@ fn is_connection_error(status: &Status) -> bool {
         status.code(),
         tonic::Code::Unavailable | tonic::Code::Unknown
     )
+}
+
+/// How a call that failed with `status` is counted.
+///
+/// tonic reports its own request timeout as `Cancelled` with the message
+/// "Timeout expired"; a deadline the peer enforced is `DeadlineExceeded`.
+/// Both mean the peer did not answer in time. Anything else is an error.
+fn peer_outcome(status: &Status) -> PeerOutcome {
+    match status.code() {
+        tonic::Code::DeadlineExceeded => PeerOutcome::Timeout,
+        tonic::Code::Cancelled if status.message() == "Timeout expired" => PeerOutcome::Timeout,
+        _ => PeerOutcome::Error,
+    }
+}
+
+/// Records how a call opened with [`NodeClient::open_call`] ended.
+fn finish_call<T>(call: PeerCall, result: Result<Response<T>, Status>) -> Result<T, Box<Status>> {
+    match result {
+        Ok(response) => {
+            call.finish(PeerOutcome::Ok);
+            Ok(response.into_inner())
+        }
+        Err(status) => {
+            call.finish(peer_outcome(&status));
+            Err(Box::new(status))
+        }
+    }
 }
 
 fn tombstone_probe_error(node_id: NodeId, status: tonic::Status) -> ClusterError {
@@ -1452,5 +1524,214 @@ mod tests {
         assert_eq!(answered, node_id);
 
         server_handle.shutdown().await.unwrap();
+    }
+
+    // ---- Calls to peers, as the metrics count them ----
+
+    use crate::cluster_metrics::PeerNames;
+    use crate::test_metrics::TestMetrics;
+
+    /// A client whose gossip knows `members`, with each peer named for metrics.
+    fn named_client(
+        members: Vec<(NodeId, NodeState, &str)>,
+        config: NodeClientConfig,
+    ) -> NodeClient {
+        let names = Arc::new(PeerNames::default());
+        names.set(members.iter().map(|(id, _, name)| (*id, name.to_string())));
+        let gossip = Arc::new(GossipHandle::new_for_testing(
+            members.into_iter().map(|(id, state, _)| (id, state)).collect(),
+        ));
+        NodeClient::new(gossip, config).with_peer_names(names)
+    }
+
+    fn quick_config() -> NodeClientConfig {
+        NodeClientConfig {
+            connect_timeout: Duration::from_millis(500),
+            max_retries: 2,
+            initial_backoff: Duration::from_millis(1),
+            ..NodeClientConfig::default()
+        }
+    }
+
+    /// A port nothing listens on.
+    fn closed_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        listener.local_addr().expect("addr").port()
+    }
+
+    /// A listener that accepts connections and never says a word.
+    async fn silent_peer() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        port
+    }
+
+    const CALLS: &str = "s4_peer_requests_total";
+    const DURATION_COUNT: &str = "s4_peer_request_duration_seconds_count";
+
+    #[tokio::test]
+    async fn a_dead_peer_is_skipped_and_counted_against_that_peer_only() {
+        let metrics = TestMetrics::install();
+        let dead = NodeId::generate();
+        let alive = NodeId::generate();
+        let client = named_client(
+            vec![
+                (dead, dead_node(dead), "node-dead"),
+                (alive, test_node(alive, closed_port()), "node-alive"),
+            ],
+            quick_config(),
+        );
+
+        assert!(client.send_health(dead).await.is_err());
+
+        assert_eq!(
+            metrics.value(CALLS, &[("peer", "node-dead"), ("outcome", "skipped")]),
+            Some(1.0)
+        );
+        assert_eq!(metrics.sum(CALLS, &[("peer", "node-alive")]), 0.0);
+        // No call was made, so no time was spent on one.
+        assert_eq!(
+            metrics.value(DURATION_COUNT, &[("peer", "node-dead")]),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_is_one_error_however_many_retries() {
+        let metrics = TestMetrics::install();
+        let peer = NodeId::generate();
+        let client = named_client(
+            vec![(peer, test_node(peer, closed_port()), "node-2")],
+            quick_config(),
+        );
+
+        assert!(client.send_health(peer).await.is_err());
+
+        assert_eq!(
+            metrics.value(CALLS, &[("peer", "node-2"), ("outcome", "error")]),
+            Some(1.0)
+        );
+        assert_eq!(metrics.sum(CALLS, &[]), 1.0);
+        assert_eq!(
+            metrics.value(DURATION_COUNT, &[("peer", "node-2")]),
+            Some(1.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answered_call_is_ok_and_timed() {
+        use crate::rpc::server::{NodeRpcServer, RpcServerConfig};
+
+        let metrics = TestMetrics::install();
+        let peer = NodeId::generate();
+        let state = test_node(peer, 19180);
+        let server = NodeRpcServer::new(
+            peer,
+            Arc::new(state.meta.clone()),
+            Arc::new(GossipHandle::new_for_testing(HashMap::new())),
+        );
+        let handle = server
+            .start(RpcServerConfig {
+                bind_addr: state.meta.addr.grpc_addr,
+                ..Default::default()
+            })
+            .await
+            .expect("server starts");
+        let client = named_client(vec![(peer, state, "node-3")], quick_config());
+
+        client.send_health(peer).await.expect("health answered");
+        client.send_health(peer).await.expect("health answered");
+
+        assert_eq!(
+            metrics.value(CALLS, &[("peer", "node-3"), ("outcome", "ok")]),
+            Some(2.0)
+        );
+        assert_eq!(
+            metrics.value(DURATION_COUNT, &[("peer", "node-3")]),
+            Some(2.0)
+        );
+        handle.shutdown().await.expect("server stops");
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_takes_the_call_and_never_answers_times_out() {
+        let metrics = TestMetrics::install();
+        let peer = NodeId::generate();
+        let client = named_client(
+            vec![(peer, test_node(peer, silent_peer().await), "node-slow")],
+            NodeClientConfig {
+                request_timeout: Duration::from_millis(200),
+                ..quick_config()
+            },
+        );
+
+        assert!(client.send_health(peer).await.is_err());
+
+        assert_eq!(
+            metrics.value(CALLS, &[("peer", "node-slow"), ("outcome", "timeout")]),
+            Some(1.0),
+            "{}",
+            metrics.render()
+        );
+        assert_eq!(
+            metrics.value(DURATION_COUNT, &[("peer", "node-slow")]),
+            Some(1.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_nobody_waits_for_any_more_is_cancelled() {
+        let metrics = TestMetrics::install();
+        let peer = NodeId::generate();
+        let client = named_client(
+            vec![(peer, test_node(peer, silent_peer().await), "node-slow")],
+            quick_config(),
+        );
+
+        // The caller's own deadline, as a coordinator has around every
+        // replica call: the call is dropped while the peer still says nothing.
+        let abandoned =
+            tokio::time::timeout(Duration::from_millis(200), client.send_health(peer)).await;
+        assert!(abandoned.is_err(), "the caller gave up first");
+
+        assert_eq!(
+            metrics.value(CALLS, &[("peer", "node-slow"), ("outcome", "cancelled")]),
+            Some(1.0),
+            "{}",
+            metrics.render()
+        );
+        // A call that never ended has no duration.
+        assert_eq!(
+            metrics.value(DURATION_COUNT, &[("peer", "node-slow")]),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_outside_the_named_pool_is_labelled_by_its_identity() {
+        let metrics = TestMetrics::install();
+        let stranger = NodeId::generate();
+        let gossip =
+            GossipHandle::new_for_testing(HashMap::from([(stranger, dead_node(stranger))]));
+        let client = NodeClient::new(Arc::new(gossip), quick_config());
+
+        assert!(client.send_health(stranger).await.is_err());
+
+        assert_eq!(
+            metrics.value(
+                CALLS,
+                &[
+                    ("peer", stranger.to_string().as_str()),
+                    ("outcome", "skipped")
+                ]
+            ),
+            Some(1.0)
+        );
     }
 }

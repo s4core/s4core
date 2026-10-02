@@ -32,6 +32,7 @@ pub mod object;
 pub mod object_lock;
 pub mod select;
 pub mod stats;
+pub mod usage;
 
 pub use bucket::{
     create_bucket, delete_bucket, delete_objects, head_bucket, list_buckets, list_object_versions,
@@ -59,15 +60,32 @@ pub use object_lock::{
 };
 pub use select::{bucket_sql_query, select_object_content};
 
-/// Check if a bucket exists in standalone mode.
+/// The key of a bucket's marker in `__system__`: the bucket exists while it
+/// does.
+pub(crate) fn bucket_marker_key(bucket: &str) -> String {
+    format!("{}{}", s4_core::types::BUCKET_MARKER_KEY_PREFIX, bucket)
+}
+
+/// The `__system__` keys a bucket's configuration lives under. Deleting the
+/// bucket deletes them all, so a bucket created again under the same name
+/// starts without the old one's settings.
+pub(crate) fn bucket_config_keys(bucket: &str) -> [String; 6] {
+    [
+        format!("__s4_bucket_cors_{bucket}"),
+        format!("__s4_bucket_versioning_{bucket}"),
+        format!("__s4_bucket_lifecycle_{bucket}"),
+        format!("__s4_bucket_policy_{bucket}"),
+        format!("__s4_bucket_object_lock_{bucket}"),
+        format!("__s4_bucket_encryption_{bucket}"),
+    ]
+}
+
+/// Check that a bucket exists in standalone mode, under the storage lock the
+/// handler holds. Does nothing in cluster mode, where
+/// [`check_bucket_cluster`] runs before the lock is taken.
 ///
-/// In cluster mode (when `write_coordinator` is present), bucket markers are
-/// replicated to all nodes via the write coordinator during `CreateBucket`, and
-/// the replica write handler auto-creates markers as a defense-in-depth measure.
-/// Therefore, this check is only needed in standalone mode.
-///
-/// Returns `Some(NoSuchBucket response)` if the bucket does not exist in
-/// standalone mode, or `None` if the check passes (or cluster mode is active).
+/// Returns `Some(NoSuchBucket response)` if the bucket does not exist, or
+/// `None` if it does (or cluster mode is active).
 pub(crate) async fn check_bucket_standalone(
     state: &crate::server::AppState,
     storage: &dyn s4_core::StorageEngine,
@@ -75,13 +93,76 @@ pub(crate) async fn check_bucket_standalone(
 ) -> Option<axum::response::Response> {
     use axum::response::IntoResponse;
     if state.write_coordinator.is_some() {
-        return None; // cluster mode: bucket markers are replicated
+        return None;
     }
-    let marker_key = format!("__s4_bucket_marker_{}", bucket);
-    if storage.head_object("__system__", &marker_key).await.is_err() {
+    if storage.head_object("__system__", &bucket_marker_key(bucket)).await.is_err() {
         return Some(crate::s3::errors::S3Error::NoSuchBucket.into_response());
     }
     None
+}
+
+/// Whether a bucket exists in cluster mode, asked of a read quorum of the
+/// replicas of its marker: `Ok(true)` or `Ok(false)`, or the error when too
+/// few of them answered.
+///
+/// CreateBucket and DeleteBucket write the marker through a write quorum, and
+/// R + W > N, so a bucket created or deleted through any node is seen so
+/// through every other node at once, as S3, MinIO and Ceph RGW answer. `None`
+/// outside cluster mode.
+pub(crate) async fn bucket_in_cluster(
+    state: &crate::server::AppState,
+    bucket: &str,
+) -> Option<Result<bool, s4_cluster::ClusterError>> {
+    let read_coord = state.read_coordinator.as_ref()?;
+    Some(
+        match read_coord.head("__system__", &bucket_marker_key(bucket)).await {
+            Ok(_) => Ok(true),
+            Err(s4_cluster::ClusterError::ObjectNotFound { .. }) => Ok(false),
+            Err(e) => Err(e),
+        },
+    )
+}
+
+/// Check that a bucket exists in cluster mode, before an operation that
+/// changes or enumerates it. Does nothing in standalone mode, where
+/// [`check_bucket_standalone`] runs under the storage lock.
+///
+/// Returns `Some(NoSuchBucket)` when the bucket does not exist, and the
+/// cluster error (`503` when too few replicas answered) when the quorum cannot
+/// tell: nothing is written to a bucket no quorum vouched for.
+///
+/// Must be called without the storage lock held: the quorum read takes this
+/// node's own storage lock, and a writer queued behind a read lock held here
+/// would hold it up until the read timed out.
+pub(crate) async fn check_bucket_cluster(
+    state: &crate::server::AppState,
+    bucket: &str,
+) -> Option<axum::response::Response> {
+    use axum::response::IntoResponse;
+    match bucket_in_cluster(state, bucket).await? {
+        Ok(true) => None,
+        Ok(false) => Some(crate::s3::errors::S3Error::NoSuchBucket.into_response()),
+        Err(e) => {
+            tracing::warn!(bucket, error = %e, "bucket existence could not be confirmed");
+            Some(cluster_error_to_response(&e))
+        }
+    }
+}
+
+/// The answer to a cluster read of one object that found nothing:
+/// `NoSuchBucket` when the bucket is gone, `NoSuchKey` otherwise. The bucket
+/// is asked only on the miss, so a read that finds its object costs no second
+/// quorum read. When the quorum cannot tell whether the bucket exists, the
+/// answer is `NoSuchKey`: the object is absent either way.
+pub(crate) async fn object_not_found(
+    state: &crate::server::AppState,
+    bucket: &str,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    match bucket_in_cluster(state, bucket).await {
+        Some(Ok(false)) => crate::s3::errors::S3Error::NoSuchBucket.into_response(),
+        _ => crate::s3::errors::S3Error::NoSuchKey.into_response(),
+    }
 }
 
 /// Return true when the current request is served by an EC cluster pool.

@@ -1,3 +1,44 @@
+# v1.2.0-extended-metrics
+
+# Cluster Observability, Hint Delivery and Gossip Rejoin
+
+**Release Overview**
+Cluster nodes now report their state through Prometheus metrics and the cluster admin API. Cluster mode also gets a set of fixes: a replica that was down catches up on what it missed, a node declared dead rejoins by itself, and buckets, batch deletes and the web console cover the whole cluster instead of one node.
+
+## 📊 Observability (All Editions)
+* **Cluster metrics:** membership, quorum operations, calls between nodes, hinted handoff, read repair, anti-entropy, tombstones and disk usage. Reference and suggested alerts: `docs/06-monitoring/prometheus-metrics.md`.
+* **Build and licence metrics:** `s4_build_info{version,edition}` on every node, `s4_license_expiry_timestamp_seconds` under an Enterprise licence.
+* **Grafana dashboard:** `docs/06-monitoring/grafana/s4-cluster.json`.
+* **Cluster admin API:** `/api/admin/cluster/health`, `/cluster/topology`, `/node/health`, `/cluster/repair-status` and `/scrubber/status` report the real state of the cluster; health is `healthy`, `degraded` or `critical`.
+
+## 🐛 Bug Fixes (All Editions)
+* **HTTP metrics:** `http_requests_total` stayed at zero, `/health` checks were counted as bucket listings, and `http_request_duration_seconds` was a summary that cannot be combined across nodes.
+* **Deleted buckets kept their Object Lock and encryption settings,** and a new bucket with the same name inherited them.
+* **Hinted handoff (cluster mode):** A replica that was down now gets the writes and deletes it missed within about 30 seconds of its return. Hints used to be written for every write and never delivered.
+* **A node declared dead rejoins by itself** after a long pause or a network split, without a restart.
+* **Objects stored before a node joined the cluster:** A delete made while that node was down now reaches it when it returns; the object used to stay there, listed and answering `503`.
+* **Missing buckets in cluster mode answer `NoSuchBucket`,** as in S3. A write into a bucket that never existed, or was deleted through another node, used to succeed.
+* **DeleteObjects in cluster mode** (`aws s3 rm --recursive`, `mc rm --recursive`) removed the keys on one node only, and they came back.
+* **Web console and admin API in cluster mode:** Creating and deleting buckets, bucket statistics, browsing a bucket and the dashboard counters covered only the node that took the request; they now cover the whole cluster.
+* **A write could be lost in cluster mode** if it landed while hinted handoff or an erasure-coding move was removing an older copy of the same key.
+
+## 📚 Documentation
+* **Cluster monitoring guide:** what each metric and cluster admin route reports.
+* **Switching a single node to cluster mode** does not copy its data to the other nodes: reads of its objects answer `503`, and the objects are lost with that node. The clustering guide shows how to move the data into a new cluster through S3.
+
+## 🏗️ Build & Deployment
+* **Rust 1.99.0:** Pinned in `rust-toolchain.toml`; rustup installs it when you build from source. Docker images are built with the same release.
+
+## ⚠️ Upgrade Notes
+* **`http_request_duration_seconds` is a histogram:** Use `histogram_quantile` over `http_request_duration_seconds_bucket`; the `quantile` series are gone.
+* **`POST /api/admin/node/drain` answers `501`:** Stop a node with SIGTERM; it finishes the requests in flight.
+* **Cluster health checks:** `/api/admin/cluster/health` returns `degraded` or `critical` while a member is down, so a check that expects `healthy` fails.
+* **`NoSuchBucket` in cluster mode:** Create a bucket before writing into it. Each request into a bucket now reads the bucket through the quorum first.
+* **`/api/stats` and the admin object listing** gain a `complete` field, and `max-keys` of the admin listing is limited to 1–1000. Use `/health`, not `/api/stats`, for health checks.
+* **Hint files of earlier releases** are removed at start.
+* **Cluster protocol:** Unchanged.
+
+
 # v1.1.1-secret-files
 
 # Secrets from Files and a Safe Admin JWT Secret

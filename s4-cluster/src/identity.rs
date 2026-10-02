@@ -231,6 +231,26 @@ pub enum NodeStatus {
     Left,
 }
 
+impl NodeStatus {
+    /// Every status, in the order the metrics and the admin API list them.
+    pub const ALL: [NodeStatus; 4] = [
+        NodeStatus::Alive,
+        NodeStatus::Suspect,
+        NodeStatus::Dead,
+        NodeStatus::Left,
+    ];
+
+    /// The name of the status in the metrics and in the admin API.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            NodeStatus::Alive => "alive",
+            NodeStatus::Suspect => "suspect",
+            NodeStatus::Dead => "dead",
+            NodeStatus::Left => "left",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GossipIdentity — foca::Identity implementation
 // ---------------------------------------------------------------------------

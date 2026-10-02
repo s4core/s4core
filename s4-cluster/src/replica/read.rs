@@ -57,20 +57,7 @@ impl ReplicaReadHandler {
 
         match result {
             Ok((data, record)) => {
-                // Use stored HLC values if available, fall back to modified_at
-                let hlc = if record.hlc_timestamp > 0 {
-                    HlcTimestamp {
-                        wall_time: record.hlc_timestamp,
-                        logical: record.hlc_logical,
-                        node_id: record.origin_node_id,
-                    }
-                } else {
-                    HlcTimestamp {
-                        wall_time: record.modified_at / 1_000_000, // nanos → millis
-                        logical: 0,
-                        node_id: 0,
-                    }
-                };
+                let hlc = HlcTimestamp::of_record(&record);
 
                 debug!(
                     bucket = %request.bucket,
@@ -155,20 +142,7 @@ impl ReplicaReadHandler {
 
         match result {
             Ok(record) => {
-                // Use stored HLC values if available, fall back to modified_at
-                let hlc = if record.hlc_timestamp > 0 {
-                    HlcTimestamp {
-                        wall_time: record.hlc_timestamp,
-                        logical: record.hlc_logical,
-                        node_id: record.origin_node_id,
-                    }
-                } else {
-                    HlcTimestamp {
-                        wall_time: record.modified_at / 1_000_000, // nanos → millis
-                        logical: 0,
-                        node_id: 0,
-                    }
-                };
+                let hlc = HlcTimestamp::of_record(&record);
 
                 debug!(
                     bucket = %request.bucket,
@@ -271,19 +245,7 @@ impl ReplicaReadHandler {
                     if i == max_keys - 1 && is_truncated {
                         next_token = key.clone();
                     }
-                    let hlc = if record.hlc_timestamp > 0 {
-                        HlcTimestamp {
-                            wall_time: record.hlc_timestamp,
-                            logical: record.hlc_logical,
-                            node_id: record.origin_node_id,
-                        }
-                    } else {
-                        HlcTimestamp {
-                            wall_time: record.modified_at / 1_000_000, // nanos → millis
-                            logical: 0,
-                            node_id: 0,
-                        }
-                    };
+                    let hlc = HlcTimestamp::of_record(&record);
                     objects.push(proto::ObjectInfo {
                         key,
                         size: record.size,

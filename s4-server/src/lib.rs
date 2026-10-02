@@ -30,6 +30,9 @@ mod app;
 pub use app::App;
 pub use compaction_worker::CompactionWorker;
 pub use config::{ClusterModeConfig, Config, ServerMode};
-pub use edition::{build_cluster_services, edition_label, resolve_cluster_limits};
+pub use edition::{
+    build_cluster_services, edition_label, record_edition_metrics, resolve_cluster_limits,
+    resolve_edition, ResolvedEdition,
+};
 pub use lifecycle_worker::LifecycleWorker;
 pub use multipart_cleanup_worker::MultipartCleanupWorker;

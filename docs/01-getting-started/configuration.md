@@ -119,11 +119,11 @@ See [Clustering](../08-deployment/clustering.md) for how these fit together.
 | `S4_READ_QUORUM` | Read quorum R | `2` | `2` |
 | `S4_GC_GRACE_DAYS` | Tombstone GC grace period, in days | `7` | `7` |
 | `S4_MAX_REJOIN_DOWNTIME_DAYS` | Maximum offline days before a returning node must rebuild before it serves erasure-coded reads. Also bounds the tombstone GC grace period. See [Erasure Coding → Coming back to the pool](../04-features/erasure-coding.md#coming-back-to-the-pool) | `3` | `3` |
-| `S4_ANTI_ENTROPY_INTERVAL_SECS` | Merkle tree exchange interval, in seconds | `600` | `600` |
+| `S4_ANTI_ENTROPY_INTERVAL_SECS` | Merkle tree exchange interval, in seconds. No effect yet: the anti-entropy rounds of a replicated pool are not started | `600` | `600` |
 | `S4_SCRUBBER_FULL_SCAN_DAYS` | Full CRC32 scrub cycle, in days | `30` | `30` |
 | `S4_SCRUBBER_START_DELAY_SECS` | How long the scrubber waits after start before its first cycle. Healing a damaged blob means fetching a healthy copy from a peer, and a node that has just started has not finished hearing about its peers | `30` | `30` |
 | `S4_SCRUBBER_UNHEALED_RETRY_SECS` | How soon the scrubber runs again after a cycle that found damage it could not heal. A cycle that healed everything waits the full scan period | `300` | `300` |
-| `S4_HINT_TTL_HOURS` | Hinted handoff TTL, in hours | `3` | `3` |
+| `S4_HINT_TTL_HOURS` | How long a hint for a replica that missed a write is kept, in hours. After that only a quorum read brings the replica up to date — anti-entropy of a replicated pool is not started yet; `0` keeps no hints | `3` | `3` |
 
 ## Erasure Coding (Enterprise Edition)
 

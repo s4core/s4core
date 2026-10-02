@@ -206,8 +206,16 @@ curl -s -k "https://localhost:9000/api/admin/buckets/my-bucket/objects?max-keys=
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `prefix` | string | Filter objects by key prefix |
-| `max-keys` | integer | Maximum number of keys to return |
-| `continuation-token` | string | Pagination token from previous response |
+| `max-keys` | integer | Objects and directories per page: default 50, from 1 to 1000 |
+| `continuation-token` | string | Opaque token from the previous page's `next_continuation_token` |
+
+Keys below `prefix` that contain another `/` are grouped into a directory, listed
+once in `common_prefixes`; a page that ends with a directory continues past all
+of it. The answer is `{ "objects": [...], "common_prefixes": [...],
+"is_truncated": bool, "next_continuation_token": "...", "complete": bool }`.
+On a cluster node the bucket is listed from every node of the pool and merged by
+key, as S3 ListObjects is, and `complete` is `false` when a node did not answer;
+on a single node it is always `true`.
 
 An unknown bucket answers `404 NoSuchBucket`; an existing bucket with nothing in
 it answers `200` with an empty `objects` array.
@@ -216,12 +224,32 @@ it answers `200` with an empty `objects` array.
 
 **GET** `/api/admin/bucket-stats`
 
-Returns storage statistics for all buckets.
+Returns every bucket with its number of objects and their bytes.
 
 ```bash
 curl -s -k https://localhost:9000/api/admin/bucket-stats \
   -H "Authorization: Bearer $TOKEN"
 ```
+
+```json
+{
+  "buckets": [
+    { "name": "photos", "objects_count": 1205, "storage_used_bytes": 4823110, "created_at": 1790812345000000000 }
+  ],
+  "total_storage_bytes": 4823110,
+  "complete": true
+}
+```
+
+`storage_used_bytes` is the size of the objects as clients see them, before
+deduplication and replication; `created_at` is in nanoseconds since the epoch.
+On a cluster node the numbers are the pool's, whichever node is asked: buckets
+and objects are listed from every node of the pool and merged by key, so an
+object counts once, at the size of its newest version, wherever its copies are.
+`complete` is `false` when a node of the pool did not answer: objects only that
+node holds are then missing from the numbers. On a single node it is always
+`true`. Every bucket is listed in full, page by page, so the request takes
+longer the more objects the buckets hold.
 
 ## Error Responses
 

@@ -18,7 +18,7 @@ Thank you for your interest in contributing to S4. This guide will help you get 
 
 ### Required Tools
 
-- **Rust 1.70+** — install via [rustup](https://rustup.rs)
+- **Rust** — through [rustup](https://rustup.rs): the release is pinned in `rust-toolchain.toml`, and `rustup toolchain install` in the repository installs it
 - **Git** — version control
 - **AWS CLI** (optional) — for manual testing
 

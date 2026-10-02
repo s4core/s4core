@@ -1,6 +1,6 @@
 # Cluster Deployment
 
-> Last updated: 2026-09-26
+> Last updated: 2026-10-01
 
 This guide covers deploying S4 in distributed (cluster) mode. For architecture and internals, see [Federation](../04-features/federation.md).
 
@@ -15,6 +15,8 @@ S4 supports three operating modes controlled by `S4_MODE`:
 | `gateway` | Stateless router — no local storage, forwards requests to cluster nodes |
 
 In `single` mode, no cluster code runs. Switching to `cluster` starts gossip, gRPC, quorum coordinators, and all background cluster workers automatically.
+
+**A node that ran in `single` mode does not bring its data into a cluster.** Restarted with `S4_MODE=cluster` on the same data directory, it keeps its buckets and objects, but does not copy them to the other nodes: with the default read quorum of 2 every read of them answers `503`, and without that node they are not there at all. To move to a cluster, start the cluster empty and copy the data into it through S3, for example with `mc mirror` or `rclone sync`, then check the copy before switching clients.
 
 ## Prerequisites
 
@@ -51,9 +53,11 @@ instead, through its `_FILE` form — see
 [Secrets from Files](../01-getting-started/configuration.md#secrets-from-files-_file).
 
 Start order does not matter. A node announces itself to its seeds over UDP, and
-keeps announcing for as long as it knows no peer, so a node that comes up before
-its seeds still joins once they are listening. This makes starting a whole
-cluster at once, and rolling restarts, safe to do without staggering.
+keeps announcing every second to each seed it does not see alive, so a node that
+comes up before its seeds still joins once they are listening. This makes
+starting a whole cluster at once, and rolling restarts, safe to do without
+staggering. The same announcements end a network split: once the network heals,
+the two sides find each other again within seconds, without a restart.
 
 ### Bare Metal / VM
 
@@ -252,9 +256,9 @@ server {
 | `S4_MAX_REJOIN_DOWNTIME_DAYS` | `3` | Lower bound on `S4_GC_GRACE_DAYS`; see [Long Downtime](#long-downtime--s4_max_rejoin_downtime_days) |
 | `S4_EXPECTED_NODE_IDENTITY` | unset | Identity (UUID) this data directory must belong to; node replacement tool |
 | `S4_NODE_IDENTITY_CONFLICT_CHECK` | `true` | Refuse the start when a live pool member already answers for this node's identity |
-| `S4_ANTI_ENTROPY_INTERVAL_SECS` | `600` | Merkle tree sync interval (seconds) |
+| `S4_ANTI_ENTROPY_INTERVAL_SECS` | `600` | Merkle tree sync interval (seconds); no effect yet, the rounds are not started |
 | `S4_SCRUBBER_FULL_SCAN_DAYS` | `30` | Full CRC32 integrity scan cycle (days) |
-| `S4_HINT_TTL_HOURS` | `3` | Hinted handoff TTL for offline replicas |
+| `S4_HINT_TTL_HOURS` | `3` | How long a hint for a replica that missed a write is kept; `0` keeps none |
 
 ## Gateway Mode
 
@@ -311,21 +315,127 @@ curl -H "Authorization: Bearer $TOKEN" http://any-node:9000/api/admin/node/healt
 # Cluster topology (pools, nodes, assignments)
 curl -H "Authorization: Bearer $TOKEN" http://any-node:9000/api/admin/cluster/topology
 
-# Repair status (anti-entropy progress)
+# Repair status (anti-entropy and tombstone GC)
 curl -H "Authorization: Bearer $TOKEN" http://any-node:9000/api/admin/cluster/repair-status
+
+# Background scrubber of this node
+curl -H "Authorization: Bearer $TOKEN" http://any-node:9000/api/admin/scrubber/status
+```
+
+Each answer is the view of the node asked, read from the same state its metrics are written
+from, so it matches a scrape of that node's `/metrics` (see [Key Metrics](#key-metrics)). The
+answers below are node-2's in the three-node example above with node-3 stopped, and its scrubber's
+after the first full scan. A single node answers these routes with fixed values: one healthy node,
+no pools, `"cluster_mode": false`.
+
+`cluster/health` counts the members of `S4_POOL_NODES` by status — the node asked is alive, a
+member it has never heard from is dead — and sets `status`. `healthy`: every member is alive.
+`degraded`: some are not, but no more than RF − max(W, R) of them, so every key still has enough
+live replicas for both quorums. `critical`: more are down, and writes or reads of some keys fail.
+In a pool larger than RF this is the worst case, because the members that are down may hold
+replicas of the same keys. An erasure-coded pool (Enterprise) is counted by the same rule: its
+objects below `S4_EC_MIN_OBJECT_SIZE` are replicated with RF, W and R, and with the default
+quorums every built-in profile survives the one loss the rule allows. A custom profile or quorum
+under which the erasure set survives fewer losses than RF − max(W, R) is not reflected in `status`;
+see the losses each profile survives in
+[Erasure Coding](../04-features/erasure-coding.md).
+
+```json
+{
+  "status": "degraded",
+  "nodes_total": 3, "nodes_alive": 2, "nodes_suspect": 0, "nodes_dead": 1, "nodes_left": 0,
+  "epoch": 1, "protocol_version": 3, "s4_version": "1.1.1",
+  "pool": "pool-1", "replication_factor": 3, "write_quorum": 2, "read_quorum": 2
+}
+```
+
+`cluster/topology` lists the pool and every configured member with its status and the addresses
+and version it last announced. A member the node has never heard from has only its name, its
+identity and `dead`.
+
+```json
+{
+  "mode": "cluster", "epoch": 1,
+  "pools": [{
+    "pool_id": 0, "name": "pool-1", "storage_class": "standard",
+    "replication_factor": 3, "write_quorum": 2, "read_quorum": 2,
+    "nodes": [
+      {"name": "node-1", "node_id": "ea526217-3b53-4b73-9037-742e4bd8d024", "status": "alive",
+       "local": false, "grpc_addr": "10.0.1.1:9100", "http_addr": "10.0.1.1:9000",
+       "protocol_version": 3, "s4_version": "1.1.1"},
+      {"name": "node-2", "node_id": "1c4f41b1-1d79-4c32-b70c-248d7d338635", "status": "alive",
+       "local": true, "grpc_addr": "10.0.1.2:9100", "http_addr": "10.0.1.2:9000",
+       "protocol_version": 3, "s4_version": "1.1.1"},
+      {"name": "node-3", "node_id": "0299dbf8-bd57-43f7-91c3-6fc5bb458476", "status": "dead",
+       "local": false, "grpc_addr": "10.0.1.3:9100", "http_addr": "10.0.1.3:9000",
+       "protocol_version": 3, "s4_version": "1.1.1"}
+    ]
+  }]
+}
+```
+
+`node/health` is the node asked: its identity (the `node_id` file in its data directory), the name
+it announces, its pool, addresses, version and uptime.
+
+```json
+{
+  "cluster_mode": true, "uptime_secs": 26,
+  "node": {
+    "node_id": "1c4f41b1-1d79-4c32-b70c-248d7d338635", "node_name": "node-2", "status": "alive",
+    "pool_id": 0, "pool": "pool-1", "grpc_addr": "10.0.1.2:9100", "http_addr": "10.0.1.2:9000",
+    "protocol_version": 3, "s4_version": "1.1.1"
+  }
+}
+```
+
+`cluster/repair-status` counts, since the node started, anti-entropy rounds, the keys they found
+behind on this node (`divergent_keys`), repaired (`total_repairs`) and failed to repair, the time
+of the last repair, the repair frontier lag, and the tombstones GC holds and purged. The rounds of
+a replicated pool are not started yet, so on a replicated pool these stay at zero.
+
+```json
+{
+  "rounds_completed": 0, "divergent_keys": 0, "total_repairs": 0, "repairs_failed": 0,
+  "last_repair": null, "repair_frontier_lag_secs": 0.0,
+  "tombstones_active": 0, "tombstones_purged": 0
+}
+```
+
+`scrubber/status` counts the blobs the background scrubber checked, the damage it found and
+healed, and how far its current scan has got. Objects under 4 KiB are stored in the index rather
+than in a volume, and the scrubber does not check them.
+
+```json
+{
+  "mode": "cluster", "background_scrubber": true,
+  "message": "The background scrubber verifies every blob of this node against its CRC32 and heals a corrupted one from a replica. POST /api/admin/scrubber/run checks every volume now.",
+  "scan_progress": 1.0, "scan_progress_pct": 100, "cycles_completed": 1,
+  "last_full_scan_timestamp": 1790848867, "volumes_scanned_total": 1,
+  "blobs_scanned_total": 12, "bytes_scanned_total": 66120,
+  "corruptions_found_total": 0, "corruptions_healed_total": 0, "corruptions_unrecoverable_total": 0
+}
 ```
 
 ### Key Metrics
 
-In cluster mode, S4 exposes additional Prometheus metrics:
+Scrape every node: each exports its own `/metrics`, and every number there is that node's view.
+The metrics, their labels and what a change in each means are listed in
+[Prometheus Metrics → Cluster](../06-monitoring/prometheus-metrics.md#cluster), with the queries
+worth an alert. A Grafana dashboard for a cluster ships with the documentation:
+[`s4-cluster.json`](../06-monitoring/grafana/s4-cluster.json).
 
-- `s4_cluster_nodes_alive` — number of alive nodes
-- `s4_cluster_quorum_writes_total` — total quorum write operations
-- `s4_cluster_quorum_reads_total` — total quorum read operations
-- `s4_cluster_hints_pending` — pending hinted handoff entries
-- `s4_cluster_blobs_scanned_total` — scrubber progress
-- `s4_cluster_corruptions_found_total` — bit rot detections
-- `s4_cluster_corruptions_healed_total` — auto-healed corruptions
+The ones to watch first:
+
+- `s4_cluster_nodes{status!="alive"}` and `s4_cluster_peer_up` — who each node holds down. A peer
+  down on every node is down; down on one node only, the network between the two is.
+- `s4_quorum_operations_total{outcome="quorum_not_met"}` — operations that failed because too
+  few replicas answered.
+- `s4_peer_requests_total` by `peer` — failures and timeouts that pile up on one peer point at the
+  node that holds the cluster back.
+- `s4_hints_pending` and `s4_hints_dropped_total` — writes a replica missed, waiting for it or
+  never to reach it through hinted handoff.
+- `s4_node_disk_used_bytes` and `s4_node_disk_total_bytes` — the filesystem under each data
+  directory.
 
 ## Node Recovery
 
@@ -333,8 +443,12 @@ In cluster mode, S4 exposes additional Prometheus metrics:
 
 When a node comes back online after a short outage:
 1. Gossip automatically detects the node is alive
-2. Pending hints are delivered from other nodes
-3. Anti-entropy repairs any remaining divergences
+2. The other nodes deliver the hints they stored for it within 30 seconds; a hint whose key has
+   another replica down waits until that replica is back too (see
+   [Hinted Handoff](../04-features/federation.md#hinted-handoff))
+3. What the hints did not cover — hints that expired or were dropped, including the `ambiguous`
+   ones whose copy may have missed a delete — stays behind until a quorum read repairs it:
+   anti-entropy of a replicated pool is not started yet
 
 No manual intervention needed.
 
@@ -391,16 +505,17 @@ off.
 
 ## Graceful Shutdown
 
-S4 performs a graceful shutdown sequence in cluster mode:
+On `SIGTERM` or `Ctrl+C` a node:
 
-1. Stops accepting new coordinated requests
-2. Waits for in-flight operations (timeout: 30s)
-3. Flushes pending hints to disk
-4. Broadcasts `Left` status via gossip
-5. Shuts down gRPC server
-6. Syncs metadata, closes volumes, exits
+1. Stops accepting connections and finishes the HTTP requests in flight
+2. Syncs metadata, closes volumes and exits
 
-Use `SIGTERM` or `Ctrl+C` to trigger graceful shutdown.
+It does not announce that it is leaving. Its peers find out through gossip, as they would after
+a crash: they mark it dead once gossip has suspected it for 5 seconds, and store a hint for each
+write it misses.
+
+`POST /api/admin/node/drain` is not implemented and answers `501`: stopping the node with
+`SIGTERM` is the drain.
 
 ## CE vs EE Limits
 

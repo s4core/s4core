@@ -6,7 +6,7 @@ S4 can be installed from source or run via Docker.
 
 ### Prerequisites
 
-- Rust 1.70 or later
+- Rust through [rustup](https://rustup.rs): the release is pinned in `rust-toolchain.toml`, and `rustup toolchain install` in the repository installs it
 - Linux (recommended) or macOS
 
 ### Build Steps

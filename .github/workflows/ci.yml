@@ -25,9 +25,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler nasm
 
       - name: Install Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+        # The release, with rustfmt and clippy, comes from rust-toolchain.toml.
+        run: rustup toolchain install
 
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
@@ -39,7 +38,10 @@ jobs:
           else
             BRANCH="$(echo "${GITHUB_REF_NAME}" | tr '/' '-')"
             SHORT_SHA="$(echo "${GITHUB_SHA}" | cut -c1-7)"
-            VERSION="0.0.0-${BRANCH}.${SHORT_SHA}"
+            # `sha-` keeps the identifier alphanumeric. A short SHA made of
+            # digits only and starting with 0 (0419239) is a numeric semver
+            # identifier with a leading zero, which cargo rejects.
+            VERSION="0.0.0-${BRANCH}.sha-${SHORT_SHA}"
           fi
           echo "Setting version to ${VERSION}"
           sed -i "s|^version = \"0.0.1\"|version = \"${VERSION}\"|" Cargo.toml

@@ -105,6 +105,8 @@ pub struct App {
     /// Edition-derived cluster limits (CE or EE).
     #[allow(dead_code)]
     cluster_limits: ClusterLimits,
+    /// The edition as resolved at start, reported in the metrics.
+    edition: edition::ResolvedEdition,
     /// Trait-object DI container for edition-dependent services.
     #[allow(dead_code)]
     cluster_services: ClusterServices,
@@ -156,7 +158,8 @@ impl App {
         }
 
         // Resolve CE/EE edition limits and services
-        let cluster_limits = edition::resolve_cluster_limits();
+        let resolved_edition = edition::resolve_edition();
+        let cluster_limits = resolved_edition.limits.clone();
         let cluster_services = edition::build_cluster_services(&cluster_limits);
 
         // Create lifecycle tracker
@@ -189,6 +192,7 @@ impl App {
             config,
             storage,
             cluster_limits,
+            edition: resolved_edition,
             cluster_services,
             node_lifecycle,
             jwt_secret,
@@ -233,10 +237,11 @@ impl App {
 
         // Initialize Prometheus metrics recorder if enabled
         let prometheus_handle = if self.config.metrics.prometheus_enabled {
-            use metrics_exporter_prometheus::PrometheusBuilder;
-            match PrometheusBuilder::new().install_recorder() {
+            match s4_api::prometheus::builder().and_then(|builder| builder.install_recorder()) {
                 Ok(handle) => {
                     info!("Prometheus metrics enabled (available at /metrics)");
+                    s4_cluster::describe_metrics();
+                    edition::record_edition_metrics(&self.edition);
                     Some(handle)
                 }
                 Err(e) => {
@@ -305,6 +310,7 @@ impl App {
             if let Some(ec_object_runtime) = cs.ec_object_runtime.clone() {
                 state = state.with_ec_object_runtime(ec_object_runtime);
             }
+            state = state.with_cluster_admin_service(cs.cluster_admin_service.clone());
 
             Some(cs)
         } else {

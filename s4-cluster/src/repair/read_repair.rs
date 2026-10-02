@@ -31,6 +31,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
+use crate::cluster_metrics::record_read_repair;
 use crate::identity::NodeId;
 use crate::rpc::proto;
 use crate::rpc::NodeClient;
@@ -111,6 +112,8 @@ impl ReadRepairService {
         self.repairs_initiated.fetch_add(1, Ordering::Relaxed);
 
         if let Err(mpsc::error::TrySendError::Full(_)) = self.repair_tx.try_send(task) {
+            // The stale replica stays stale: a repair that never ran failed.
+            record_read_repair(false);
             warn!("read repair queue full, dropping repair task");
         }
     }
@@ -161,6 +164,7 @@ impl ReadRepairService {
             match rpc_client.send_write(target, request).await {
                 Ok(resp) if resp.success => {
                     completed.fetch_add(1, Ordering::Relaxed);
+                    record_read_repair(true);
                     debug!(
                         target_node = %target,
                         bucket = %bucket,
@@ -170,6 +174,7 @@ impl ReadRepairService {
                 }
                 Ok(resp) => {
                     failed.fetch_add(1, Ordering::Relaxed);
+                    record_read_repair(false);
                     warn!(
                         target_node = %target,
                         bucket = %bucket,
@@ -180,6 +185,7 @@ impl ReadRepairService {
                 }
                 Err(e) => {
                     failed.fetch_add(1, Ordering::Relaxed);
+                    record_read_repair(false);
                     error!(
                         target_node = %target,
                         bucket = %bucket,
@@ -255,5 +261,115 @@ mod tests {
         });
 
         assert_eq!(service.repairs_initiated(), 1);
+    }
+
+    fn repair_task(target: NodeId) -> RepairTask {
+        RepairTask {
+            target_node: target,
+            bucket: "bucket".into(),
+            key: "stale.txt".into(),
+            data: b"latest".to_vec(),
+            content_hash: vec![0u8; 32],
+            content_type: "text/plain".into(),
+            metadata: Default::default(),
+            hlc: crate::hlc::HlcTimestamp::from_record(20, 0, 1).to_proto(),
+            version_id: None,
+            topology_epoch: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repair_that_lands_is_ok_and_one_that_cannot_reach_its_replica_failed() {
+        use crate::gossip::{GossipHandle, NodeState};
+        use crate::identity::{Edition, NodeAddr, NodeCapacity, NodeMeta, NodeStatus, PoolId};
+        use crate::replica::ReplicaWriteHandler;
+        use crate::rpc::server::{NodeRpcServer, RpcServerConfig};
+        use crate::rpc::NodeClientConfig;
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+
+        let metrics = crate::test_metrics::TestMetrics::install();
+        let state = |node_id: NodeId, port: u16, status: NodeStatus| NodeState {
+            meta: NodeMeta {
+                node_id,
+                node_name: "replica".into(),
+                addr: NodeAddr {
+                    grpc_addr: format!("127.0.0.1:{port}").parse().unwrap(),
+                    http_addr: "127.0.0.1:9000".parse().unwrap(),
+                    gossip_addr: "127.0.0.1:9200".parse().unwrap(),
+                },
+                pool_id: PoolId::new(1),
+                topology_epoch: 1,
+                protocol_version: 1,
+                capacity: NodeCapacity::default(),
+                started_at: 0,
+                s4_version: "0.1.0".into(),
+                edition: Edition::Community,
+            },
+            status,
+            last_seen: Instant::now(),
+        };
+
+        // A replica that takes the repair write into real storage.
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            s4_core::storage::BitcaskStorageEngine::new(
+                tmp.path().join("volumes"),
+                tmp.path().join("metadata"),
+                10 * 1024 * 1024,
+                4096,
+                false,
+            )
+            .await
+            .unwrap(),
+        );
+        let replica = NodeId::generate();
+        let replica_state = state(replica, 19182, NodeStatus::Alive);
+        let server = NodeRpcServer::new(
+            replica,
+            Arc::new(replica_state.meta.clone()),
+            Arc::new(GossipHandle::new_for_testing(HashMap::new())),
+        )
+        .with_replica_handler(Arc::new(ReplicaWriteHandler::new(
+            storage,
+            Arc::new(crate::idempotency::IdempotencyTracker::new()),
+            1,
+        )));
+        let handle = server
+            .start(RpcServerConfig {
+                bind_addr: replica_state.meta.addr.grpc_addr,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let gone = NodeId::generate();
+        let gossip = GossipHandle::new_for_testing(HashMap::from([
+            (replica, replica_state),
+            (gone, state(gone, 19183, NodeStatus::Dead)),
+        ]));
+        let client = Arc::new(NodeClient::new(
+            Arc::new(gossip),
+            NodeClientConfig::default(),
+        ));
+        let service = ReadRepairService::start_with_capacity(client, 8);
+
+        service.submit(repair_task(replica));
+        service.submit(repair_task(gone));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while service.repairs_completed() + service.repairs_failed() < 2 {
+            assert!(Instant::now() < deadline, "repairs did not finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let repairs = "s4_read_repairs_total";
+        assert_eq!(
+            metrics.value(repairs, &[("outcome", "ok")]),
+            Some(1.0),
+            "{}",
+            metrics.render()
+        );
+        assert_eq!(metrics.value(repairs, &[("outcome", "failed")]), Some(1.0));
+        handle.shutdown().await.unwrap();
     }
 }

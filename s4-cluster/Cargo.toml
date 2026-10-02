@@ -76,6 +76,7 @@ s4-core = { path = "../s4-core" }
 tonic-build = "0.12"
 
 [dev-dependencies]
+metrics-exporter-prometheus = { workspace = true }
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util", "macros"] }
 

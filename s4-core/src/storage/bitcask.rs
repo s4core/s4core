@@ -428,11 +428,7 @@ impl BitcaskStorageEngine {
             storage_used_bytes += record.size;
         }
 
-        let dedup = self.deduplicator.clone();
-        let (dedup_unique_blobs, dedup_total_references) =
-            tokio::task::spawn_blocking(move || dedup.stats())
-                .await
-                .map_err(|e| StorageError::Database(e.to_string()))??;
+        let (dedup_unique_blobs, dedup_total_references) = self.dedup_stats().await?;
 
         Ok(StorageStats {
             buckets_count,
@@ -441,6 +437,16 @@ impl BitcaskStorageEngine {
             dedup_unique_blobs,
             dedup_total_references,
         })
+    }
+
+    /// The deduplicator's unique blobs and the references to them, without
+    /// counting the objects: what a cluster node reports of its own storage
+    /// next to the pool's object numbers.
+    pub async fn dedup_stats(&self) -> Result<(u64, u64), StorageError> {
+        let dedup = self.deduplicator.clone();
+        tokio::task::spawn_blocking(move || dedup.stats())
+            .await
+            .map_err(|e| StorageError::Database(e.to_string()))?
     }
 
     // ========================================================================
@@ -4816,6 +4822,43 @@ mod tests {
 
         let result = engine.get_object("bucket", "key").await;
         assert!(result.is_err());
+    }
+
+    /// Hint delivery removes a record stored without an HLC by a delete on
+    /// the zero HLC. That delete must match only such a record: one written
+    /// meanwhile through a coordinator carries an HLC and stays.
+    #[tokio::test]
+    async fn a_delete_on_the_zero_hlc_matches_only_a_record_without_one() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = BitcaskStorageEngine::new(
+            temp_dir.path().join("volumes"),
+            temp_dir.path().join("metadata_db"),
+            1024 * 1024,
+            4096,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut with_hlc = HashMap::new();
+        with_hlc.insert("_s4_hlc_wall".to_string(), "10".to_string());
+        with_hlc.insert("_s4_hlc_logical".to_string(), "0".to_string());
+        with_hlc.insert("_s4_hlc_node_id".to_string(), "1".to_string());
+        engine
+            .put_object("bucket", "ordered", b"a", "text/plain", &with_hlc)
+            .await
+            .unwrap();
+        engine
+            .put_object("bucket", "plain", b"b", "text/plain", &HashMap::new())
+            .await
+            .unwrap();
+
+        assert!(!engine.delete_object_if_hlc("bucket", "ordered", 0, 0, 0).await.unwrap());
+        assert!(engine.head_object("bucket", "ordered").await.is_ok());
+        assert!(engine.delete_object_if_hlc("bucket", "plain", 0, 0, 0).await.unwrap());
+        assert!(matches!(
+            engine.head_object("bucket", "plain").await,
+            Err(StorageError::ObjectNotFound { .. })
+        ));
     }
 
     #[tokio::test]

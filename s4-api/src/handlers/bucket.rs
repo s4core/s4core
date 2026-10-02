@@ -165,165 +165,60 @@ pub async fn create_bucket(
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
 
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-    let mut bucket_meta = std::collections::HashMap::new();
-    bucket_meta.insert(
-        s4_core::types::S4_STORAGE_CLASS_METADATA_KEY.to_string(),
-        state.default_bucket_storage_class.as_metadata_value().to_string(),
-    );
-    let empty_meta = std::collections::HashMap::new();
+    if let Err(e) = create_bucket_marker(&state, &bucket).await {
+        return bucket_change_error_response(e);
+    }
 
-    // ── Cluster mode: replicate bucket metadata via quorum write ──
-    if let Some(ref write_coord) = state.write_coordinator {
-        // Check existence via quorum read for cluster-wide consistency
-        if let Some(ref read_coord) = state.read_coordinator {
-            match read_coord.head("__system__", &bucket_marker_key).await {
-                Ok(_) => return S3Error::BucketAlreadyExists.into_response(),
-                Err(s4_cluster::ClusterError::ObjectNotFound { .. }) => { /* proceed */ }
-                Err(e) => {
-                    error!("Cluster head check for bucket marker failed: {:?}", e);
+    // If Object Lock was requested, versioning and the lock configuration
+    // follow the marker. These writes are not atomic with it: if one fails,
+    // the bucket exists without them, the client gets the error and can retry
+    // the configuration, as S3's eventual consistency for bucket configuration
+    // allows.
+    if object_lock_enabled {
+        info!(
+            "Enabling Object Lock (with versioning) on bucket: {}",
+            bucket
+        );
+        let lock_xml = object_lock_to_xml(&ObjectLockConfiguration {
+            object_lock_enabled: true,
+            default_retention: None,
+        });
+        let configs = [
+            (
+                format!("__s4_bucket_versioning_{}", bucket),
+                b"Enabled".to_vec(),
+                "text/plain",
+            ),
+            (
+                format!("__s4_bucket_object_lock_{}", bucket),
+                lock_xml.into_bytes(),
+                "application/xml",
+            ),
+        ];
+        let empty_meta = std::collections::HashMap::new();
+        for (key, value, content_type) in &configs {
+            if let Some(ref write_coord) = state.write_coordinator {
+                if let Err(e) =
+                    write_coord.write("__system__", key, value, content_type, &empty_meta).await
+                {
+                    error!("Failed to replicate {}: {:?}", key, e);
                     return super::cluster_error_to_response(&e);
+                }
+            } else {
+                let storage = state.storage.read().await;
+                if let Err(e) =
+                    storage.put_object("__system__", key, value, content_type, &empty_meta).await
+                {
+                    error!("Failed to write {}: {:?}", key, e);
+                    return S3Error::InternalError("Failed to enable Object Lock".to_string())
+                        .into_response();
                 }
             }
         }
-
-        // Write bucket marker to W replicas
-        if let Err(e) = write_coord
-            .write(
-                "__system__",
-                &bucket_marker_key,
-                b"1",
-                "application/octet-stream",
-                &bucket_meta,
-            )
-            .await
-        {
-            error!("Failed to replicate bucket marker: {:?}", e);
-            return super::cluster_error_to_response(&e);
-        }
-
-        // If Object Lock requested, replicate versioning + lock config.
-        // NOTE: These writes are not atomic with the marker write above.
-        // If a config write fails, the bucket marker already exists on replicas.
-        // This mirrors S3's eventual consistency for bucket configuration and is
-        // acceptable: the client receives an error and can retry the configuration.
-        if object_lock_enabled {
-            info!(
-                "Enabling Object Lock (with versioning) on bucket: {}",
-                bucket
-            );
-
-            let versioning_key = format!("__s4_bucket_versioning_{}", bucket);
-            if let Err(e) = write_coord
-                .write(
-                    "__system__",
-                    &versioning_key,
-                    b"Enabled",
-                    "text/plain",
-                    &empty_meta,
-                )
-                .await
-            {
-                error!("Failed to replicate versioning config: {:?}", e);
-                return super::cluster_error_to_response(&e);
-            }
-
-            let lock_config = ObjectLockConfiguration {
-                object_lock_enabled: true,
-                default_retention: None,
-            };
-            let lock_key = format!("__s4_bucket_object_lock_{}", bucket);
-            let lock_xml = object_lock_to_xml(&lock_config);
-            if let Err(e) = write_coord
-                .write(
-                    "__system__",
-                    &lock_key,
-                    lock_xml.as_bytes(),
-                    "application/xml",
-                    &empty_meta,
-                )
-                .await
-            {
-                error!("Failed to replicate Object Lock config: {:?}", e);
-                return super::cluster_error_to_response(&e);
-            }
-
-            info!("Object Lock enabled on bucket: {}", bucket);
-        }
-
-        info!("Bucket created (cluster): {}", bucket);
-    } else {
-        // ── Standalone mode: local storage ──
-        let storage = state.storage.read().await;
-
-        if storage.head_object("__system__", &bucket_marker_key).await.is_ok() {
-            return S3Error::BucketAlreadyExists.into_response();
-        }
-
-        if let Err(e) = storage
-            .put_object(
-                "__system__",
-                &bucket_marker_key,
-                b"1",
-                "application/octet-stream",
-                &bucket_meta,
-            )
-            .await
-        {
-            error!("Failed to create bucket marker: {:?}", e);
-            return S3Error::InternalError("Failed to create bucket".to_string()).into_response();
-        }
-
-        if object_lock_enabled {
-            info!(
-                "Enabling Object Lock (with versioning) on bucket: {}",
-                bucket
-            );
-
-            let versioning_key = format!("__s4_bucket_versioning_{}", bucket);
-            if let Err(e) = storage
-                .put_object(
-                    "__system__",
-                    &versioning_key,
-                    b"Enabled",
-                    "text/plain",
-                    &empty_meta,
-                )
-                .await
-            {
-                error!("Failed to enable versioning for Object Lock: {:?}", e);
-                return S3Error::InternalError(
-                    "Failed to enable versioning for Object Lock".to_string(),
-                )
-                .into_response();
-            }
-
-            let lock_config = ObjectLockConfiguration {
-                object_lock_enabled: true,
-                default_retention: None,
-            };
-            let lock_key = format!("__s4_bucket_object_lock_{}", bucket);
-            let lock_xml = object_lock_to_xml(&lock_config);
-            if let Err(e) = storage
-                .put_object(
-                    "__system__",
-                    &lock_key,
-                    lock_xml.as_bytes(),
-                    "application/xml",
-                    &empty_meta,
-                )
-                .await
-            {
-                error!("Failed to enable Object Lock: {:?}", e);
-                return S3Error::InternalError("Failed to enable Object Lock".to_string())
-                    .into_response();
-            }
-
-            info!("Object Lock enabled on bucket: {}", bucket);
-        }
-
-        info!("Bucket created: {}", bucket);
+        info!("Object Lock enabled on bucket: {}", bucket);
     }
+
+    info!("Bucket created: {}", bucket);
 
     // S3 CreateBucket returns empty body with Location header
     Response::builder()
@@ -331,6 +226,254 @@ pub async fn create_bucket(
         .header(header::LOCATION, format!("/{}", bucket))
         .body(Body::empty())
         .unwrap()
+}
+
+/// Why a bucket was not created or deleted. The S3 and admin routes share
+/// [`create_bucket_marker`] and [`delete_bucket_and_contents`], so either
+/// route creates and deletes a bucket the same way, in either mode.
+#[derive(Debug)]
+pub(crate) enum BucketChangeError {
+    /// The bucket already exists.
+    AlreadyExists,
+    /// There is no such bucket.
+    NotFound,
+    /// The bucket holds objects, and they were not to be deleted.
+    NotEmpty,
+    /// A quorum operation failed.
+    Cluster(ClusterError),
+    /// Too few replicas answered to delete one of the bucket's objects.
+    Unavailable(String),
+    /// Local storage, or an object delete, failed.
+    Storage(String),
+}
+
+/// The S3 response for a bucket that was not created or deleted.
+fn bucket_change_error_response(error: BucketChangeError) -> Response {
+    match error {
+        BucketChangeError::AlreadyExists => S3Error::BucketAlreadyExists.into_response(),
+        BucketChangeError::NotFound => S3Error::NoSuchBucket.into_response(),
+        BucketChangeError::NotEmpty => S3Error::BucketNotEmpty.into_response(),
+        BucketChangeError::Cluster(e) => super::cluster_error_to_response(&e),
+        BucketChangeError::Unavailable(message) => {
+            (StatusCode::SERVICE_UNAVAILABLE, message).into_response()
+        }
+        BucketChangeError::Storage(message) => S3Error::InternalError(message).into_response(),
+    }
+}
+
+/// Creates a bucket by writing its marker: in cluster mode through the write
+/// quorum, after a read quorum found none, so that every node sees the bucket
+/// at once; in local storage otherwise.
+pub(crate) async fn create_bucket_marker(
+    state: &AppState,
+    bucket: &str,
+) -> Result<(), BucketChangeError> {
+    let marker_key = super::bucket_marker_key(bucket);
+    let mut bucket_meta = std::collections::HashMap::new();
+    bucket_meta.insert(
+        s4_core::types::S4_STORAGE_CLASS_METADATA_KEY.to_string(),
+        state.default_bucket_storage_class.as_metadata_value().to_string(),
+    );
+
+    if let Some(ref write_coord) = state.write_coordinator {
+        if let Some(ref read_coord) = state.read_coordinator {
+            match read_coord.head("__system__", &marker_key).await {
+                Ok(_) => return Err(BucketChangeError::AlreadyExists),
+                Err(ClusterError::ObjectNotFound { .. }) => {}
+                Err(e) => {
+                    error!("Cluster head check for bucket marker failed: {:?}", e);
+                    return Err(BucketChangeError::Cluster(e));
+                }
+            }
+        }
+        let written = write_coord
+            .write(
+                "__system__",
+                &marker_key,
+                b"1",
+                "application/octet-stream",
+                &bucket_meta,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                error!("Failed to replicate bucket marker: {:?}", e);
+                BucketChangeError::Cluster(e)
+            });
+        // The kept usage of the pool no longer lists every bucket.
+        state.usage_cache.invalidate().await;
+        return written;
+    }
+
+    let storage = state.storage.read().await;
+    if storage.head_object("__system__", &marker_key).await.is_ok() {
+        return Err(BucketChangeError::AlreadyExists);
+    }
+    storage
+        .put_object(
+            "__system__",
+            &marker_key,
+            b"1",
+            "application/octet-stream",
+            &bucket_meta,
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            error!("Failed to create bucket marker: {:?}", e);
+            BucketChangeError::Storage(format!("Failed to create bucket: {e}"))
+        })
+}
+
+/// Deletes a bucket: with `force` its objects first, otherwise only while it
+/// holds none; then its marker and its configuration. In cluster mode every
+/// step goes through the quorums, objects as DeleteObject deletes them, so
+/// that no node keeps what the others deleted; in local storage otherwise.
+///
+/// The marker goes before the configuration: a bucket whose configuration
+/// could not all be deleted is gone anyway, whereas the other order could
+/// leave a bucket that lost its policy and lifecycle.
+pub(crate) async fn delete_bucket_and_contents(
+    state: &AppState,
+    bucket: &str,
+    force: bool,
+) -> Result<(), BucketChangeError> {
+    let marker_key = super::bucket_marker_key(bucket);
+
+    if let Some(write_coord) = state.write_coordinator.clone() {
+        if let Some(ref read_coord) = state.read_coordinator {
+            match read_coord.head("__system__", &marker_key).await {
+                Ok(_) => {}
+                Err(ClusterError::ObjectNotFound { .. }) => {
+                    return Err(BucketChangeError::NotFound)
+                }
+                Err(e) => return Err(BucketChangeError::Cluster(e)),
+            }
+        }
+        if let Some(ref list_coord) = state.list_coordinator {
+            if force {
+                delete_all_objects_in_cluster(state, &write_coord, list_coord, bucket).await?;
+            } else {
+                match list_coord.list(bucket, "", 1, None).await {
+                    Ok(result) if !result.entries.is_empty() => {
+                        return Err(BucketChangeError::NotEmpty)
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("Failed to check bucket emptiness: {:?}", e);
+                        return Err(BucketChangeError::Cluster(e));
+                    }
+                }
+            }
+        }
+        if let Err(e) = write_coord.delete("__system__", &marker_key).await {
+            error!("Failed to replicate bucket marker deletion: {:?}", e);
+            return Err(BucketChangeError::Cluster(e));
+        }
+        for key in &super::bucket_config_keys(bucket) {
+            if let Err(e) = write_coord.delete("__system__", key).await {
+                warn!(
+                    "Bucket {} deleted, its configuration {} not: {:?}",
+                    bucket, key, e
+                );
+            }
+        }
+        // The kept usage of the pool still lists the bucket.
+        state.usage_cache.invalidate().await;
+        return Ok(());
+    }
+
+    let storage = state.storage.read().await;
+    if storage.head_object("__system__", &marker_key).await.is_err() {
+        return Err(BucketChangeError::NotFound);
+    }
+    // A failed listing must not be read as "nothing left": that would drop
+    // the bucket marker while its objects are still stored.
+    let listing_failed = |e: s4_core::StorageError| {
+        BucketChangeError::Storage(format!("Failed to list objects in '{bucket}': {e}"))
+    };
+    if force {
+        loop {
+            let objects = storage.list_objects(bucket, "", 1000).await.map_err(listing_failed)?;
+            if objects.is_empty() {
+                break;
+            }
+            for (key, _) in &objects {
+                storage.delete_object(bucket, key).await.map_err(|e| {
+                    error!(
+                        "Failed to delete object {} during force delete: {:?}",
+                        key, e
+                    );
+                    BucketChangeError::Storage(format!("Failed to delete object {key}: {e}"))
+                })?;
+            }
+        }
+    } else if !storage.list_objects(bucket, "", 1).await.map_err(listing_failed)?.is_empty() {
+        return Err(BucketChangeError::NotEmpty);
+    }
+    storage.delete_object("__system__", &marker_key).await.map_err(|e| {
+        error!("Failed to delete bucket marker: {:?}", e);
+        BucketChangeError::Storage("Failed to delete bucket".to_string())
+    })?;
+    for key in &super::bucket_config_keys(bucket) {
+        let _ = storage.delete_object("__system__", key).await;
+    }
+    Ok(())
+}
+
+/// Deletes every object of a bucket through the write quorum, page by page.
+/// A key listed again after it was deleted — a replica that has not taken the
+/// delete yet still lists it — is not deleted twice; a page made only of such
+/// keys stops the deletion rather than loop.
+async fn delete_all_objects_in_cluster(
+    state: &AppState,
+    write_coord: &s4_cluster::QuorumWriteCoordinator,
+    list_coord: &s4_cluster::DistributedListCoordinator,
+    bucket: &str,
+) -> Result<(), BucketChangeError> {
+    let mut deleted = std::collections::HashSet::new();
+    loop {
+        let page = list_coord.list(bucket, "", 1000, None).await.map_err(|e| {
+            error!(
+                "Failed to list objects of {} to delete them: {:?}",
+                bucket, e
+            );
+            BucketChangeError::Cluster(e)
+        })?;
+        if page.entries.is_empty() {
+            return Ok(());
+        }
+        let mut progressed = false;
+        for entry in page.entries {
+            if !deleted.insert(entry.key.clone()) {
+                continue;
+            }
+            progressed = true;
+            if let Err(response) =
+                super::object::delete_object_in_cluster(state, write_coord, bucket, &entry.key)
+                    .await
+            {
+                let message = format!(
+                    "Failed to delete object {} of {}: {}",
+                    entry.key,
+                    bucket,
+                    response.status()
+                );
+                error!("{}", message);
+                return Err(if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+                    BucketChangeError::Unavailable(message)
+                } else {
+                    BucketChangeError::Storage(message)
+                });
+            }
+        }
+        if !progressed {
+            return Err(BucketChangeError::Storage(format!(
+                "Objects of {bucket} are still listed after they were deleted; retry once the \
+                 replicas agree"
+            )));
+        }
+    }
 }
 
 /// Deletes a bucket.
@@ -348,82 +491,10 @@ pub async fn delete_bucket(
 ) -> impl IntoResponse {
     info!("DeleteBucket: {}", bucket);
 
-    let bucket_marker_key = format!("__s4_bucket_marker_{}", bucket);
-
-    let config_keys = [
-        format!("__s4_bucket_cors_{}", bucket),
-        format!("__s4_bucket_versioning_{}", bucket),
-        format!("__s4_bucket_lifecycle_{}", bucket),
-        format!("__s4_bucket_policy_{}", bucket),
-    ];
-
-    // ── Cluster mode: quorum-replicated bucket deletion ──
-    if let Some(ref write_coord) = state.write_coordinator {
-        // Existence check via quorum read
-        if let Some(ref read_coord) = state.read_coordinator {
-            match read_coord.head("__system__", &bucket_marker_key).await {
-                Ok(_) => { /* bucket exists, proceed */ }
-                Err(ClusterError::ObjectNotFound { .. }) => {
-                    return S3Error::NoSuchBucket.into_response();
-                }
-                Err(e) => return super::cluster_error_to_response(&e),
-            }
-        }
-
-        // Emptiness check via distributed list
-        if let Some(ref list_coord) = state.list_coordinator {
-            match list_coord.list(&bucket, "", 1, None).await {
-                Ok(result) if !result.entries.is_empty() => {
-                    return S3Error::BucketNotEmpty.into_response();
-                }
-                Ok(_) => { /* empty, proceed */ }
-                Err(e) => {
-                    error!("Failed to check bucket emptiness: {:?}", e);
-                    return super::cluster_error_to_response(&e);
-                }
-            }
-        }
-
-        // Delete bucket marker via quorum
-        if let Err(e) = write_coord.delete("__system__", &bucket_marker_key).await {
-            error!("Failed to replicate bucket marker deletion: {:?}", e);
-            return super::cluster_error_to_response(&e);
-        }
-
-        // Clean up config keys (non-fatal — orphaned keys are harmless)
-        for key in &config_keys {
-            if let Err(e) = write_coord.delete("__system__", key).await {
-                debug!("Non-fatal: failed to delete config key {}: {:?}", key, e);
-            }
-        }
-
-        info!("Bucket deleted (cluster): {}", bucket);
-    } else {
-        // ── Standalone mode: local storage ──
-        let storage = state.storage.read().await;
-
-        if storage.head_object("__system__", &bucket_marker_key).await.is_err() {
-            return S3Error::NoSuchBucket.into_response();
-        }
-
-        let objects = storage.list_objects(&bucket, "", 1).await;
-        if let Ok(list) = objects {
-            if !list.is_empty() {
-                return S3Error::BucketNotEmpty.into_response();
-            }
-        }
-
-        if let Err(e) = storage.delete_object("__system__", &bucket_marker_key).await {
-            error!("Failed to delete bucket marker: {:?}", e);
-            return S3Error::InternalError("Failed to delete bucket".to_string()).into_response();
-        }
-
-        for key in &config_keys {
-            let _ = storage.delete_object("__system__", key).await;
-        }
-
-        info!("Bucket deleted: {}", bucket);
+    if let Err(e) = delete_bucket_and_contents(&state, &bucket, false).await {
+        return bucket_change_error_response(e);
     }
+    info!("Bucket deleted: {}", bucket);
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -570,6 +641,9 @@ pub async fn list_objects(
 
     // Cluster mode: use distributed list coordinator
     if let Some(ref list_coord) = state.list_coordinator {
+        if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+            return resp;
+        }
         match list_coord.list(&bucket, &prefix, max_keys, start_after).await {
             Ok(result) => {
                 // Convert DistributedListResult entries to (key, IndexRecord) for XML rendering
@@ -904,9 +978,12 @@ pub async fn list_object_versions(
         }
     }
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -1028,9 +1105,66 @@ pub async fn delete_objects(
     };
 
     let versioning_status = get_bucket_versioning_status(&state, &bucket).await;
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
+
+    // Cluster mode: every key through the write quorum, exactly as
+    // DeleteObject deletes one. A local delete alone would leave the other
+    // replicas holding the object, and a quorum read would bring it back.
+    if let Some(write_coord) = state.write_coordinator.clone() {
+        let mut result = DeleteObjectsResult {
+            deleted: Vec::new(),
+            errors: Vec::new(),
+        };
+        for obj in request.objects {
+            if obj.version_id.is_some() {
+                result.errors.push(DeleteError {
+                    key: obj.key,
+                    version_id: obj.version_id,
+                    code: "NotImplemented".to_string(),
+                    message: "Cluster mode keeps no object versions".to_string(),
+                });
+                continue;
+            }
+            match super::object::delete_object_in_cluster(&state, &write_coord, &bucket, &obj.key)
+                .await
+            {
+                Ok(()) => result.deleted.push(DeletedObject {
+                    key: obj.key,
+                    version_id: None,
+                    delete_marker: false,
+                    delete_marker_version_id: None,
+                }),
+                Err(response) => {
+                    let (code, message) = if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+                        (
+                            "ServiceUnavailable",
+                            "The delete did not reach a write quorum",
+                        )
+                    } else {
+                        ("InternalError", "The delete failed")
+                    };
+                    result.errors.push(DeleteError {
+                        key: obj.key,
+                        version_id: None,
+                        code: code.to_string(),
+                        message: message.to_string(),
+                    });
+                }
+            }
+        }
+        let xml_response = xml::delete_objects_response(&result, request.quiet);
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/xml")
+            .body(Body::from(xml_response))
+            .unwrap();
+    }
+
     let storage = state.storage.read().await;
 
-    // Check bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }

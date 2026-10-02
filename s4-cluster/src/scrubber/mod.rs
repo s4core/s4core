@@ -820,6 +820,7 @@ mod tests {
 
     #[tokio::test]
     async fn scrub_cycle_detects_corruption_standalone() {
+        let metrics = crate::test_metrics::TestMetrics::install();
         let (_dir, index_db, volumes_dir) = setup_test_env().await;
 
         // Write a blob, then corrupt it on disk
@@ -868,6 +869,26 @@ mod tests {
         let snap = scrubber.metrics().snapshot();
         assert_eq!(snap.corruptions_found_total, 1);
         assert_eq!(snap.corruptions_unrecoverable_total, 1);
+
+        // The admin API reads the counters; the metrics must say the same.
+        for (name, counter) in [
+            ("s4_scrubber_blobs_scanned_total", snap.blobs_scanned_total),
+            (
+                "s4_scrubber_corruptions_found_total",
+                snap.corruptions_found_total,
+            ),
+        ] {
+            assert_eq!(metrics.value(name, &[]), Some(counter as f64), "{name}");
+        }
+        assert_eq!(
+            metrics.value("s4_scrubber_corruptions_healed_total", &[]),
+            None
+        );
+        assert_eq!(snap.corruptions_healed_total, 0);
+        assert_eq!(
+            metrics.value("s4_scrubber_scan_progress", &[]),
+            Some(snap.scan_progress_pct as f64 / 100.0)
+        );
     }
 
     #[tokio::test]

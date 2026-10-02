@@ -9,7 +9,9 @@
 # ============================================
 # Stage 1: Build
 # ============================================
-FROM rust:1.90-alpine AS builder
+# The same Rust release as rust-toolchain.toml, which is not copied into the
+# image: change both together.
+FROM rust:1.99.0-alpine AS builder
 
 # Install build dependencies (protobuf-dev provides protoc for gRPC codegen).
 # There is no OpenSSL here on purpose: TLS is rustls end to end, so nothing in

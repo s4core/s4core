@@ -482,3 +482,43 @@ async fn listing_an_empty_bucket_is_200_with_no_objects() {
         "an existing but empty bucket lists nothing: {json}"
     );
 }
+
+// ============================================================================
+// Cluster routes on a single node
+// ============================================================================
+
+#[tokio::test]
+async fn drain_on_a_single_node_asks_for_cluster_mode_and_starts_nothing() {
+    let (state, _temp) = state_with_users().await;
+    let token = login_token(&state, "admin", "password123").await;
+
+    let (status, json) = send(
+        &state,
+        admin_request("POST", "/api/admin/node/drain", &token, None),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body: {json}");
+    assert!(
+        json["error"].as_str().is_some_and(|m| m.contains("cluster mode")),
+        "body: {json}"
+    );
+    assert!(
+        json.get("status").is_none(),
+        "nothing was initiated: {json}"
+    );
+}
+
+#[tokio::test]
+async fn drain_needs_a_superuser() {
+    let (state, _temp) = state_with_users().await;
+    let token = login_token(&state, "viewer", "password123").await;
+
+    let (status, json) = send(
+        &state,
+        admin_request("POST", "/api/admin/node/drain", &token, None),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {json}");
+}

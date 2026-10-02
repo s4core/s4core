@@ -48,9 +48,11 @@ use tokio_stream::StreamExt;
 use tokio_util::io::StreamReader;
 use tracing::{debug, error, warn};
 
+use crate::cluster_metrics::{observe_quorum, QuorumOperation};
 use crate::config::ClusterConfig;
 use crate::conflict;
 use crate::error::ClusterError;
+use crate::hints::{KeyStateSource, NewestVersion, StoredCopy};
 use crate::hlc::{HlcTimestamp, HybridClock};
 use crate::identity::NodeId;
 use crate::placement::PlacementRouter;
@@ -296,6 +298,8 @@ pub struct QuorumReadCoordinator {
     timeouts: ReadTimeouts,
     topology_epoch: u64,
     read_quorum: u8,
+    /// Replicas a write waits for: how many copies a confirmed write leaves.
+    write_quorum: u8,
     stream_failures: StreamFailureTracker,
 }
 
@@ -322,6 +326,7 @@ impl QuorumReadCoordinator {
             timeouts,
             topology_epoch: cluster_config.epoch,
             read_quorum: cluster_config.default_read_quorum,
+            write_quorum: cluster_config.default_write_quorum,
             stream_failures: StreamFailureTracker::default(),
         }
     }
@@ -331,6 +336,10 @@ impl QuorumReadCoordinator {
     /// Uses digest-based two-phase read: first HEAD from R replicas,
     /// then full GET from the replica with the latest version.
     pub async fn read(&self, bucket: &str, key: &str) -> Result<QuorumReadResult, ClusterError> {
+        observe_quorum(QuorumOperation::Read, self.read_inner(bucket, key)).await
+    }
+
+    async fn read_inner(&self, bucket: &str, key: &str) -> Result<QuorumReadResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
         let replicas = &decision.replicas;
 
@@ -466,6 +475,19 @@ impl QuorumReadCoordinator {
         key: &str,
         range: Option<(u64, u64)>,
     ) -> Result<QuorumReadStreamResult, ClusterError> {
+        observe_quorum(
+            QuorumOperation::Read,
+            self.read_stream_inner(bucket, key, range),
+        )
+        .await
+    }
+
+    async fn read_stream_inner(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: Option<(u64, u64)>,
+    ) -> Result<QuorumReadStreamResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
         let replicas = &decision.replicas;
 
@@ -582,6 +604,10 @@ impl QuorumReadCoordinator {
 
     /// Execute a quorum HEAD (metadata only, no data transfer).
     pub async fn head(&self, bucket: &str, key: &str) -> Result<QuorumHeadResult, ClusterError> {
+        observe_quorum(QuorumOperation::Head, self.head_inner(bucket, key)).await
+    }
+
+    async fn head_inner(&self, bucket: &str, key: &str) -> Result<QuorumHeadResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
         let replicas = &decision.replicas;
 
@@ -633,19 +659,7 @@ impl QuorumReadCoordinator {
             other => ClusterError::Storage(other.to_string()),
         })?;
 
-        let hlc = if record.hlc_timestamp > 0 {
-            HlcTimestamp {
-                wall_time: record.hlc_timestamp,
-                logical: record.hlc_logical,
-                node_id: record.origin_node_id,
-            }
-        } else {
-            HlcTimestamp {
-                wall_time: record.modified_at / 1_000_000, // nanos → millis (HLC uses millis)
-                logical: 0,
-                node_id: self.local_node_id.0,
-            }
-        };
+        let hlc = HlcTimestamp::of_record(&record);
 
         debug!(
             bucket = %bucket,
@@ -681,19 +695,7 @@ impl QuorumReadCoordinator {
             other => ClusterError::Storage(other.to_string()),
         })?;
 
-        let hlc = if record.hlc_timestamp > 0 {
-            HlcTimestamp {
-                wall_time: record.hlc_timestamp,
-                logical: record.hlc_logical,
-                node_id: record.origin_node_id,
-            }
-        } else {
-            HlcTimestamp {
-                wall_time: record.modified_at / 1_000_000, // nanos → millis (HLC uses millis)
-                logical: 0,
-                node_id: self.local_node_id.0,
-            }
-        };
+        let hlc = HlcTimestamp::of_record(&record);
 
         let erasure_coded = record.is_erasure_coded();
         Ok(QuorumHeadResult {
@@ -728,90 +730,8 @@ impl QuorumReadCoordinator {
         // Own the actual replica futures. Wrapping already-spawned JoinHandles
         // would detach those tasks when this quorum read is cancelled.
         let mut set = tokio::task::JoinSet::new();
-
         for &node_id in replicas {
-            if node_id == self.local_node_id {
-                let storage = self.storage.clone();
-                let bucket = bucket.to_string();
-                let key = key.to_string();
-                let local_id = self.local_node_id;
-                let timeout_dur = self.timeouts.replica_read_timeout;
-
-                set.spawn(async move {
-                    let result =
-                        tokio::time::timeout(timeout_dur, storage.head_object(&bucket, &key)).await;
-
-                    match result {
-                        Ok(Ok(record)) => DigestResult::Success(ObjectDigest {
-                            node_id: local_id,
-                            erasure_coded: record.is_erasure_coded(),
-                            hlc: if record.hlc_timestamp > 0 {
-                                HlcTimestamp {
-                                    wall_time: record.hlc_timestamp,
-                                    logical: record.hlc_logical,
-                                    node_id: record.origin_node_id,
-                                }
-                            } else {
-                                HlcTimestamp {
-                                    wall_time: record.modified_at / 1_000_000, // nanos → millis
-                                    logical: 0,
-                                    node_id: local_id.0,
-                                }
-                            },
-                            content_hash: Some(record.content_hash),
-                            etag: record.etag,
-                            size: record.size,
-                            content_type: record.content_type,
-                            version_id: record.version_id,
-                            metadata: record.metadata,
-                        }),
-                        Ok(Err(e @ s4_core::StorageError::ObjectNotFound { .. })) => {
-                            DigestResult::NotFound(local_id, e.to_string())
-                        }
-                        Ok(Err(e)) => DigestResult::Error(local_id, e.to_string()),
-                        Err(_) => DigestResult::Timeout(local_id),
-                    }
-                });
-            } else {
-                let client = self.rpc_client.clone();
-                let request = proto::HeadObjectRequest {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                    version_id: None,
-                    topology_epoch: self.topology_epoch,
-                };
-                let timeout_dur = self.timeouts.replica_read_timeout;
-
-                set.spawn(async move {
-                    let result =
-                        tokio::time::timeout(timeout_dur, client.send_head(node_id, request)).await;
-
-                    match result {
-                        Ok(Ok(resp)) if resp.exists => {
-                            let hlc = resp
-                                .hlc
-                                .map(|h| HlcTimestamp::from_proto(&h))
-                                .unwrap_or_else(HlcTimestamp::zero);
-
-                            DigestResult::Success(ObjectDigest {
-                                node_id,
-                                hlc,
-                                etag: resp.etag,
-                                size: resp.content_length,
-                                content_type: resp.content_type,
-                                version_id: resp.version_id,
-                                erasure_coded: resp.erasure_coded,
-                                metadata: resp.metadata,
-                                content_hash: content_hash_from_bytes(&resp.content_hash),
-                            })
-                        }
-                        Ok(Ok(resp)) if resp.epoch_mismatch => DigestResult::EpochMismatch(node_id),
-                        Ok(Ok(_)) => DigestResult::NotFound(node_id, "object not found".into()),
-                        Ok(Err(e)) => DigestResult::Error(node_id, e.to_string()),
-                        Err(_) => DigestResult::Timeout(node_id),
-                    }
-                });
-            }
+            set.spawn(self.digest_task(node_id, bucket, key));
         }
 
         // Wait for R responses with timeout
@@ -905,6 +825,156 @@ impl QuorumReadCoordinator {
         }
 
         Ok(digests)
+    }
+
+    /// What replica `node_id` holds of `bucket/key`, as a task that owns
+    /// everything it needs.
+    fn digest_task(
+        &self,
+        node_id: NodeId,
+        bucket: &str,
+        key: &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DigestResult> + Send + 'static>> {
+        if node_id == self.local_node_id {
+            let storage = self.storage.clone();
+            let bucket = bucket.to_string();
+            let key = key.to_string();
+            let local_id = self.local_node_id;
+            let timeout_dur = self.timeouts.replica_read_timeout;
+
+            Box::pin(async move {
+                let result =
+                    tokio::time::timeout(timeout_dur, storage.head_object(&bucket, &key)).await;
+
+                match result {
+                    Ok(Ok(record)) => DigestResult::Success(ObjectDigest {
+                        node_id: local_id,
+                        erasure_coded: record.is_erasure_coded(),
+                        hlc: HlcTimestamp::of_record(&record),
+                        content_hash: Some(record.content_hash),
+                        etag: record.etag,
+                        size: record.size,
+                        content_type: record.content_type,
+                        version_id: record.version_id,
+                        metadata: record.metadata,
+                    }),
+                    Ok(Err(e @ s4_core::StorageError::ObjectNotFound { .. })) => {
+                        DigestResult::NotFound(local_id, e.to_string())
+                    }
+                    Ok(Err(e)) => DigestResult::Error(local_id, e.to_string()),
+                    Err(_) => DigestResult::Timeout(local_id),
+                }
+            })
+        } else {
+            let client = self.rpc_client.clone();
+            let request = proto::HeadObjectRequest {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: None,
+                topology_epoch: self.topology_epoch,
+            };
+            let timeout_dur = self.timeouts.replica_read_timeout;
+
+            Box::pin(async move {
+                let result =
+                    tokio::time::timeout(timeout_dur, client.send_head(node_id, request)).await;
+
+                match result {
+                    Ok(Ok(resp)) if resp.exists => {
+                        let hlc = resp
+                            .hlc
+                            .map(|h| HlcTimestamp::from_proto(&h))
+                            .unwrap_or_else(HlcTimestamp::zero);
+
+                        DigestResult::Success(ObjectDigest {
+                            node_id,
+                            hlc,
+                            etag: resp.etag,
+                            size: resp.content_length,
+                            content_type: resp.content_type,
+                            version_id: resp.version_id,
+                            erasure_coded: resp.erasure_coded,
+                            metadata: resp.metadata,
+                            content_hash: content_hash_from_bytes(&resp.content_hash),
+                        })
+                    }
+                    Ok(Ok(resp)) if resp.epoch_mismatch => DigestResult::EpochMismatch(node_id),
+                    Ok(Ok(_)) => DigestResult::NotFound(node_id, "object not found".into()),
+                    Ok(Err(e)) => DigestResult::Error(node_id, e.to_string()),
+                    Err(_) => DigestResult::Timeout(node_id),
+                }
+            })
+        }
+    }
+
+    /// The newest version of `bucket/key` among its replicas other than
+    /// `target`, for hint delivery.
+    ///
+    /// Unlike a quorum read it asks every one of those replicas and needs
+    /// every answer: a replica that did not answer may hold the newest
+    /// version, and taking the others for the current state would bring the
+    /// target to an older one. One that gossip holds down is not asked at all,
+    /// and makes the answer an error at once. It counts no quorum operation and
+    /// repairs nothing — deciding who is behind is the caller's job.
+    async fn newest_version_except(
+        &self,
+        bucket: &str,
+        key: &str,
+        target: NodeId,
+    ) -> Result<NewestVersion, ClusterError> {
+        let decision = self.router.route(bucket, key)?;
+        if !decision.replicas.contains(&target) || decision.replicas.len() < 2 {
+            return Ok(NewestVersion::NotAReplica);
+        }
+        let others: Vec<NodeId> =
+            decision.replicas.iter().copied().filter(|node_id| *node_id != target).collect();
+        if let Some(down) = others
+            .iter()
+            .find(|node_id| **node_id != self.local_node_id && self.rpc_client.is_down(**node_id))
+        {
+            return Err(ClusterError::Unavailable(format!("replica {down} is down")));
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for &node_id in &others {
+            set.spawn(self.digest_task(node_id, bucket, key));
+        }
+
+        let deadline = tokio::time::Instant::now() + self.timeouts.quorum_timeout;
+        let mut digests = Vec::new();
+        let mut absent = 0;
+        loop {
+            let answer = tokio::time::timeout_at(deadline, set.join_next())
+                .await
+                .map_err(|_| ClusterError::ReadTimeout(self.timeouts.quorum_timeout))?;
+            match answer {
+                None => break,
+                Some(Ok(DigestResult::Success(digest))) => digests.push(digest),
+                Some(Ok(DigestResult::NotFound(..))) => absent += 1,
+                Some(Ok(DigestResult::Timeout(node_id))) => {
+                    return Err(ClusterError::Unavailable(format!(
+                        "replica {node_id} did not answer in time"
+                    )))
+                }
+                Some(Ok(DigestResult::Error(node_id, error))) => {
+                    return Err(ClusterError::Unavailable(format!(
+                        "replica {node_id}: {error}"
+                    )))
+                }
+                Some(Ok(DigestResult::EpochMismatch(node_id))) => {
+                    return Err(ClusterError::Unavailable(format!(
+                        "replica {node_id} is on another topology epoch"
+                    )))
+                }
+                Some(Err(e)) => {
+                    return Err(ClusterError::Unavailable(format!(
+                        "digest task failed: {e}"
+                    )))
+                }
+            }
+        }
+        // A confirmed write not on the target is on this many of the others.
+        let confirming = usize::from(self.write_quorum).min(others.len());
+        Ok(newest_of(&digests, absent, confirming))
     }
 
     /// Phase 2: Fetch full object data from a specific replica.
@@ -1003,23 +1073,11 @@ impl QuorumReadCoordinator {
                 })?;
 
             return Ok(QuorumReadStreamResult {
+                hlc: HlcTimestamp::of_record(&object_stream.record),
                 body: object_stream.body,
                 etag: object_stream.record.etag,
                 content_type: object_stream.record.content_type,
                 metadata: object_stream.record.metadata,
-                hlc: if object_stream.record.hlc_timestamp > 0 {
-                    HlcTimestamp {
-                        wall_time: object_stream.record.hlc_timestamp,
-                        logical: object_stream.record.hlc_logical,
-                        node_id: object_stream.record.origin_node_id,
-                    }
-                } else {
-                    HlcTimestamp {
-                        wall_time: object_stream.record.modified_at / 1_000_000,
-                        logical: 0,
-                        node_id: self.local_node_id.0,
-                    }
-                },
                 version_id: object_stream.record.version_id,
                 total_size: object_stream.total_size,
                 content_length: object_stream.content_length,
@@ -1172,6 +1230,70 @@ fn is_integrity_error(error: &ClusterError) -> bool {
     }
 }
 
+/// The newest of `digests` by HLC, given that `absent` other replicas hold no
+/// key and that a confirmed write leaves `confirming` copies on them.
+///
+/// At a tie, one replica holding only the erasure-coded record is enough for
+/// the version to count as erasure coded: the object is being moved out of
+/// replication, and a copy is not to be spread again.
+///
+/// A copy is confirmed when no replica is absent, or when at least
+/// `confirming` replicas hold exactly it. Without tombstones an absent replica
+/// may be one that took a delete the copy missed, and only a copy on as many
+/// replicas as a confirmed write leaves is known to be newer than any delete
+/// that was confirmed.
+fn newest_of(digests: &[ObjectDigest], absent: usize, confirming: usize) -> NewestVersion {
+    let Some(newest) = digests.iter().map(|digest| digest.hlc).max() else {
+        return NewestVersion::Absent;
+    };
+    let at_newest = || digests.iter().filter(move |digest| digest.hlc == newest);
+    if at_newest().any(|digest| digest.erasure_coded) {
+        return NewestVersion::ErasureCoded { hlc: newest };
+    }
+    match at_newest().next() {
+        Some(digest) => NewestVersion::Copy {
+            hlc: newest,
+            node: digest.node_id,
+            confirmed: absent == 0 || at_newest().count() >= confirming,
+        },
+        None => NewestVersion::Absent,
+    }
+}
+
+#[async_trait::async_trait]
+impl KeyStateSource for QuorumReadCoordinator {
+    async fn newest_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        target: NodeId,
+    ) -> Result<NewestVersion, ClusterError> {
+        self.newest_version_except(bucket, key, target).await
+    }
+
+    async fn read_copy(
+        &self,
+        bucket: &str,
+        key: &str,
+        node: NodeId,
+    ) -> Result<StoredCopy, ClusterError> {
+        let (data, record) = self.fetch_full_object(bucket, key, node).await?;
+        // A record written without an HLC carries the one every node makes up
+        // for it, with node 0: read locally, from a replica's answer, or from
+        // a copy repaired from such a record. A replica that answered with no
+        // HLC at all leaves a zero one, and the copy carries none.
+        let hlc = Some(HlcTimestamp::of_record(&record)).filter(|hlc| hlc.wall_time > 0);
+        Ok(StoredCopy {
+            hlc,
+            data,
+            content_hash: record.content_hash.to_vec(),
+            content_type: record.content_type,
+            metadata: record.metadata,
+            version_id: record.version_id,
+        })
+    }
+}
+
 /// Short grace period for late digests after reaching the read quorum.
 fn digest_drain_deadline(quorum_deadline: tokio::time::Instant) -> tokio::time::Instant {
     quorum_deadline.min(tokio::time::Instant::now() + Duration::from_millis(50))
@@ -1247,6 +1369,29 @@ mod tests {
         assert_eq!(result.etag, "\"mock-etag\"");
         assert_eq!(result.size, 9);
         assert_eq!(result.replicas_responded, 1);
+    }
+
+    /// A copy whose HLC would be zero carries none: written with it, it would
+    /// pass the target's LWW unweighed. The mock's record has no HLC and was
+    /// modified within the first millisecond, as a copy built from a replica
+    /// that reported no HLC is.
+    #[tokio::test]
+    async fn a_copy_with_a_zero_hlc_carries_none() {
+        let (coordinator, _tmp) = setup_single_node();
+        let copy = coordinator.read_copy("test-bucket", "hello.txt", NodeId(1)).await.unwrap();
+        assert_eq!(copy.hlc, None);
+        assert_eq!(copy.data, b"Hello S4!");
+    }
+
+    /// The single-node paths report a record written without an HLC as every
+    /// other path does: with a made-up HLC, node 0.
+    #[tokio::test]
+    async fn single_node_reads_report_a_made_up_hlc_for_a_record_without_one() {
+        let (coordinator, _tmp) = setup_single_node();
+        let read = coordinator.read("test-bucket", "hello.txt").await.unwrap();
+        let head = coordinator.head("test-bucket", "hello.txt").await.unwrap();
+        assert!(read.hlc.is_made_up(), "{:?}", read.hlc);
+        assert!(head.hlc.is_made_up(), "{:?}", head.hlc);
     }
 
     #[tokio::test]
@@ -1703,6 +1848,652 @@ mod tests {
                 bytes_written: 0,
                 etag: "\"mock-etag\"".into(),
             })
+        }
+    }
+
+    // ---- Quorum operations, as the metrics count them ----
+
+    #[tokio::test]
+    async fn reads_and_heads_count_an_absent_object_apart_from_a_failure() {
+        let metrics = crate::test_metrics::TestMetrics::install();
+        let (coordinator, _tmp) = setup_single_node();
+        let ops = "s4_quorum_operations_total";
+
+        coordinator.read("bucket", "hello.txt").await.expect("found");
+        assert!(matches!(
+            coordinator.read("bucket", "missing.txt").await,
+            Err(ClusterError::ObjectNotFound { .. })
+        ));
+        coordinator.head("bucket", "hello.txt").await.expect("found");
+        assert!(coordinator.head("bucket", "missing.txt").await.is_err());
+
+        for operation in ["read", "head"] {
+            assert_eq!(
+                metrics.value(ops, &[("operation", operation), ("outcome", "ok")]),
+                Some(1.0)
+            );
+            assert_eq!(
+                metrics.value(ops, &[("operation", operation), ("outcome", "not_found")]),
+                Some(1.0)
+            );
+            assert_eq!(
+                metrics.value(
+                    "s4_quorum_duration_seconds_count",
+                    &[("operation", operation)]
+                ),
+                Some(2.0)
+            );
+        }
+        assert_eq!(metrics.sum(ops, &[("outcome", "error")]), 0.0);
+    }
+
+    // ---- The newest version, as hint delivery reads it ----
+
+    mod newest_version {
+        use super::*;
+        use crate::config::PoolConfig;
+        use crate::gossip::NodeState;
+        use crate::identity::{Edition, NodeAddr, NodeCapacity, NodeMeta, NodeStatus, PoolId};
+        use crate::placement::bucket_placement::BucketPlacement;
+        use crate::replica::ReplicaReadHandler;
+        use crate::rpc::server::{NodeRpcServer, RpcServerConfig, RpcServerHandle};
+        use crate::test_metrics::TestMetrics;
+        use s4_core::storage::BitcaskStorageEngine;
+        use s4_core::types::StorageClass;
+
+        const TARGET: NodeId = NodeId(3);
+
+        /// Node 1 of a three-node pool, RF=3, W=R=2, on real storage. Node 2
+        /// is a replica on real storage that answers or is held dead. Node 3
+        /// is the hint's target: held dead and never asked, or, for the tests
+        /// that deliver, a replica on real storage that takes writes.
+        struct Pool {
+            coordinator: Arc<QuorumReadCoordinator>,
+            local: Arc<BitcaskStorageEngine>,
+            node_2: Arc<BitcaskStorageEngine>,
+            /// The target's storage, when it runs.
+            target: Option<Arc<BitcaskStorageEngine>>,
+            rpc_client: Arc<NodeClient>,
+            gossip: Arc<GossipHandle>,
+            _servers: Vec<RpcServerHandle>,
+            _dirs: Vec<tempfile::TempDir>,
+        }
+
+        async fn storage() -> (Arc<BitcaskStorageEngine>, tempfile::TempDir) {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = BitcaskStorageEngine::new(
+                dir.path().join("volumes"),
+                dir.path().join("metadata"),
+                10 * 1024 * 1024,
+                4096,
+                false,
+            )
+            .await
+            .unwrap();
+            (Arc::new(storage), dir)
+        }
+
+        async fn pool(node_2_answers: bool, base_port: u16) -> Pool {
+            build_pool(node_2_answers, false, base_port).await
+        }
+
+        /// The pool with node 2 and the target both up.
+        async fn pool_with_target(base_port: u16) -> Pool {
+            build_pool(true, true, base_port).await
+        }
+
+        async fn build_pool(node_2_answers: bool, target_runs: bool, base_port: u16) -> Pool {
+            let addr = |n: u128| NodeAddr {
+                grpc_addr: format!("127.0.0.1:{}", base_port + n as u16).parse().unwrap(),
+                http_addr: format!("127.0.0.1:{}", 9000 + n).parse().unwrap(),
+                gossip_addr: format!("127.0.0.1:{}", 9200 + n).parse().unwrap(),
+            };
+            let pool_id = PoolId::new(1);
+            let config = ClusterConfig {
+                pools: vec![PoolConfig {
+                    pool_id,
+                    name: "pool-1".to_string(),
+                    nodes: (1..=3).map(addr).collect(),
+                    replication_factor: Some(3),
+                    write_quorum: Some(2),
+                    read_quorum: Some(2),
+                    storage_class: StorageClass::Standard,
+                }],
+                default_replication_factor: 3,
+                default_write_quorum: 2,
+                default_read_quorum: 2,
+                ..ClusterConfig::default()
+            };
+            let meta = |n: u128| NodeMeta {
+                node_id: NodeId(n),
+                node_name: format!("node-{n}"),
+                addr: addr(n),
+                pool_id,
+                topology_epoch: config.epoch,
+                protocol_version: crate::protocol::PROTOCOL_VERSION,
+                capacity: NodeCapacity::default(),
+                started_at: 0,
+                s4_version: "0.1.0".into(),
+                edition: Edition::Community,
+            };
+            let state = |n: u128, alive: bool| NodeState {
+                meta: meta(n),
+                status: if alive {
+                    NodeStatus::Alive
+                } else {
+                    NodeStatus::Dead
+                },
+                last_seen: std::time::Instant::now(),
+            };
+            let serve = |n: u128, storage: Arc<BitcaskStorageEngine>| {
+                NodeRpcServer::new(
+                    NodeId(n),
+                    Arc::new(meta(n)),
+                    Arc::new(GossipHandle::new_for_testing(HashMap::new())),
+                )
+                .with_replica_handler(Arc::new(crate::replica::ReplicaWriteHandler::new(
+                    storage.clone(),
+                    Arc::new(crate::idempotency::IdempotencyTracker::new()),
+                    config.epoch,
+                )))
+                .with_read_handler(Arc::new(ReplicaReadHandler::new(storage, config.epoch)))
+                .start(RpcServerConfig {
+                    bind_addr: addr(n).grpc_addr,
+                    ..Default::default()
+                })
+            };
+
+            let (local, local_dir) = storage().await;
+            let (node_2, node_2_dir) = storage().await;
+            let mut dirs = vec![local_dir, node_2_dir];
+            let mut servers = Vec::new();
+            if node_2_answers {
+                servers.push(serve(2, node_2.clone()).await.unwrap());
+            }
+            let target = if target_runs {
+                let (target, target_dir) = storage().await;
+                dirs.push(target_dir);
+                servers.push(serve(3, target.clone()).await.unwrap());
+                Some(target)
+            } else {
+                None
+            };
+
+            let members = HashMap::from([
+                (NodeId(2), state(2, node_2_answers)),
+                (TARGET, state(3, target_runs)),
+            ]);
+            let gossip = Arc::new(GossipHandle::new_for_testing(members));
+            let rpc_client = Arc::new(NodeClient::new(gossip.clone(), NodeClientConfig::default()));
+            let resolver: HashMap<_, _> = (1..=3).map(|n| (addr(n).grpc_addr, NodeId(n))).collect();
+            let placement = BucketPlacement::from_entries([("bucket".to_string(), pool_id)]);
+            let router =
+                Arc::new(PlacementRouter::new(&config, NodeId(1), placement, &resolver).unwrap());
+            let coordinator = Arc::new(QuorumReadCoordinator::new(
+                NodeId(1),
+                local.clone(),
+                rpc_client.clone(),
+                router,
+                Arc::new(HybridClock::new(NodeId(1))),
+                Arc::new(ReadRepairService::start_with_capacity(
+                    rpc_client.clone(),
+                    16,
+                )),
+                &config,
+                ReadTimeouts::default(),
+            ));
+            Pool {
+                coordinator,
+                local,
+                node_2,
+                target,
+                rpc_client,
+                gossip,
+                _servers: servers,
+                _dirs: dirs,
+            }
+        }
+
+        fn at(wall: u64) -> HlcTimestamp {
+            HlcTimestamp::from_record(wall, 0, 7)
+        }
+
+        async fn put(storage: &BitcaskStorageEngine, data: &[u8], hlc: HlcTimestamp) {
+            let metadata = HashMap::from([
+                ("_s4_hlc_wall".to_string(), hlc.wall_time.to_string()),
+                ("_s4_hlc_logical".to_string(), hlc.logical.to_string()),
+                ("_s4_hlc_node_id".to_string(), hlc.node_id.to_string()),
+                ("owner".to_string(), "test".to_string()),
+            ]);
+            storage
+                .put_object("bucket", "key", data, "text/plain", &metadata)
+                .await
+                .unwrap();
+        }
+
+        /// The newest version among the replicas other than the target, and
+        /// its copy as that replica holds it — found without a quorum
+        /// operation or a read repair being counted.
+        #[tokio::test]
+        async fn the_newest_version_is_the_newest_among_the_other_replicas() {
+            let metrics = TestMetrics::install();
+            let pool = pool(true, 19810).await;
+            put(&pool.local, b"version 10", at(10)).await;
+            put(&pool.node_2, b"version 20", at(20)).await;
+
+            let newest = pool.coordinator.newest_version("bucket", "key", TARGET).await.unwrap();
+            assert_eq!(
+                newest,
+                NewestVersion::Copy {
+                    hlc: at(20),
+                    node: NodeId(2),
+                    confirmed: true,
+                }
+            );
+            let copy = pool.coordinator.read_copy("bucket", "key", NodeId(2)).await.unwrap();
+            assert_eq!(copy.hlc, Some(at(20)));
+            assert_eq!(copy.data, b"version 20");
+            assert_eq!(copy.metadata.get("owner").map(String::as_str), Some("test"));
+
+            put(&pool.local, b"version 30", at(30)).await;
+            let newest = pool.coordinator.newest_version("bucket", "key", TARGET).await.unwrap();
+            assert_eq!(
+                newest,
+                NewestVersion::Copy {
+                    hlc: at(30),
+                    node: NodeId(1),
+                    confirmed: true,
+                }
+            );
+            let copy = pool.coordinator.read_copy("bucket", "key", NodeId(1)).await.unwrap();
+            assert_eq!(
+                (copy.hlc, copy.data),
+                (Some(at(30)), b"version 30".to_vec())
+            );
+
+            assert_eq!(metrics.value("s4_quorum_operations_total", &[]), None);
+            assert_eq!(metrics.sum("s4_quorum_operations_total", &[]), 0.0);
+            assert_eq!(metrics.sum("s4_read_repairs_total", &[]), 0.0);
+        }
+
+        /// A copy one replica holds while the other has no key may be one
+        /// that missed a delete: with W=2 a confirmed write not on the target
+        /// is on both other replicas.
+        #[tokio::test]
+        async fn a_copy_beside_a_replica_without_the_key_is_unconfirmed() {
+            let pool = pool(true, 19826).await;
+            put(&pool.local, b"version 20", at(20)).await;
+
+            let newest = pool.coordinator.newest_version("bucket", "key", TARGET).await.unwrap();
+            assert_eq!(
+                newest,
+                NewestVersion::Copy {
+                    hlc: at(20),
+                    node: NodeId(1),
+                    confirmed: false,
+                }
+            );
+
+            put(&pool.node_2, b"version 20", at(20)).await;
+            let newest = pool.coordinator.newest_version("bucket", "key", TARGET).await.unwrap();
+            assert!(
+                matches!(
+                    newest,
+                    NewestVersion::Copy {
+                        confirmed: true,
+                        ..
+                    }
+                ),
+                "{newest:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_key_no_other_replica_holds_is_absent() {
+            let pool = pool(true, 19814).await;
+            let newest = pool.coordinator.newest_version("bucket", "key", TARGET).await.unwrap();
+            assert_eq!(newest, NewestVersion::Absent);
+        }
+
+        /// The replica that did not answer may be the one holding the newest
+        /// version: that is an error, never "absent". One gossip holds dead is
+        /// not even asked, so delivery that waits for it costs no call.
+        #[tokio::test]
+        async fn a_replica_that_does_not_answer_is_an_error_not_an_absence() {
+            let metrics = TestMetrics::install();
+            let pool = pool(false, 19818).await;
+            put(&pool.local, b"version 10", at(10)).await;
+            let result = pool.coordinator.newest_version("bucket", "key", TARGET).await;
+            assert!(result.is_err(), "{result:?}");
+            assert_eq!(
+                metrics.sum("s4_peer_requests_total", &[]),
+                0.0,
+                "{}",
+                metrics.render()
+            );
+        }
+
+        #[tokio::test]
+        async fn a_node_that_is_not_a_replica_of_the_key_has_nothing_to_catch_up() {
+            let pool = pool(true, 19822).await;
+            let newest = pool.coordinator.newest_version("bucket", "key", NodeId(9)).await.unwrap();
+            assert_eq!(newest, NewestVersion::NotAReplica);
+        }
+
+        /// A record written without an HLC is copied with the one every node
+        /// makes up for it, node 0, whether it is read locally or from a
+        /// replica.
+        #[tokio::test]
+        async fn a_copy_written_without_an_hlc_carries_the_made_up_one() {
+            let pool = pool(true, 19852).await;
+            for (node, storage) in [(NodeId(1), &pool.local), (NodeId(2), &pool.node_2)] {
+                storage
+                    .put_object("bucket", "key", b"no hlc", "text/plain", &HashMap::new())
+                    .await
+                    .unwrap();
+                let copy = pool.coordinator.read_copy("bucket", "key", node).await.unwrap();
+                assert_eq!(
+                    copy.hlc,
+                    Some(made_up_hlc(storage).await),
+                    "read from {node}"
+                );
+                assert_eq!(copy.data, b"no hlc");
+            }
+        }
+
+        /// The HLC made up for a record written without one, node 0, as every
+        /// replica reports it.
+        async fn made_up_hlc(storage: &BitcaskStorageEngine) -> HlcTimestamp {
+            let record = storage.head_object("bucket", "key").await.unwrap();
+            HlcTimestamp::from_record(record.modified_at / 1_000_000, 0, 0)
+        }
+
+        /// A record written without an HLC is reported with the same made-up
+        /// HLC whether it is read locally or from a replica, whole or as a
+        /// stream: digests from different coordinators compare it alike.
+        #[tokio::test]
+        async fn a_record_without_an_hlc_is_reported_alike_on_every_path() {
+            let pool = pool(true, 19856).await;
+            for (node, storage) in [(NodeId(1), &pool.local), (NodeId(2), &pool.node_2)] {
+                storage
+                    .put_object("bucket", "key", b"no hlc", "text/plain", &HashMap::new())
+                    .await
+                    .unwrap();
+                let made_up = made_up_hlc(storage).await;
+
+                match pool.coordinator.digest_task(node, "bucket", "key").await {
+                    DigestResult::Success(digest) => {
+                        assert_eq!(digest.hlc, made_up, "digest from {node}")
+                    }
+                    other => panic!("digest from {node}: {other:?}"),
+                }
+                let stream = pool
+                    .coordinator
+                    .open_stream_from_replica("bucket", "key", node, None)
+                    .await
+                    .unwrap();
+                assert_eq!(stream.hlc, made_up, "stream from {node}");
+            }
+        }
+
+        /// Read repair writes the newest version with its HLC. Taken from a
+        /// record written without one, that is the made-up HLC, node 0: the
+        /// repaired copies are still told apart from a write the cluster
+        /// ordered, and delivery copies them as made up.
+        #[tokio::test]
+        async fn a_copy_repaired_from_a_record_without_an_hlc_stays_made_up() {
+            let pool = pool_with_target(19868).await;
+            let target = pool.target.clone().unwrap();
+            pool.local
+                .put_object("bucket", "key", b"no hlc", "text/plain", &HashMap::new())
+                .await
+                .unwrap();
+            put(&pool.node_2, b"version 10", at(10)).await;
+            put(&target, b"version 10", at(10)).await;
+            let made_up = made_up_hlc(&pool.local).await;
+
+            let read = pool.coordinator.read("bucket", "key").await.unwrap();
+            assert_eq!((read.hlc, read.data), (made_up, b"no hlc".to_vec()));
+            assert!(read.repair_triggered);
+
+            for (node, storage) in [(NodeId(2), &pool.node_2), (TARGET, &target)] {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                while hlc_on(storage).await == Some(10) {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "{node} was not repaired"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let record = storage.head_object("bucket", "key").await.unwrap();
+                assert_eq!(HlcTimestamp::of_record(&record), made_up, "{node}");
+            }
+            let copy = pool.coordinator.read_copy("bucket", "key", NodeId(2)).await.unwrap();
+            assert_eq!((copy.hlc, copy.data), (Some(made_up), b"no hlc".to_vec()));
+        }
+
+        // ---- Hint delivery over real replicas ----
+
+        use crate::hints::{HintDelivery, HintEntry, HintedHandoffConfig, HintedHandoffManager};
+
+        /// A manager storing hints for the pool's target and a delivery that
+        /// reads current states through the pool's coordinator.
+        fn delivering(pool: &Pool, dir: &std::path::Path) -> (HintedHandoffManager, HintDelivery) {
+            let manager =
+                HintedHandoffManager::new(HintedHandoffConfig::new(dir), pool.rpc_client.clone());
+            let delivery = HintDelivery::new(
+                pool.coordinator.clone(),
+                pool.rpc_client.clone(),
+                pool.gossip.clone(),
+                NodeId(1),
+                1,
+            );
+            (manager, delivery)
+        }
+
+        async fn hlc_on(storage: &BitcaskStorageEngine) -> Option<u64> {
+            storage
+                .head_object("bucket", "key")
+                .await
+                .ok()
+                .map(|record| record.hlc_timestamp)
+        }
+
+        /// The target missed a write that node 1 and node 2 took. Before the
+        /// hint is delivered the key is deleted through node 2, which the
+        /// target takes and node 1 misses. Node 1's copy is the newest left,
+        /// and spreading it would bring the deleted key back on the target:
+        /// it is not spread, and the hint is dropped as ambiguous.
+        #[tokio::test]
+        async fn a_copy_that_missed_a_delete_is_not_brought_back_by_a_hint() {
+            let metrics = TestMetrics::install();
+            let tmp = tempfile::tempdir().unwrap();
+            let pool = pool_with_target(19840).await;
+            let target = pool.target.clone().unwrap();
+            put(&pool.local, b"version 20", at(20)).await;
+            let (manager, delivery) = delivering(&pool, tmp.path());
+
+            manager.store(TARGET, HintEntry::written("bucket", "key", at(20))).await;
+            manager.deliver(&delivery).await;
+
+            assert_eq!(hlc_on(&target).await, None, "the deleted key came back");
+            assert_eq!(
+                metrics.value("s4_hints_dropped_total", &[("reason", "ambiguous")]),
+                Some(1.0),
+                "{}",
+                metrics.render()
+            );
+            assert_eq!(manager.pending(TARGET).await, 0);
+        }
+
+        /// The same hint once both other replicas hold the copy: a confirmed
+        /// write, spread to the target.
+        #[tokio::test]
+        async fn a_copy_both_other_replicas_hold_is_delivered() {
+            let metrics = TestMetrics::install();
+            let tmp = tempfile::tempdir().unwrap();
+            let pool = pool_with_target(19844).await;
+            let target = pool.target.clone().unwrap();
+            put(&pool.local, b"version 20", at(20)).await;
+            put(&pool.node_2, b"version 20", at(20)).await;
+            let (manager, delivery) = delivering(&pool, tmp.path());
+
+            manager.store(TARGET, HintEntry::written("bucket", "key", at(20))).await;
+            manager.deliver(&delivery).await;
+
+            assert_eq!(hlc_on(&target).await, Some(20));
+            assert_eq!(metrics.value("s4_hints_delivered_total", &[]), Some(1.0));
+            assert_eq!(metrics.sum("s4_hints_dropped_total", &[]), 0.0);
+        }
+
+        /// Every other replica holds some version: no delete is in play, and
+        /// the newest is spread even though only one of them holds it.
+        #[tokio::test]
+        async fn the_newest_copy_is_delivered_when_no_replica_lacks_the_key() {
+            let tmp = tempfile::tempdir().unwrap();
+            let pool = pool_with_target(19848).await;
+            let target = pool.target.clone().unwrap();
+            put(&pool.local, b"version 30", at(30)).await;
+            put(&pool.node_2, b"version 20", at(20)).await;
+            let (manager, delivery) = delivering(&pool, tmp.path());
+
+            manager.store(TARGET, HintEntry::written("bucket", "key", at(20))).await;
+            manager.deliver(&delivery).await;
+
+            assert_eq!(hlc_on(&target).await, Some(30));
+        }
+
+        /// A key stored before the cluster formed lives only on the node that
+        /// had it. Deleted through the cluster while that node was down, it is
+        /// removed from the node once it is back: its record stores no HLC,
+        /// and the delete on the zero HLC matches it.
+        #[tokio::test]
+        async fn a_key_deleted_while_its_only_holder_was_down_is_removed_from_it() {
+            let metrics = TestMetrics::install();
+            let tmp = tempfile::tempdir().unwrap();
+            let pool = pool_with_target(19876).await;
+            let target = pool.target.clone().unwrap();
+            target
+                .put_object(
+                    "bucket",
+                    "key",
+                    b"before the cluster",
+                    "text/plain",
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap();
+            let deleted_at =
+                HlcTimestamp::from_record(made_up_hlc(&target).await.wall_time + 1, 0, 7);
+            let (manager, delivery) = delivering(&pool, tmp.path());
+
+            manager.store(TARGET, HintEntry::deleted("bucket", "key", deleted_at)).await;
+            manager.deliver(&delivery).await;
+
+            assert!(target.head_object("bucket", "key").await.is_err());
+            assert_eq!(metrics.value("s4_hints_delivered_total", &[]), Some(1.0));
+            assert_eq!(metrics.sum("s4_hints_dropped_total", &[]), 0.0);
+        }
+
+        /// The newest version among the other replicas is a record written
+        /// without an HLC, and no replica lacks the key: its copy reaches the
+        /// target with the made-up HLC, as read repair would bring it.
+        #[tokio::test]
+        async fn a_copy_without_an_hlc_reaches_a_replica_that_lacks_the_key() {
+            let tmp = tempfile::tempdir().unwrap();
+            let pool = pool_with_target(19880).await;
+            let target = pool.target.clone().unwrap();
+            put(&pool.node_2, b"version 10", at(10)).await;
+            pool.local
+                .put_object("bucket", "key", b"no hlc", "text/plain", &HashMap::new())
+                .await
+                .unwrap();
+            let made_up = made_up_hlc(&pool.local).await;
+            let (manager, delivery) = delivering(&pool, tmp.path());
+
+            manager.store(TARGET, HintEntry::written("bucket", "key", at(10))).await;
+            manager.deliver(&delivery).await;
+
+            let (data, record) = target.get_object("bucket", "key").await.unwrap();
+            assert_eq!(
+                (HlcTimestamp::of_record(&record), data),
+                (made_up, b"no hlc".to_vec())
+            );
+        }
+
+        fn digest(node: u128, wall: u64, erasure_coded: bool) -> ObjectDigest {
+            ObjectDigest {
+                node_id: NodeId(node),
+                hlc: at(wall),
+                etag: String::new(),
+                size: 0,
+                content_type: String::new(),
+                version_id: None,
+                metadata: HashMap::new(),
+                erasure_coded,
+                content_hash: None,
+            }
+        }
+
+        /// One replica holding the erasure-coded record of the newest version
+        /// is enough: the object is leaving replication, and no copy of it
+        /// is to be spread again.
+        #[test]
+        fn an_erasure_coded_newest_version_is_reported_as_such() {
+            assert_eq!(
+                newest_of(&[digest(1, 10, false), digest(2, 20, true)], 0, 2),
+                NewestVersion::ErasureCoded { hlc: at(20) }
+            );
+            assert_eq!(
+                newest_of(&[digest(1, 20, false), digest(2, 20, true)], 0, 2),
+                NewestVersion::ErasureCoded { hlc: at(20) }
+            );
+            assert_eq!(
+                newest_of(&[digest(1, 30, false), digest(2, 20, true)], 0, 2),
+                NewestVersion::Copy {
+                    hlc: at(30),
+                    node: NodeId(1),
+                    confirmed: true,
+                }
+            );
+            assert_eq!(newest_of(&[], 2, 2), NewestVersion::Absent);
+        }
+
+        /// A copy is confirmed when no replica lacks the key, or when as many
+        /// replicas hold it as a confirmed write leaves behind.
+        #[test]
+        fn a_copy_is_confirmed_by_the_write_quorum_or_by_no_replica_lacking_the_key() {
+            let confirmed = |digests: &[ObjectDigest], absent, confirming| match newest_of(
+                digests, absent, confirming,
+            ) {
+                NewestVersion::Copy { confirmed, .. } => confirmed,
+                other => panic!("not a copy: {other:?}"),
+            };
+            // RF=3, W=2: two other replicas, a confirmed write is on both.
+            assert!(confirmed(
+                &[digest(1, 20, false), digest(2, 20, false)],
+                0,
+                2
+            ));
+            assert!(!confirmed(&[digest(1, 20, false)], 1, 2));
+            assert!(confirmed(
+                &[digest(1, 30, false), digest(2, 20, false)],
+                0,
+                2
+            ));
+            // RF=5, W=3: four other replicas, a confirmed write is on three.
+            let three = [
+                digest(1, 20, false),
+                digest(2, 20, false),
+                digest(3, 20, false),
+            ];
+            assert!(confirmed(&three, 1, 3));
+            assert!(!confirmed(&three[..2], 2, 3));
+            assert!(!confirmed(
+                &[three[0].clone(), three[1].clone(), digest(3, 10, false)],
+                1,
+                3
+            ));
         }
     }
 }

@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.70 or later (install via [rustup](https://rustup.rs))
+- Rust through [rustup](https://rustup.rs): the release is pinned in `rust-toolchain.toml`, and `rustup toolchain install` in the repository installs it
 - Git
 - `protoc` (protobuf compiler) for the cluster gRPC code generation
 - `nasm` 2.14 or newer, on x86_64 only
@@ -48,9 +48,6 @@ cargo bench -p s4-codec
 # Portable engine against ISA-L, in one process
 cargo bench -p s4-codec-isal
 ```
-
-Recorded results live next to the plan that produced them, in
-`plans/S4-FEDERATION/ALGORITHM-S4-FEDERATION/ERASURE-CODING/EC-v2/adr/`.
 
 ## Running Tests
 

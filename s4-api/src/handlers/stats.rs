@@ -26,6 +26,10 @@ use serde::Serialize;
 use crate::server::AppState;
 
 /// JSON stats response for Web UI.
+/// What `GET /api/stats` answers. On a cluster node the bucket and object
+/// numbers are the pool's, counted at most a few seconds ago, while the
+/// deduplication numbers are the node's own: each node deduplicates what it
+/// stores.
 #[derive(Debug, Serialize)]
 pub struct StatsResponse {
     /// Server uptime in seconds.
@@ -34,15 +38,20 @@ pub struct StatsResponse {
     pub buckets_count: u64,
     /// Number of objects (excluding delete markers and internal keys).
     pub objects_count: u64,
-    /// Total size of stored objects in bytes.
+    /// Total size of stored objects in bytes, before deduplication and
+    /// replication.
     pub storage_used_bytes: u64,
-    /// Number of unique content blobs in the deduplicator.
+    /// Number of unique content blobs in this node's deduplicator.
     pub dedup_unique_blobs: u64,
-    /// Total number of content references (including duplicates).
+    /// Total number of content references on this node (including duplicates).
     pub dedup_total_references: u64,
     /// Deduplication ratio (0.0 = no dedup, 1.0 = all content is deduplicated).
     /// Computed as `1.0 - (unique_blobs / total_references)`.
     pub dedup_ratio: f64,
+    /// False when a node of the pool did not answer a listing, so that the
+    /// bucket and object numbers miss what only it holds. Always true on a
+    /// single node.
+    pub complete: bool,
 }
 
 /// Handler for `GET /metrics` — Prometheus text format.
@@ -69,31 +78,74 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
 /// Queries the storage engine for current bucket/object counts, storage usage,
 /// and deduplication statistics. Also reports server uptime.
 pub async fn api_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let storage = state.storage.read().await;
-    let stats = match storage.get_stats().await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("Failed to get storage stats: {}", e);
-            return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get stats").into_response();
-        }
-    };
-
     let uptime_seconds = state.start_time.elapsed().as_secs();
 
-    let dedup_ratio = if stats.dedup_total_references > 0 {
-        1.0 - (stats.dedup_unique_blobs as f64 / stats.dedup_total_references as f64)
+    // Cluster mode: the pool's buckets and objects, this node's deduplication.
+    let (buckets_count, objects_count, storage_used_bytes, unique, references, complete) = if state
+        .list_coordinator
+        .is_some()
+    {
+        let usage = match super::usage::usage(&state).await {
+            Ok(usage) => usage,
+            Err(super::usage::UsageError::Cluster(e)) => {
+                tracing::error!("Failed to count the pool's objects: {}", e);
+                return super::cluster_error_to_response(&e);
+            }
+            Err(super::usage::UsageError::Storage(e)) => {
+                tracing::error!("Failed to count the pool's objects: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get stats").into_response();
+            }
+        };
+        let dedup = state.storage.read().await.dedup_stats().await;
+        let (unique, references) = match dedup {
+            Ok(dedup) => dedup,
+            Err(e) => {
+                tracing::error!("Failed to get deduplication stats: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get stats").into_response();
+            }
+        };
+        (
+            usage.buckets.len() as u64,
+            usage.objects_count(),
+            usage.storage_used_bytes(),
+            unique,
+            references,
+            usage.complete,
+        )
+    } else {
+        let storage = state.storage.read().await;
+        let stats = match storage.get_stats().await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("Failed to get storage stats: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "Failed to get stats").into_response();
+            }
+        };
+        (
+            stats.buckets_count,
+            stats.objects_count,
+            stats.storage_used_bytes,
+            stats.dedup_unique_blobs,
+            stats.dedup_total_references,
+            true,
+        )
+    };
+
+    let dedup_ratio = if references > 0 {
+        1.0 - (unique as f64 / references as f64)
     } else {
         0.0
     };
 
     let response = StatsResponse {
         uptime_seconds,
-        buckets_count: stats.buckets_count,
-        objects_count: stats.objects_count,
-        storage_used_bytes: stats.storage_used_bytes,
-        dedup_unique_blobs: stats.dedup_unique_blobs,
-        dedup_total_references: stats.dedup_total_references,
+        buckets_count,
+        objects_count,
+        storage_used_bytes,
+        dedup_unique_blobs: unique,
+        dedup_total_references: references,
         dedup_ratio,
+        complete,
     };
 
     (StatusCode::OK, axum::Json(response)).into_response()

@@ -137,9 +137,12 @@ pub async fn put_object(
     // Get versioning status before acquiring storage lock
     let versioning_status = get_bucket_versioning_status(&state, &bucket).await;
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -441,9 +444,12 @@ pub async fn copy_object(
         &src_bucket, &src_key, &bucket, &key
     );
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check destination bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check destination bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -596,7 +602,9 @@ async fn copy_object_cluster(
 ) -> Response {
     let src = match read_coord.read(src_bucket, src_key).await {
         Ok(result) => result,
-        Err(ClusterError::ObjectNotFound { .. }) => return S3Error::NoSuchKey.into_response(),
+        Err(ClusterError::ObjectNotFound { .. }) => {
+            return super::object_not_found(state, src_bucket).await
+        }
         Err(e) => {
             error!("Quorum read failed for CopyObject source: {:?}", e);
             return cluster_error_to_response(&e);
@@ -727,7 +735,7 @@ pub async fn get_object(
             let total_size = match read_coord.head(&bucket, &key).await {
                 Ok(result) => result.size,
                 Err(ClusterError::ObjectNotFound { .. }) => {
-                    return S3Error::NoSuchKey.into_response();
+                    return super::object_not_found(&state, &bucket).await;
                 }
                 Err(e) => {
                     error!("Quorum head failed before ranged read: {:?}", e);
@@ -787,7 +795,9 @@ pub async fn get_object(
                 let reader_stream = ReaderStream::new(result.body);
                 builder.body(Body::from_stream(reader_stream)).unwrap()
             }
-            Err(ClusterError::ObjectNotFound { .. }) => S3Error::NoSuchKey.into_response(),
+            Err(ClusterError::ObjectNotFound { .. }) => {
+                super::object_not_found(&state, &bucket).await
+            }
             Err(e) => {
                 error!("Quorum read failed: {:?}", e);
                 cluster_error_to_response(&e)
@@ -952,6 +962,9 @@ async fn get_ec_object_response(
         .await
     {
         Ok(head) => head,
+        Err(EcObjectReadError::NotFound { .. }) => {
+            return super::object_not_found(state, &bucket).await
+        }
         Err(error) => return ec_read_error_to_response(error, query),
     };
 
@@ -970,7 +983,9 @@ async fn get_ec_object_response(
         };
         return match read_coord.read_stream(&bucket, &key, range.map(ec_range_tuple)).await {
             Ok(result) => build_quorum_stream_response(result),
-            Err(ClusterError::ObjectNotFound { .. }) => S3Error::NoSuchKey.into_response(),
+            Err(ClusterError::ObjectNotFound { .. }) => {
+                super::object_not_found(state, &bucket).await
+            }
             Err(error) => {
                 error!("EC hot replicated quorum read failed: {:?}", error);
                 cluster_error_to_response(&error)
@@ -981,7 +996,7 @@ async fn get_ec_object_response(
     match state
         .ec_object_runtime
         .read_object(EcObjectReadRequest {
-            bucket,
+            bucket: bucket.clone(),
             key,
             version_id: query.version_id.clone(),
             range,
@@ -989,6 +1004,7 @@ async fn get_ec_object_response(
         .await
     {
         Ok(result) => build_ec_read_response(result),
+        Err(EcObjectReadError::NotFound { .. }) => super::object_not_found(state, &bucket).await,
         Err(error) => ec_read_error_to_response(error, query),
     }
 }
@@ -1176,6 +1192,57 @@ fn build_delete_marker_response(query: &ObjectVersionQuery, version_id: &str) ->
     }
 }
 
+/// Deletes the current version of one object through the write quorum, as
+/// DeleteObject and DeleteObjects do in cluster mode: the EC pool's delete
+/// commit is recorded, and an object whose hot copy is gone is deleted from
+/// its erasure-coded layout. `Ok(())` once the delete holds; otherwise the
+/// response the request gets.
+#[allow(clippy::result_large_err)] // Response is the standard axum error type
+pub(crate) async fn delete_object_in_cluster(
+    state: &AppState,
+    write_coord: &QuorumWriteCoordinator,
+    bucket: &str,
+    key: &str,
+) -> Result<(), Response> {
+    match write_coord.delete(bucket, key).await {
+        Ok(result) => {
+            info!(
+                "Quorum delete: bucket={}, key={}, acked={}/{}",
+                bucket, key, result.replicas_acked, result.replicas_total
+            );
+            super::record_ec_delete_commit(
+                state,
+                bucket.to_string(),
+                key.to_string(),
+                None,
+                result.hlc,
+                result.operation_id,
+            )
+            .await
+        }
+        Err(e) => {
+            let current = ObjectVersionQuery::default();
+            if let Some(response) = try_delete_cold_ec_object_after_hot_delete_failure(
+                state,
+                bucket,
+                key,
+                &current,
+                write_coord,
+            )
+            .await
+            {
+                return if response.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(response)
+                };
+            }
+            error!("Quorum delete failed: {:?}", e);
+            Err(cluster_error_to_response(&e))
+        }
+    }
+}
+
 async fn try_delete_cold_ec_object_after_hot_delete_failure(
     state: &AppState,
     bucket: &str,
@@ -1276,41 +1343,14 @@ pub async fn delete_object(
 
     // Cluster mode: quorum delete (basic, no versioning/Object Lock checks)
     if let (Some(write_coord), None) = (&state.write_coordinator, &query.version_id) {
-        return match write_coord.delete(&bucket, &key).await {
-            Ok(result) => {
-                info!(
-                    "Quorum delete: bucket={}, key={}, acked={}/{}",
-                    bucket, key, result.replicas_acked, result.replicas_total
-                );
-                if let Err(resp) = super::record_ec_delete_commit(
-                    &state,
-                    bucket.clone(),
-                    key.clone(),
-                    None,
-                    result.hlc,
-                    result.operation_id,
-                )
-                .await
-                {
-                    return resp;
-                }
+        if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+            return resp;
+        }
+        return match delete_object_in_cluster(&state, write_coord, &bucket, &key).await {
+            Ok(()) => {
                 Response::builder().status(StatusCode::NO_CONTENT).body(Body::empty()).unwrap()
             }
-            Err(e) => {
-                if let Some(response) = try_delete_cold_ec_object_after_hot_delete_failure(
-                    &state,
-                    &bucket,
-                    &key,
-                    &query,
-                    write_coord,
-                )
-                .await
-                {
-                    return response;
-                }
-                error!("Quorum delete failed: {:?}", e);
-                cluster_error_to_response(&e)
-            }
+            Err(response) => response,
         };
     }
 
@@ -1537,6 +1577,8 @@ pub async fn head_object(
 
                 builder.body(Body::empty()).unwrap()
             }
+            // A HEAD answer carries no body, so a missing bucket and a missing
+            // key answer the same 404: the bucket is not asked.
             Err(ClusterError::ObjectNotFound { .. }) => S3Error::NoSuchKey.into_response(),
             Err(e) => {
                 error!("Quorum head failed: {:?}", e);
@@ -1746,9 +1788,12 @@ pub async fn get_object_tagging(
         bucket, key, version_query.version_id
     );
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -1800,9 +1845,12 @@ pub async fn put_object_tagging(
         bucket, key, version_query.version_id
     );
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -1900,9 +1948,12 @@ pub async fn delete_object_tagging(
         bucket, key, version_query.version_id
     );
 
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let storage = state.storage.read().await;
 
-    // Check if bucket exists (standalone mode only — cluster mode replicates markers)
+    // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }
@@ -2125,10 +2176,13 @@ pub async fn post_object(
     // If no policy is provided, allow (matches S3 behavior for anonymous uploads on public buckets)
 
     // Write object
+    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+        return resp;
+    }
     let versioning_status = get_bucket_versioning_status(&state, &bucket).await;
     let storage = state.storage.write().await;
 
-    // Check bucket existence (standalone mode only — cluster mode replicates markers)
+    // Check bucket existence (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
     }

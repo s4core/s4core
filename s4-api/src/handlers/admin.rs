@@ -28,7 +28,7 @@ use s4_features::iam::{
 
 use s4_core::storage::StorageEngine;
 use serde::Deserialize;
-use tracing::error;
+use tracing::{error, warn};
 
 use crate::AppState;
 
@@ -218,7 +218,15 @@ pub async fn delete_credentials(
 ///
 /// GET /api/admin/bucket-stats
 /// Headers: `Authorization: Bearer <token>`
-/// Returns: { "buckets": [{ "name": "...", "objects_count": N, "storage_used_bytes": N }], "total_storage_bytes": N }
+/// Returns: { "buckets": [{ "name": "...", "objects_count": N, "storage_used_bytes": N,
+/// "created_at": N }], "total_storage_bytes": N, "complete": true }
+///
+/// In cluster mode the numbers are the pool's, not this node's: buckets and
+/// objects are listed from every node of the pool and merged by key, so each
+/// object counts once, at the size of its newest version, wherever its copies
+/// are. They are counted at most a few seconds ago (see [`super::usage`]).
+/// `complete` is false when a node did not answer a listing: an object held
+/// only by such a node is missing from the numbers.
 pub async fn bucket_stats(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -227,53 +235,50 @@ pub async fn bucket_stats(
         return Err(AdminError::Forbidden);
     }
 
-    let storage = state.storage.read().await;
-
-    // List all bucket markers to get bucket names
-    let markers = storage
-        .list_objects("__system__", "__s4_bucket_marker_", 10000)
-        .await
-        .map_err(|e| AdminError::Storage(e.to_string()))?;
-
-    let bucket_entries: Vec<(String, u64)> = markers
-        .into_iter()
-        .filter(|(_, r)| !r.is_delete_marker)
-        .filter_map(|(key, record)| {
-            key.strip_prefix("__s4_bucket_marker_")
-                .map(|s| (s.to_string(), record.created_at))
+    let usage = super::usage::usage(&state).await.map_err(admin_usage_error)?;
+    if !usage.complete {
+        warn!("bucket statistics are incomplete: a node of the pool did not answer a listing");
+    }
+    let buckets: Vec<_> = usage
+        .buckets
+        .iter()
+        .map(|bucket| {
+            json!({
+                "name": bucket.name,
+                "objects_count": bucket.objects_count,
+                "storage_used_bytes": bucket.storage_used_bytes,
+                "created_at": bucket.created_at,
+            })
         })
         .collect();
 
-    let mut buckets = Vec::new();
-    let mut total_storage_bytes: u64 = 0;
-
-    for (name, created_at) in &bucket_entries {
-        let objects = storage.list_objects(name, "", usize::MAX).await.unwrap_or_default();
-
-        let mut objects_count: u64 = 0;
-        let mut storage_used: u64 = 0;
-
-        for (key, record) in &objects {
-            if key.starts_with("__s4_") || record.is_delete_marker || key.contains('#') {
-                continue;
-            }
-            objects_count += 1;
-            storage_used += record.size;
-        }
-
-        total_storage_bytes += storage_used;
-        buckets.push(json!({
-            "name": name,
-            "objects_count": objects_count,
-            "storage_used_bytes": storage_used,
-            "created_at": created_at,
-        }));
-    }
-
     Ok(Json(json!({
         "buckets": buckets,
-        "total_storage_bytes": total_storage_bytes,
+        "total_storage_bytes": usage.storage_used_bytes(),
+        "complete": usage.complete,
     })))
+}
+
+/// The admin answer for usage that could not be read.
+fn admin_usage_error(error: super::usage::UsageError) -> AdminError {
+    match error {
+        super::usage::UsageError::Cluster(e) => admin_cluster_error(e),
+        super::usage::UsageError::Storage(message) => AdminError::Storage(message),
+    }
+}
+
+/// The admin answer for a quorum operation that failed: `503` when too few
+/// replicas answered, `500` otherwise.
+fn admin_cluster_error(error: s4_cluster::ClusterError) -> AdminError {
+    match error {
+        s4_cluster::ClusterError::QuorumNotMet { .. }
+        | s4_cluster::ClusterError::WriteTimeout(_)
+        | s4_cluster::ClusterError::ReadTimeout(_)
+        | s4_cluster::ClusterError::EpochMismatch { .. } => {
+            AdminError::Unavailable(error.to_string())
+        }
+        other => AdminError::Storage(other.to_string()),
+    }
 }
 
 /// Create a bucket via admin API.
@@ -296,24 +301,11 @@ pub async fn create_bucket(
         return Err(AdminError::InvalidBucketName(e.to_string()));
     }
 
-    let storage = state.storage.read().await;
-    let marker_key = format!("__s4_bucket_marker_{}", bucket_name);
-
-    // Check if already exists
-    if storage.head_object("__system__", &marker_key).await.is_ok() {
-        return Err(AdminError::BucketAlreadyExists(bucket_name));
-    }
-
-    storage
-        .put_object(
-            "__system__",
-            &marker_key,
-            b"1",
-            "application/octet-stream",
-            &std::collections::HashMap::new(),
-        )
+    // The same code the S3 route creates a bucket with: in cluster mode the
+    // marker goes through the write quorum, so every node sees the bucket.
+    super::bucket::create_bucket_marker(&state, &bucket_name)
         .await
-        .map_err(|e| AdminError::Storage(e.to_string()))?;
+        .map_err(|e| AdminError::from_bucket_change(&bucket_name, e))?;
 
     Ok(Json(json!({ "name": bucket_name })))
 }
@@ -344,69 +336,11 @@ pub async fn delete_bucket(
         return Err(AdminError::Forbidden);
     }
 
-    let storage = state.storage.read().await;
-    let marker_key = format!("__s4_bucket_marker_{}", bucket_name);
-
-    // Check exists
-    if storage.head_object("__system__", &marker_key).await.is_err() {
-        return Err(AdminError::BucketNotFound(bucket_name));
-    }
-
-    if query.force {
-        // Recursively delete all objects in batches
-        let batch_size = 1000;
-        loop {
-            // A failed listing must not be read as "nothing left": that would
-            // drop the bucket marker while its objects are still stored.
-            let objects =
-                storage.list_objects(&bucket_name, "", batch_size).await.map_err(|e| {
-                    AdminError::Storage(format!("Failed to list objects in '{bucket_name}': {e}"))
-                })?;
-            if objects.is_empty() {
-                break;
-            }
-            for (key, _) in &objects {
-                if let Err(e) = storage.delete_object(&bucket_name, key).await {
-                    error!(
-                        "Failed to delete object {} during force delete: {:?}",
-                        key, e
-                    );
-                    return Err(AdminError::Storage(format!(
-                        "Failed to delete object {}: {}",
-                        key, e
-                    )));
-                }
-            }
-        }
-    } else {
-        // Check empty — and report a failed listing rather than mistaking it
-        // for an empty bucket.
-        let objects = storage.list_objects(&bucket_name, "", 1).await.map_err(|e| {
-            AdminError::Storage(format!("Failed to list objects in '{bucket_name}': {e}"))
-        })?;
-        if !objects.is_empty() {
-            return Err(AdminError::BucketNotEmpty(bucket_name));
-        }
-    }
-
-    // Delete bucket configurations
-    let config_keys = [
-        format!("__s4_bucket_cors_{}", bucket_name),
-        format!("__s4_bucket_versioning_{}", bucket_name),
-        format!("__s4_bucket_lifecycle_{}", bucket_name),
-        format!("__s4_bucket_policy_{}", bucket_name),
-        format!("__s4_bucket_object_lock_{}", bucket_name),
-        format!("__s4_bucket_encryption_{}", bucket_name),
-    ];
-    for key in &config_keys {
-        let _ = storage.delete_object("__system__", key).await;
-    }
-
-    // Delete bucket marker
-    storage
-        .delete_object("__system__", &marker_key)
+    // The same code the S3 route deletes a bucket with: in cluster mode the
+    // objects, the marker and the configuration go through the quorums.
+    super::bucket::delete_bucket_and_contents(&state, &bucket_name, query.force)
         .await
-        .map_err(|e| AdminError::Storage(e.to_string()))?;
+        .map_err(|e| AdminError::from_bucket_change(&bucket_name, e))?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -428,7 +362,14 @@ pub struct ListObjectsQuery {
 ///
 /// GET /api/admin/buckets/:name/objects
 /// Headers: `Authorization: Bearer <token>`
-/// Returns: { "objects": [...], "is_truncated": bool, "next_continuation_token": "..." }
+/// Returns: { "objects": [...], "common_prefixes": [...], "is_truncated": bool,
+/// "next_continuation_token": "...", "complete": bool }
+///
+/// Keys below the prefix that contain another `/` are grouped into a
+/// directory, listed once in `common_prefixes`. `max-keys` (default 50, at
+/// most 1000, at least 1) counts objects and directories together. The bucket is read page
+/// by page, never whole; on a cluster node from every node of the pool, merged
+/// by key, and `complete` is false when a node did not answer.
 pub async fn list_bucket_objects(
     State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
@@ -439,95 +380,106 @@ pub async fn list_bucket_objects(
         return Err(AdminError::Forbidden);
     }
 
-    let storage = state.storage.read().await;
-
     // Without this check a deleted bucket and an empty one both answer 200 with
-    // an empty list, and the caller cannot tell them apart.
-    let marker_key = format!("__s4_bucket_marker_{}", bucket_name);
-    if storage.head_object("__system__", &marker_key).await.is_err() {
-        return Err(AdminError::BucketNotFound(bucket_name));
+    // an empty list, and the caller cannot tell them apart. In cluster mode the
+    // bucket is what a read quorum of its marker says, as on the S3 routes.
+    match super::bucket_in_cluster(&state, &bucket_name).await {
+        Some(Ok(true)) => {}
+        Some(Ok(false)) => return Err(AdminError::BucketNotFound(bucket_name)),
+        Some(Err(e)) => return Err(admin_cluster_error(e)),
+        None => {
+            let storage = state.storage.read().await;
+            let marker_key = super::bucket_marker_key(&bucket_name);
+            if storage.head_object("__system__", &marker_key).await.is_err() {
+                return Err(AdminError::BucketNotFound(bucket_name));
+            }
+        }
     }
 
     let prefix = params.prefix.unwrap_or_default();
-    let max_keys = params.max_keys.unwrap_or(50);
+    // At least one: a page that could list nothing would hand back the token it
+    // was given, and a client following tokens would never finish.
+    let max_keys = params.max_keys.unwrap_or(50).clamp(1, 1000);
 
-    // Fetch one extra to detect truncation
-    let all_objects = storage
-        .list_objects(&bucket_name, &prefix, usize::MAX)
-        .await
-        .map_err(|e| AdminError::Storage(e.to_string()))?;
-
-    // Filter out internal keys, delete markers, version keys
-    let filtered: Vec<_> = all_objects
-        .into_iter()
-        .filter(|(key, record)| {
-            !key.starts_with("__s4_") && !record.is_delete_marker && !key.contains('#')
-        })
-        .collect();
-
-    // Handle continuation token (it's the last key from previous page)
-    let start_index = if let Some(ref token) = params.continuation_token {
-        filtered
-            .iter()
-            .position(|(key, _)| key.as_str() > token.as_str())
-            .unwrap_or(filtered.len())
-    } else {
-        0
-    };
-
-    // Identify common prefixes (directories) vs objects
-    let mut common_prefixes: Vec<String> = Vec::new();
     let mut objects_list: Vec<serde_json::Value> = Vec::new();
-    let mut seen_prefixes = std::collections::HashSet::new();
-    let mut count = 0;
-    let mut last_key = String::new();
+    let mut common_prefixes: Vec<String> = Vec::new();
+    let mut count = 0usize;
     let mut is_truncated = false;
+    let mut complete = true;
+    // Where the next page of the bucket starts, and where a client's next
+    // request does: past the last object listed, or past the whole of the last
+    // directory, so that a directory never comes back on the next page.
+    let mut after = params.continuation_token.unwrap_or_default();
+    let mut resume = after.clone();
+    // The directory being skipped: its keys follow the one that listed it.
+    let mut directory: Option<String> = None;
 
-    for (key, record) in filtered.iter().skip(start_index) {
-        if count >= max_keys {
-            is_truncated = true;
-            break;
-        }
-
-        let relative_key = if prefix.is_empty() {
-            key.as_str()
-        } else {
-            key.strip_prefix(prefix.as_str()).unwrap_or(key.as_str())
-        };
-
-        // Check if this is a "directory" (has a / after prefix)
-        if let Some(slash_pos) = relative_key.find('/') {
-            let dir_prefix = format!("{}{}/", prefix, &relative_key[..slash_pos]);
-            if seen_prefixes.insert(dir_prefix.clone()) {
-                common_prefixes.push(dir_prefix);
-                count += 1;
+    'pages: loop {
+        let page = super::usage::page(&state, &bucket_name, &prefix, &after)
+            .await
+            .map_err(admin_usage_error)?;
+        complete &= page.complete;
+        for listed in &page.objects {
+            if directory.as_ref().is_some_and(|dir| listed.key.starts_with(dir.as_str())) {
+                continue;
             }
-        } else {
-            objects_list.push(json!({
-                "key": key,
-                "size": record.size,
-                "content_type": record.content_type,
-                "last_modified": record.modified_at,
-                "etag": record.etag,
-            }));
+            directory = None;
+            if !super::usage::is_object_key(&listed.key) {
+                continue;
+            }
+            if count >= max_keys {
+                is_truncated = true;
+                break 'pages;
+            }
+            let relative = listed.key.strip_prefix(prefix.as_str()).unwrap_or(&listed.key);
+            if let Some(slash) = relative.find('/') {
+                let dir = format!("{}{}/", prefix, &relative[..slash]);
+                resume = format!("{dir}{DIRECTORY_END}");
+                common_prefixes.push(dir.clone());
+                directory = Some(dir);
+            } else {
+                resume = listed.key.clone();
+                objects_list.push(json!({
+                    "key": listed.key,
+                    "size": listed.size,
+                    "content_type": listed.content_type,
+                    "last_modified": listed.modified_at,
+                    "etag": listed.etag,
+                }));
+            }
             count += 1;
         }
-
-        last_key = key.clone();
+        let next = match page.last_key {
+            // A directory the page ended in is skipped whole, not paged through.
+            Some(_) if page.more && directory.is_some() => resume.clone(),
+            Some(last) if page.more => last,
+            _ => break,
+        };
+        if !super::usage::advance(&mut after, next) {
+            complete = false;
+            break;
+        }
+    }
+    if !complete {
+        warn!(bucket = %bucket_name, "object listing is incomplete: a node of the pool did not answer");
     }
 
     let mut result = json!({
         "objects": objects_list,
         "common_prefixes": common_prefixes,
         "is_truncated": is_truncated,
+        "complete": complete,
     });
-
     if is_truncated {
-        result["next_continuation_token"] = json!(last_key);
+        result["next_continuation_token"] = json!(resume);
     }
 
     Ok(Json(result))
 }
+
+/// Sorts after every key in a directory: a listing resumed after
+/// `directory + DIRECTORY_END` starts past the whole directory.
+const DIRECTORY_END: char = '\u{10FFFF}';
 
 /// Trigger on-demand volume compaction — requires SuperUser role.
 ///
@@ -644,29 +596,31 @@ pub async fn run_scrubber(
     })))
 }
 
-/// Get the status of the background scrubber (if running in cluster mode).
+/// Get the status of the background scrubber.
 ///
 /// GET /api/admin/scrubber/status
 /// Headers: `Authorization: Bearer <token>`
-/// Returns: `{ "mode": "standalone", "message": "..." }`
 ///
-/// In standalone mode, returns a static message. In cluster mode (Phase 10),
-/// this will return live scrubber metrics from the background service.
+/// A cluster node answers the counters of its background scrubber, the ones
+/// the `s4_scrubber_*` metrics mirror. A single node runs no background
+/// scrubber and answers with a static message.
 pub async fn scrubber_status(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(claims): Extension<JwtClaims>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
     if !claims.role.can_admin() {
         return Err(AdminError::Forbidden);
     }
 
-    // In standalone mode, there is no background scrubber running.
-    // Use POST /api/admin/scrubber/run for on-demand scrubbing.
-    Ok(Json(json!({
-        "mode": "standalone",
-        "background_scrubber": false,
-        "message": "Use POST /api/admin/scrubber/run for on-demand CRC32 integrity check. Background scrubber is available in cluster mode.",
-    })))
+    Ok(Json(match state.cluster_admin_service.scrubber_status() {
+        Some(status) => json!(status),
+        // Use POST /api/admin/scrubber/run for on-demand scrubbing.
+        None => json!({
+            "mode": "standalone",
+            "background_scrubber": false,
+            "message": "Use POST /api/admin/scrubber/run for on-demand CRC32 integrity check. Background scrubber is available in cluster mode.",
+        }),
+    }))
 }
 
 /// Admin API error type.
@@ -709,6 +663,24 @@ pub enum AdminError {
     Iam(IamError),
     /// Storage engine fault (500).
     Storage(String),
+    /// Too few cluster replicas answered (503); the request may be retried.
+    Unavailable(String),
+}
+
+impl AdminError {
+    /// The admin answer for a bucket the shared bucket code did not create or
+    /// delete, the same cases the S3 route answers.
+    fn from_bucket_change(bucket: &str, error: super::bucket::BucketChangeError) -> Self {
+        use super::bucket::BucketChangeError;
+        match error {
+            BucketChangeError::AlreadyExists => AdminError::BucketAlreadyExists(bucket.to_string()),
+            BucketChangeError::NotFound => AdminError::BucketNotFound(bucket.to_string()),
+            BucketChangeError::NotEmpty => AdminError::BucketNotEmpty(bucket.to_string()),
+            BucketChangeError::Cluster(e) => admin_cluster_error(e),
+            BucketChangeError::Unavailable(message) => AdminError::Unavailable(message),
+            BucketChangeError::Storage(message) => AdminError::Storage(message),
+        }
+    }
 }
 
 impl AdminError {
@@ -732,6 +704,7 @@ impl AdminError {
             AdminError::Iam(_) | AdminError::Storage(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "InternalError")
             }
+            AdminError::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable"),
         }
     }
 
@@ -755,6 +728,7 @@ impl AdminError {
             AdminError::InvalidData => "Invalid request data".to_string(),
             AdminError::Iam(err) => err.to_string(),
             AdminError::Storage(err) => err.clone(),
+            AdminError::Unavailable(err) => err.clone(),
         }
     }
 }

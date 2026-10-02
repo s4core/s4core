@@ -54,6 +54,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::clock::hlc::HlcTimestamp;
+use crate::cluster_metrics;
 use crate::config::AntiEntropyConfig;
 use crate::error::ClusterError;
 use crate::gossip::GossipHandle;
@@ -69,7 +70,8 @@ use crate::rpc::NodeClient;
 pub struct AntiEntropyMetrics {
     /// Number of Merkle exchange rounds completed.
     pub rounds_completed: AtomicU64,
-    /// Total divergent keys discovered across all rounds.
+    /// Keys found behind on this node: its peer held a newer copy, or this
+    /// node could not tell. Each of them is either repaired or failed.
     pub divergent_keys_found: AtomicU64,
     /// Total keys successfully repaired.
     pub repairs_completed: AtomicU64,
@@ -77,6 +79,13 @@ pub struct AntiEntropyMetrics {
     pub repairs_failed: AtomicU64,
     /// Total duration of all repair rounds in milliseconds.
     pub total_repair_duration_ms: AtomicU64,
+    /// The repair frontier lag at the end of the last round, in seconds, as
+    /// the bits of an `f64`: the value `s4_repair_frontier_lag_seconds` was
+    /// set to. Zero before the first round.
+    pub frontier_lag_secs_bits: AtomicU64,
+    /// When a key was last repaired, in Unix milliseconds; zero before the
+    /// first repair.
+    pub last_repair_unix_ms: AtomicU64,
 }
 
 impl AntiEntropyMetrics {
@@ -93,6 +102,8 @@ impl AntiEntropyMetrics {
             repairs_completed: self.repairs_completed.load(Ordering::Relaxed),
             repairs_failed: self.repairs_failed.load(Ordering::Relaxed),
             total_repair_duration_ms: self.total_repair_duration_ms.load(Ordering::Relaxed),
+            frontier_lag_secs: f64::from_bits(self.frontier_lag_secs_bits.load(Ordering::Relaxed)),
+            last_repair_unix_ms: self.last_repair_unix_ms.load(Ordering::Relaxed),
         }
     }
 }
@@ -110,6 +121,41 @@ pub struct AntiEntropySnapshot {
     pub repairs_failed: u64,
     /// Total repair duration in milliseconds.
     pub total_repair_duration_ms: u64,
+    /// The repair frontier lag at the end of the last round, in seconds.
+    pub frontier_lag_secs: f64,
+    /// When a key was last repaired, in Unix milliseconds; zero before the
+    /// first repair.
+    pub last_repair_unix_ms: u64,
+}
+
+/// Wall-clock time in epoch milliseconds, the unit of an HLC's wall time.
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// The age, in seconds at `now_ms`, of the oldest cut `frontier` holds for
+/// `peers` over `ranges`. A peer with no cut in a range has had none since
+/// `since_ms`, and ages from there: that is how long tombstones of the range
+/// have been waiting on it. No peers or no ranges: nothing lags, `0`.
+fn frontier_lag_secs(
+    frontier: &RepairFrontier,
+    ranges: &[KeyRange],
+    peers: &[NodeId],
+    since_ms: u64,
+    now_ms: u64,
+) -> f64 {
+    let oldest = ranges
+        .iter()
+        .flat_map(|range| {
+            peers.iter().map(move |peer| {
+                frontier.get_cut(range, peer).map_or(since_ms, |cut| cut.wall_time)
+            })
+        })
+        .min();
+    oldest.map_or(0.0, |oldest| now_ms.saturating_sub(oldest) as f64 / 1000.0)
 }
 
 /// Maps ring position → list of (bucket, key) pairs at that position.
@@ -137,6 +183,9 @@ pub struct AntiEntropyService {
     repair_frontier: Arc<RwLock<RepairFrontier>>,
     metrics: Arc<AntiEntropyMetrics>,
     pool_nodes: Vec<NodeId>,
+    /// When the service was created, epoch milliseconds: where the frontier of
+    /// a peer it has never moved for starts to age.
+    created_at_ms: u64,
 }
 
 impl AntiEntropyService {
@@ -162,6 +211,7 @@ impl AntiEntropyService {
             repair_frontier: Arc::new(RwLock::new(RepairFrontier::new())),
             metrics: Arc::new(AntiEntropyMetrics::new()),
             pool_nodes,
+            created_at_ms: now_millis(),
         }
     }
 
@@ -428,6 +478,10 @@ impl AntiEntropyService {
             .total_repair_duration_ms
             .fetch_add(elapsed.as_millis() as u64, Ordering::Relaxed);
         self.metrics.rounds_completed.fetch_add(1, Ordering::Relaxed);
+        cluster_metrics::record_anti_entropy_round();
+        let lag = self.frontier_lag_secs().await;
+        self.metrics.frontier_lag_secs_bits.store(lag.to_bits(), Ordering::Relaxed);
+        cluster_metrics::set_repair_frontier_lag(lag);
 
         debug!(
             elapsed_ms = elapsed.as_millis(),
@@ -494,10 +548,9 @@ impl AntiEntropyService {
             return Ok(());
         }
 
+        // Ranges, not keys: the peer lists every leaf once the roots differ,
+        // so how many keys are behind is known only once they are compared.
         let num_divergent = divergent_ranges.len();
-        self.metrics
-            .divergent_keys_found
-            .fetch_add(num_divergent as u64, Ordering::Relaxed);
 
         info!(
             %peer,
@@ -544,6 +597,8 @@ impl AntiEntropyService {
             )
             .await?;
 
+        // Counted as each key is settled, so that a stream that breaks off
+        // midway still accounts for the keys it did repair.
         let mut repaired = 0u64;
         let mut failed = 0u64;
 
@@ -555,105 +610,20 @@ impl AntiEntropyService {
             if item.key.is_empty() {
                 continue;
             }
-
-            let peer_hlc = item.hlc.as_ref().map(|h| HlcTimestamp {
-                wall_time: h.wall_time,
-                logical: h.logical,
-                node_id: u128::from_be_bytes(h.node_id.as_slice().try_into().unwrap_or([0u8; 16])),
-            });
-
-            if let Some(peer_hlc_ts) = peer_hlc {
-                // Parse "bucket/key" from the response.
-                let (bucket, obj_key) = match item.key.split_once('/') {
-                    Some((b, k)) => (b, k),
-                    None => {
-                        warn!(key = %item.key, "invalid repair key format, expected bucket/key");
-                        failed += 1;
-                        continue;
-                    }
-                };
-
-                // LWW: only write if peer's version is newer than local.
-                //
-                // Note on tie-breaking: IndexRecord doesn't store the HLC
-                // logical counter, so when wall times match we treat any
-                // peer logical > 0 as "newer". This is a safe bias toward
-                // convergence — the worst case is a redundant overwrite
-                // with identical data.
-                let should_write = match self.storage.head_object(bucket, obj_key).await {
-                    Ok(local_record) => {
-                        let local_millis = local_record.modified_at / 1_000_000;
-                        peer_hlc_ts.wall_time > local_millis
-                            || (peer_hlc_ts.wall_time == local_millis && peer_hlc_ts.logical > 0)
-                    }
-                    Err(_) => true, // Key missing locally — always write.
-                };
-
-                if !should_write {
-                    continue;
-                }
-
-                // Defense-in-depth: ensure bucket marker exists locally.
-                // The bucket marker itself is also an object in __system__,
-                // so it will be synced by anti-entropy. But if a data object
-                // arrives before its bucket marker, auto-create the marker
-                // so API-layer bucket checks pass.
-                if bucket != "__system__" {
-                    let marker_key = format!("__s4_bucket_marker_{bucket}");
-                    if self.storage.head_object("__system__", &marker_key).await.is_err() {
-                        debug!(bucket = %bucket, "auto-creating bucket marker during anti-entropy repair");
-                        let _ = self
-                            .storage
-                            .put_object(
-                                "__system__",
-                                &marker_key,
-                                b"1",
-                                "application/octet-stream",
-                                &HashMap::new(),
-                            )
-                            .await;
-                    }
-                }
-
-                // Use content_type and metadata from the peer's response
-                // (preserves the original values from when the object was written).
-                let content_type = if item.content_type.is_empty() {
-                    "application/octet-stream"
-                } else {
-                    &item.content_type
-                };
-
-                match self
-                    .storage
-                    .put_object(bucket, obj_key, &item.data, content_type, &item.metadata)
-                    .await
-                {
-                    Ok(_) => {
-                        debug!(
-                            bucket = %bucket,
-                            key = %obj_key,
-                            peer_wall_time = peer_hlc_ts.wall_time,
-                            "anti-entropy: repaired key from peer"
-                        );
-                        repaired += 1;
-                    }
-                    Err(e) => {
-                        warn!(
-                            bucket = %bucket,
-                            key = %obj_key,
-                            error = %e,
-                            "anti-entropy: failed to write repair data"
-                        );
-                        failed += 1;
-                    }
-                }
+            let Some(outcome) = self.repair_from_peer(item).await else {
+                continue; // this node's copy is as new as the peer's
+            };
+            self.metrics.divergent_keys_found.fetch_add(1, Ordering::Relaxed);
+            if outcome {
+                self.metrics.repairs_completed.fetch_add(1, Ordering::Relaxed);
+                self.metrics.last_repair_unix_ms.store(now_millis(), Ordering::Relaxed);
+                repaired += 1;
             } else {
+                self.metrics.repairs_failed.fetch_add(1, Ordering::Relaxed);
                 failed += 1;
             }
+            cluster_metrics::record_anti_entropy_repair(outcome);
         }
-
-        self.metrics.repairs_completed.fetch_add(repaired, Ordering::Relaxed);
-        self.metrics.repairs_failed.fetch_add(failed, Ordering::Relaxed);
 
         // Step 4: Advance repair frontier.
         if repaired > 0 {
@@ -677,6 +647,115 @@ impl AntiEntropyService {
         );
 
         Ok(())
+    }
+
+    /// Takes the peer's copy of one key if it is newer than this node's.
+    ///
+    /// `None` when this node's copy is as new as the peer's: the key is not
+    /// behind here. Otherwise whether the peer's copy was written — including
+    /// `false` for a copy this node cannot place in time or in a bucket, which
+    /// leaves the key as behind as it was.
+    async fn repair_from_peer(&self, item: proto::RepairSyncResponse) -> Option<bool> {
+        let Some(peer_hlc_ts) = item.hlc.as_ref().map(|h| HlcTimestamp {
+            wall_time: h.wall_time,
+            logical: h.logical,
+            node_id: u128::from_be_bytes(h.node_id.as_slice().try_into().unwrap_or([0u8; 16])),
+        }) else {
+            return Some(false);
+        };
+
+        // Parse "bucket/key" from the response.
+        let Some((bucket, obj_key)) = item.key.split_once('/') else {
+            warn!(key = %item.key, "invalid repair key format, expected bucket/key");
+            return Some(false);
+        };
+
+        // LWW: only write if peer's version is newer than local.
+        //
+        // Note on tie-breaking: IndexRecord doesn't store the HLC
+        // logical counter, so when wall times match we treat any
+        // peer logical > 0 as "newer". This is a safe bias toward
+        // convergence — the worst case is a redundant overwrite
+        // with identical data.
+        let should_write = match self.storage.head_object(bucket, obj_key).await {
+            Ok(local_record) => {
+                let local_millis = local_record.modified_at / 1_000_000;
+                peer_hlc_ts.wall_time > local_millis
+                    || (peer_hlc_ts.wall_time == local_millis && peer_hlc_ts.logical > 0)
+            }
+            Err(_) => true, // Key missing locally — always write.
+        };
+
+        if !should_write {
+            return None;
+        }
+
+        // Defense-in-depth: ensure bucket marker exists locally.
+        // The bucket marker itself is also an object in __system__,
+        // so it will be synced by anti-entropy. But if a data object
+        // arrives before its bucket marker, auto-create the marker
+        // so API-layer bucket checks pass.
+        if bucket != "__system__" {
+            let marker_key = format!("__s4_bucket_marker_{bucket}");
+            if self.storage.head_object("__system__", &marker_key).await.is_err() {
+                debug!(bucket = %bucket, "auto-creating bucket marker during anti-entropy repair");
+                let _ = self
+                    .storage
+                    .put_object(
+                        "__system__",
+                        &marker_key,
+                        b"1",
+                        "application/octet-stream",
+                        &HashMap::new(),
+                    )
+                    .await;
+            }
+        }
+
+        // Use content_type and metadata from the peer's response
+        // (preserves the original values from when the object was written).
+        let content_type = if item.content_type.is_empty() {
+            "application/octet-stream"
+        } else {
+            &item.content_type
+        };
+
+        match self
+            .storage
+            .put_object(bucket, obj_key, &item.data, content_type, &item.metadata)
+            .await
+        {
+            Ok(_) => {
+                debug!(
+                    bucket = %bucket,
+                    key = %obj_key,
+                    peer_wall_time = peer_hlc_ts.wall_time,
+                    "anti-entropy: repaired key from peer"
+                );
+                Some(true)
+            }
+            Err(e) => {
+                warn!(
+                    bucket = %bucket,
+                    key = %obj_key,
+                    error = %e,
+                    "anti-entropy: failed to write repair data"
+                );
+                Some(false)
+            }
+        }
+    }
+
+    /// Seconds since the repair frontier last moved, for the peer it has gone
+    /// longest without moving for, over every range this node keeps a tree
+    /// for. A peer it never moved for counts from the service's creation.
+    async fn frontier_lag_secs(&self) -> f64 {
+        let ranges: Vec<KeyRange> =
+            self.merkle_trees.read().await.values().map(MerkleTree::key_range).collect();
+        let peers: Vec<NodeId> =
+            self.pool_nodes.iter().copied().filter(|n| *n != self.local_node_id).collect();
+        let frontier = self.repair_frontier.read().await;
+        frontier_lag_secs(&frontier, &ranges, &peers, self.created_at_ms, now_millis())
     }
 
     /// Pick a random alive replica peer (not self).
@@ -1189,5 +1268,212 @@ mod tests {
         let _ = tx.send(true);
         service.run(rx).await;
         // If we get here, the service exited properly.
+    }
+
+    // -----------------------------------------------------------------------
+    // Metrics
+    // -----------------------------------------------------------------------
+
+    fn cut(wall_time: u64) -> HlcTimestamp {
+        HlcTimestamp {
+            wall_time,
+            logical: 0,
+            node_id: 0,
+        }
+    }
+
+    /// The frontier lags by the peer it moved for least recently; a peer it
+    /// never moved for has been waiting since the service was created.
+    #[test]
+    fn the_frontier_lags_by_its_oldest_boundary() {
+        let range = KeyRange::full();
+        let (recent, stale, never) = (NodeId(2), NodeId(3), NodeId(4));
+        let mut frontier = RepairFrontier::new();
+        frontier.advance(&range, recent, cut(90_000));
+        frontier.advance(&range, stale, cut(40_000));
+
+        let lag = |peers: &[NodeId]| frontier_lag_secs(&frontier, &[range], peers, 10_000, 100_000);
+        assert_eq!(lag(&[recent]), 10.0);
+        assert_eq!(lag(&[recent, stale]), 60.0);
+        assert_eq!(lag(&[recent, stale, never]), 90.0);
+        assert_eq!(lag(&[]), 0.0, "a node without peers waits on nobody");
+        assert_eq!(
+            frontier_lag_secs(&frontier, &[], &[recent], 10_000, 100_000),
+            0.0
+        );
+    }
+
+    /// A round with nobody to exchange with is still a round, and leaves the
+    /// frontier where the service found it.
+    #[tokio::test]
+    async fn a_round_without_a_live_peer_is_counted() {
+        let metrics = crate::test_metrics::TestMetrics::install();
+        let service = make_service(NodeId(1), vec![(NodeId(2), NodeStatus::Dead)]);
+        service.init_tree(KeyRange::full(), &[]).await;
+
+        service.run_round().await;
+
+        assert_eq!(
+            metrics.value("s4_anti_entropy_rounds_total", &[]),
+            Some(1.0)
+        );
+        assert_eq!(
+            metrics.value("s4_anti_entropy_divergent_keys_total", &[]),
+            None
+        );
+        let lag = metrics.value("s4_repair_frontier_lag_seconds", &[]).unwrap();
+        assert!((0.0..5.0).contains(&lag), "lag {lag}");
+        let snapshot = service.metrics().snapshot();
+        assert_eq!(
+            snapshot.frontier_lag_secs, lag,
+            "the admin API reads another lag"
+        );
+        assert_eq!(snapshot.last_repair_unix_ms, 0, "nothing was repaired");
+    }
+
+    /// One round against a real peer: of the keys this node holds, only the
+    /// one the peer holds a newer copy of is behind, is counted as divergent
+    /// and is repaired — not the 2^(depth-1) leaf ranges a differing root reports,
+    /// which is what the divergence counter used to add up.
+    #[tokio::test]
+    async fn a_round_counts_the_keys_it_found_behind_and_repaired() {
+        use crate::replica::ReplicaReadHandler;
+        use crate::rpc::server::{NodeRpcServer, RpcServerConfig};
+        use s4_core::storage::BitcaskStorageEngine;
+
+        let metrics = crate::test_metrics::TestMetrics::install();
+        let (local, peer) = (NodeId(1), NodeId(2));
+        let peer_addr: SocketAddr = "127.0.0.1:19830".parse().unwrap();
+
+        async fn storage(dir: &tempfile::TempDir) -> Arc<BitcaskStorageEngine> {
+            Arc::new(
+                BitcaskStorageEngine::new(
+                    dir.path().join("volumes"),
+                    dir.path().join("metadata"),
+                    10 * 1024 * 1024,
+                    4096,
+                    false,
+                )
+                .await
+                .unwrap(),
+            )
+        }
+        async fn put(storage: &BitcaskStorageEngine, key: &str, data: &[u8], wall: Option<u64>) {
+            let mut metadata = HashMap::new();
+            if let Some(wall) = wall {
+                metadata.insert("_s4_hlc_wall".to_string(), wall.to_string());
+                metadata.insert("_s4_hlc_logical".to_string(), "0".to_string());
+                metadata.insert("_s4_hlc_node_id".to_string(), "2".to_string());
+            }
+            storage
+                .put_object(
+                    "__system__",
+                    "__s4_bucket_marker_bucket",
+                    b"1",
+                    "text/plain",
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap();
+            storage.put_object("bucket", key, data, "text/plain", &metadata).await.unwrap();
+        }
+        let service = |node: NodeId, storage: Arc<BitcaskStorageEngine>, members| {
+            let gossip = Arc::new(GossipHandle::new_for_testing(members));
+            let client = Arc::new(NodeClient::new(gossip.clone(), NodeClientConfig::default()));
+            AntiEntropyService::new(
+                AntiEntropyConfig::default(),
+                node,
+                PoolId::new(1),
+                vec![local, peer],
+                gossip,
+                client,
+                storage,
+            )
+        };
+
+        // This node: a copy the peer has overwritten since, and one written
+        // here after the peer's.
+        let local_dir = tempfile::tempdir().unwrap();
+        let local_storage = storage(&local_dir).await;
+        put(&local_storage, "stale", b"old", None).await;
+        put(&local_storage, "newer-here", b"new", None).await;
+
+        // The peer: the newer copy of the first, an older one of the second,
+        // and a key only it has, which is its own round to push.
+        let peer_dir = tempfile::tempdir().unwrap();
+        let peer_storage = storage(&peer_dir).await;
+        put(&peer_storage, "stale", b"new", Some(now_millis() + 60_000)).await;
+        put(&peer_storage, "newer-here", b"old", Some(1_000)).await;
+        put(&peer_storage, "only-on-peer", b"x", Some(1_000)).await;
+        let peer_service = Arc::new(service(peer, peer_storage.clone(), HashMap::new()));
+        peer_service.init_from_storage().await;
+        let mut peer_state = test_node_state(peer, NodeStatus::Alive);
+        peer_state.meta.addr.grpc_addr = peer_addr;
+        let _server = NodeRpcServer::new(
+            peer,
+            Arc::new(peer_state.meta.clone()),
+            Arc::new(GossipHandle::new_for_testing(HashMap::new())),
+        )
+        .with_anti_entropy(peer_service)
+        .with_read_handler(Arc::new(ReplicaReadHandler::new(peer_storage, 1)))
+        .start(RpcServerConfig {
+            bind_addr: peer_addr,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let local_service = service(
+            local,
+            local_storage.clone(),
+            HashMap::from([(peer, peer_state)]),
+        );
+        local_service.init_from_storage().await;
+        let before_round = now_millis();
+        local_service.run_round().await;
+
+        let (data, _) = local_storage.get_object("bucket", "stale").await.unwrap();
+        assert_eq!(data, b"new", "the key behind was not repaired");
+        let (data, _) = local_storage.get_object("bucket", "newer-here").await.unwrap();
+        assert_eq!(data, b"new", "a key newer here was overwritten");
+
+        assert_eq!(
+            metrics.value("s4_anti_entropy_rounds_total", &[]),
+            Some(1.0)
+        );
+        assert_eq!(
+            metrics.value("s4_anti_entropy_divergent_keys_total", &[]),
+            Some(1.0)
+        );
+        assert_eq!(
+            metrics.value("s4_anti_entropy_repairs_total", &[("outcome", "ok")]),
+            Some(1.0)
+        );
+        assert_eq!(
+            metrics.value("s4_anti_entropy_repairs_total", &[("outcome", "failed")]),
+            None
+        );
+        let snapshot = local_service.metrics().snapshot();
+        assert_eq!(
+            (
+                snapshot.rounds_completed,
+                snapshot.divergent_keys_found,
+                snapshot.repairs_completed
+            ),
+            (1, 1, 1),
+            "the counters the admin API reads disagree with the metrics"
+        );
+        // The repair moved the frontier for the peer just now.
+        let lag = metrics.value("s4_repair_frontier_lag_seconds", &[]).unwrap();
+        assert!((0.0..5.0).contains(&lag), "lag {lag}");
+        assert_eq!(
+            snapshot.frontier_lag_secs, lag,
+            "the admin API reads another lag"
+        );
+        assert!(
+            (before_round..=now_millis()).contains(&snapshot.last_repair_unix_ms),
+            "last repair at {} is not during the round",
+            snapshot.last_repair_unix_ms
+        );
     }
 }

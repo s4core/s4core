@@ -29,7 +29,7 @@ The dashboard displays key metrics and system health information.
 - Pie chart showing storage usage per bucket
 - Visual breakdown of how storage is distributed
 
-All dashboard data is sourced from the `/api/stats` and `/api/admin/bucket-stats` endpoints.
+All dashboard data is sourced from the `/api/stats` and `/api/admin/bucket-stats` endpoints. On a cluster node the bucket, object and storage numbers are the pool's, counted at most 10 seconds ago, whichever node the console is connected to; the deduplication ratio is that node's own.
 
 ## Bucket Management
 
