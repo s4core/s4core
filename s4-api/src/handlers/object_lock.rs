@@ -34,11 +34,11 @@ use s4_features::object_lock::{
 use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
 
+use super::cluster_unsupported::{refuse_in_cluster, OBJECT_LOCK_UNSUPPORTED};
 use crate::s3::errors::S3Error;
 use crate::server::AppState;
 
-// Storage key prefix for Object Lock configuration
-const OBJECT_LOCK_CONFIG_PREFIX: &str = "__s4_bucket_object_lock_";
+use s4_core::types::OBJECT_LOCK_CONFIG_KEY_PREFIX as OBJECT_LOCK_CONFIG_PREFIX;
 
 // ============================================================================
 // Bucket Object Lock Configuration Handlers
@@ -51,7 +51,8 @@ const OBJECT_LOCK_CONFIG_PREFIX: &str = "__s4_bucket_object_lock_";
 /// # Returns
 ///
 /// - 200 OK with XML Object Lock configuration
-/// - 404 ObjectLockConfigurationNotFoundError if not configured
+/// - 404 ObjectLockConfigurationNotFoundError if not configured, and always
+///   in cluster mode, which enforces no Object Lock
 pub async fn get_bucket_object_lock_configuration(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
@@ -66,6 +67,12 @@ pub async fn get_bucket_object_lock_configuration(
     // Check if bucket exists (standalone; cluster mode checked above)
     if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
         return resp;
+    }
+
+    // Cluster mode enforces no Object Lock, whatever a node stored before it
+    // refused to turn it on.
+    if state.is_cluster_mode() {
+        return S3Error::ObjectLockConfigurationNotFound.into_response();
     }
 
     // Get Object Lock configuration
@@ -95,6 +102,7 @@ pub async fn get_bucket_object_lock_configuration(
 ///
 /// - 200 OK if configuration saved successfully
 /// - 400 Bad Request if invalid configuration or versioning not enabled
+/// - 501 Not Implemented in cluster mode
 ///
 /// # Critical Validations
 ///
@@ -107,6 +115,9 @@ pub async fn put_bucket_object_lock_configuration(
 ) -> impl IntoResponse {
     info!("PutBucketObjectLockConfiguration: {}", bucket);
 
+    if let Some(resp) = refuse_in_cluster(&state, OBJECT_LOCK_UNSUPPORTED) {
+        return resp;
+    }
     if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
         return resp;
     }
@@ -234,6 +245,7 @@ async fn resolve_version_id(
 ///
 /// - 200 OK with XML retention configuration
 /// - 404 NoSuchObjectLockConfiguration if retention not set
+/// - 501 Not Implemented in cluster mode, which enforces no Object Lock
 pub async fn get_object_retention(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
@@ -243,6 +255,10 @@ pub async fn get_object_retention(
         "GetObjectRetention: {}/{} version={:?}",
         bucket, key, query.version_id
     );
+
+    if let Some(resp) = refuse_in_cluster(&state, OBJECT_LOCK_UNSUPPORTED) {
+        return resp;
+    }
 
     let storage = state.storage.read().await;
 
@@ -296,6 +312,7 @@ pub async fn get_object_retention(
 ///
 /// - 200 OK if retention set successfully
 /// - 400 Bad Request if invalid retention or COMPLIANCE retention modification attempted
+/// - 501 Not Implemented in cluster mode, which enforces no Object Lock
 ///
 /// # Safety (Phase 3)
 ///
@@ -312,6 +329,10 @@ pub async fn put_object_retention(
         "PutObjectRetention: {}/{} version={:?}",
         bucket, key, query.version_id
     );
+
+    if let Some(resp) = refuse_in_cluster(&state, OBJECT_LOCK_UNSUPPORTED) {
+        return resp;
+    }
 
     let bypass_governance = is_bypass_governance(&headers);
     let storage = state.storage.read().await;
@@ -454,6 +475,7 @@ pub async fn put_object_retention(
 /// # Returns
 ///
 /// - 200 OK with XML legal hold status
+/// - 501 Not Implemented in cluster mode, which enforces no Object Lock
 pub async fn get_object_legal_hold(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
@@ -463,6 +485,10 @@ pub async fn get_object_legal_hold(
         "GetObjectLegalHold: {}/{} version={:?}",
         bucket, key, query.version_id
     );
+
+    if let Some(resp) = refuse_in_cluster(&state, OBJECT_LOCK_UNSUPPORTED) {
+        return resp;
+    }
 
     let storage = state.storage.read().await;
 
@@ -502,6 +528,7 @@ pub async fn get_object_legal_hold(
 /// # Returns
 ///
 /// - 200 OK if legal hold set successfully
+/// - 501 Not Implemented in cluster mode, which enforces no Object Lock
 pub async fn put_object_legal_hold(
     State(state): State<AppState>,
     Path((bucket, key)): Path<(String, String)>,
@@ -512,6 +539,10 @@ pub async fn put_object_legal_hold(
         "PutObjectLegalHold: {}/{} version={:?}",
         bucket, key, query.version_id
     );
+
+    if let Some(resp) = refuse_in_cluster(&state, OBJECT_LOCK_UNSUPPORTED) {
+        return resp;
+    }
 
     let storage = state.storage.read().await;
 
@@ -607,8 +638,7 @@ async fn get_bucket_versioning_status_internal(
     storage: &dyn StorageEngine,
     bucket: &str,
 ) -> VersioningStatus {
-    const VERSIONING_CONFIG_PREFIX: &str = "__s4_bucket_versioning_";
-    let versioning_key = format!("{}{}", VERSIONING_CONFIG_PREFIX, bucket);
+    let versioning_key = format!("{}{}", s4_core::types::VERSIONING_CONFIG_KEY_PREFIX, bucket);
 
     match storage.get_object("__system__", &versioning_key).await {
         Ok((data, _)) => {

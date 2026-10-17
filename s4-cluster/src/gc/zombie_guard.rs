@@ -175,6 +175,7 @@ mod tests {
         let policy = TombstonePolicy {
             gc_grace: Duration::from_secs(3600),
             max_rejoin_downtime: Duration::from_secs(300), // 5 minutes
+            ..TombstonePolicy::default()
         };
         let guard = ZombieGuard::new(policy);
 

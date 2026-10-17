@@ -27,9 +27,11 @@ pub mod admin_cluster;
 pub mod admin_ec;
 pub mod bucket;
 pub mod bucket_config;
+pub mod cluster_unsupported;
 pub mod multipart;
 pub mod object;
 pub mod object_lock;
+pub mod readiness;
 pub mod select;
 pub mod stats;
 pub mod usage;
@@ -43,8 +45,11 @@ pub use bucket_config::{
     delete_bucket_cors, delete_bucket_encryption, delete_bucket_lifecycle, delete_bucket_policy,
     get_bucket_cors, get_bucket_encryption, get_bucket_lifecycle, get_bucket_location,
     get_bucket_policy, get_bucket_policy_status, get_bucket_versioning,
-    get_bucket_versioning_status, get_cors_config, is_versioning_enabled, put_bucket_cors,
-    put_bucket_encryption, put_bucket_lifecycle, put_bucket_policy, put_bucket_versioning,
+    get_bucket_versioning_status, is_versioning_enabled, put_bucket_cors, put_bucket_encryption,
+    put_bucket_lifecycle, put_bucket_policy, put_bucket_versioning,
+};
+pub use cluster_unsupported::{
+    unenforced_bucket_configs, UnenforcedBucketConfig, UnenforcedConfigKind, UnenforcedConfigs,
 };
 pub use multipart::{
     abort_multipart_upload, complete_multipart_upload, create_multipart_upload, list_parts,
@@ -60,6 +65,44 @@ pub use object_lock::{
 };
 pub use select::{bucket_sql_query, select_object_content};
 
+/// The user metadata a request carries: its `x-amz-meta-*` headers, keyed
+/// without the prefix and in lower case.
+///
+/// A key starting with `_s4_` is left out. The storage reads such keys as
+/// S4's own instructions — the HLC of a replicated write, the ETag a repaired
+/// copy keeps — and a client must not be able to give them.
+pub(crate) fn user_metadata(
+    headers: &axum::http::HeaderMap,
+) -> std::collections::HashMap<String, String> {
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let key = name.as_str().to_lowercase().strip_prefix("x-amz-meta-")?.to_string();
+            if key.starts_with("_s4_") {
+                return None;
+            }
+            Some((key, value.to_str().ok()?.to_string()))
+        })
+        .collect()
+}
+
+/// The stored metadata of a copy's source as the copy takes it: without the
+/// keys reserved for S4 (`_s4_*`), which a record written before client
+/// headers were filtered may hold and which the write of the copy would read
+/// as instructions. The physical storage class is the object's own and stays.
+pub(crate) fn copied_metadata(
+    stored: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    stored
+        .iter()
+        .filter(|(key, _)| {
+            !key.starts_with("_s4_")
+                || key.as_str() == s4_core::types::S4_STORAGE_CLASS_METADATA_KEY
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
 /// The key of a bucket's marker in `__system__`: the bucket exists while it
 /// does.
 pub(crate) fn bucket_marker_key(bucket: &str) -> String {
@@ -70,14 +113,7 @@ pub(crate) fn bucket_marker_key(bucket: &str) -> String {
 /// bucket deletes them all, so a bucket created again under the same name
 /// starts without the old one's settings.
 pub(crate) fn bucket_config_keys(bucket: &str) -> [String; 6] {
-    [
-        format!("__s4_bucket_cors_{bucket}"),
-        format!("__s4_bucket_versioning_{bucket}"),
-        format!("__s4_bucket_lifecycle_{bucket}"),
-        format!("__s4_bucket_policy_{bucket}"),
-        format!("__s4_bucket_object_lock_{bucket}"),
-        format!("__s4_bucket_encryption_{bucket}"),
-    ]
+    s4_core::types::BUCKET_CONFIG_KEY_PREFIXES.map(|prefix| format!("{prefix}{bucket}"))
 }
 
 /// Check that a bucket exists in standalone mode, under the storage lock the
@@ -292,6 +328,9 @@ pub(crate) fn cluster_error_to_response(
             (StatusCode::FORBIDDEN, message.clone()).into_response()
         }
         s4_cluster::ClusterError::QuorumNotMet { .. }
+        | s4_cluster::ClusterError::PlacementGenerationFenced { .. }
+        | s4_cluster::ClusterError::ReplicaFenced(_)
+        | s4_cluster::ClusterError::Unavailable(_)
         | s4_cluster::ClusterError::WriteTimeout(_)
         | s4_cluster::ClusterError::ReadTimeout(_) => axum::response::Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -312,5 +351,73 @@ pub(crate) fn cluster_error_to_response(
             format!("Cluster error: {}", err),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A copy takes its source's stored metadata without the keys reserved
+    /// for S4, which a record from before client headers were filtered may
+    /// hold; the physical storage class stays.
+    /// A pool that cannot answer now is a retry for the client, not a
+    /// failure of the server: 503 like a quorum not met.
+    #[test]
+    fn an_unavailable_pool_answers_service_unavailable() {
+        for error in [
+            s4_cluster::ClusterError::Unavailable("manifest quorum not reached".into()),
+            s4_cluster::ClusterError::QuorumNotMet {
+                needed: 4,
+                achieved: 3,
+            },
+        ] {
+            assert_eq!(
+                cluster_error_to_response(&error).status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{error}"
+            );
+        }
+        assert_eq!(
+            cluster_error_to_response(&s4_cluster::ClusterError::Storage("disk".into())).status(),
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn replica_admission_refusals_answer_service_unavailable() {
+        for error in [
+            s4_cluster::ClusterError::ReplicaFenced("replica refused admission".into()),
+            s4_cluster::ClusterError::PlacementGenerationFenced {
+                coordinator: 0,
+                minimum: 2,
+            },
+        ] {
+            assert_eq!(
+                cluster_error_to_response(&error).status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_copy_takes_no_reserved_key_from_its_source() {
+        let stored = std::collections::HashMap::from([
+            ("owner".to_string(), "alice".to_string()),
+            (
+                s4_core::REPAIRED_ETAG_METADATA_KEY.to_string(),
+                "forged".to_string(),
+            ),
+            ("_s4_hlc_wall".to_string(), "99".to_string()),
+            (
+                s4_core::types::S4_STORAGE_CLASS_METADATA_KEY.to_string(),
+                "standard".to_string(),
+            ),
+        ]);
+        let copied = copied_metadata(&stored);
+        let mut keys: Vec<&str> = copied.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["_s4_storage_class", "owner"]);
     }
 }

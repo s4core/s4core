@@ -88,6 +88,12 @@ pub async fn create_multipart_upload(
 ) -> impl IntoResponse {
     info!("CreateMultipartUpload: bucket={}, key={}", bucket, key);
 
+    if let Some(resp) =
+        super::cluster_unsupported::refuse_object_lock_headers_in_cluster(&state, &headers)
+    {
+        return resp;
+    }
+
     if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
         return resp;
     }
@@ -108,16 +114,7 @@ pub async fn create_multipart_upload(
         .unwrap_or("binary/octet-stream");
 
     // Extract custom metadata (x-amz-meta-* headers)
-    let mut custom_metadata = HashMap::new();
-    for (name, value) in headers.iter() {
-        let name_str = name.as_str().to_lowercase();
-        if name_str.starts_with("x-amz-meta-") {
-            if let Ok(v) = value.to_str() {
-                let meta_key = name_str.strip_prefix("x-amz-meta-").unwrap().to_string();
-                custom_metadata.insert(meta_key, v.to_string());
-            }
-        }
-    }
+    let custom_metadata = super::user_metadata(&headers);
 
     if let Some(write_coord) = state.write_coordinator.clone() {
         drop(storage);
@@ -953,7 +950,9 @@ pub async fn complete_multipart_upload(
     let storage_arc = state.storage.clone();
     let write_coordinator = state.write_coordinator.clone();
 
-    tokio::spawn(async move {
+    // The completion is still the client's request, answered as it goes: its
+    // quorum operations count as the client's, not as the node's own work.
+    tokio::spawn(s4_cluster::on_behalf_of_client(async move {
         // Keep-alive: send whitespace periodically (safety mechanism —
         // native complete is fast but we keep this for S3 spec compliance)
         let keepalive_tx = tx.clone();
@@ -1109,7 +1108,7 @@ pub async fn complete_multipart_upload(
                 let _ = tx.send(Ok(Bytes::from(error_xml))).await;
             }
         }
-    });
+    }));
 
     let stream = ReceiverStream::new(rx);
     let body = Body::from_stream(stream);

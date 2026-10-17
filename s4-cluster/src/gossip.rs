@@ -56,7 +56,11 @@ use tracing::{debug, info, trace, warn};
 
 use crate::cluster_metrics::{self, PoolRoster};
 use crate::error::ClusterError;
+use crate::iam_catch_up::IamAnnouncement;
+use crate::iam_config::IamConfigPrint;
 use crate::identity::{GossipIdentity, NodeId, NodeMeta, NodeStatus};
+use crate::metadata_placement::{PeerPlacement, PlacementRecord, PlacementView};
+use crate::pool_generation::GenerationAnnouncement;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -169,6 +173,145 @@ struct MetaStamp {
     version: u64,
 }
 
+/// What a metadata broadcast carries after [`MetaBroadcast`]. A node of an
+/// older release decodes the broadcast with `postcard::from_bytes`, which
+/// stops at the end of what it knows and ignores what follows, and foca
+/// relays a broadcast as the bytes it received: the tail reaches every node
+/// unchanged. A node that sent none — an older release — reads as the default.
+///
+/// On the wire the tail is a sequence of parts, each added by a release after
+/// the parts before it and never changed: [`AdoptionTail`] (protocol 6), then
+/// [`PlacementTail`], then [`IamTail`] (protocol 8). A node reads the parts it
+/// knows and ignores the rest, and a part missing reads as its default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct MetaTail {
+    /// The node adopted the bucket configurations it stored before protocol
+    /// 6 (`ConfigAdoption`).
+    bucket_configs_adopted: bool,
+    /// Where the node is in the move of its pool's bucket metadata, `None`
+    /// from a node that announces none — of an earlier release, or before
+    /// its first record.
+    bucket_metadata_placement: Option<PlacementRecord>,
+    /// The state of the node's copy of IAM, `None` from a node that
+    /// announces none — of an earlier release, or before it read its copy.
+    iam: Option<IamAnnouncement>,
+    /// The node keeps no IAM of its own that its pool has not taken over
+    /// (plan CLUSTER-IAM-REPLICATION.md, decision 8).
+    iam_adopted: bool,
+    /// Fingerprints of the node's IAM configuration, `None` from a node that
+    /// announces none (plan CLUSTER-IAM-REPLICATION.md, decision 6).
+    iam_config: Option<IamConfigPrint>,
+    /// Durable pool generations (protocol 9), separate from topology in use.
+    pool_generation: Option<GenerationAnnouncement>,
+}
+
+/// The first part of [`MetaTail`] on the wire.
+#[derive(Debug, Serialize, Deserialize)]
+struct AdoptionTail {
+    bucket_configs_adopted: bool,
+}
+
+/// The second part of [`MetaTail`] on the wire.
+#[derive(Debug, Serialize, Deserialize)]
+struct PlacementTail {
+    bucket_metadata_placement: Option<PlacementRecord>,
+}
+
+/// The third part of [`MetaTail`] on the wire.
+#[derive(Debug, Serialize, Deserialize)]
+struct IamTail {
+    iam: Option<IamAnnouncement>,
+    iam_adopted: bool,
+    iam_config: Option<IamConfigPrint>,
+}
+
+/// The fourth, fixed-size part of the metadata tail (protocol 9).
+#[derive(Debug, Serialize, Deserialize)]
+struct GenerationTail {
+    pool_generation: Option<GenerationAnnouncement>,
+}
+
+/// The bytes of a metadata broadcast: [`MetaBroadcast`], then [`MetaTail`].
+fn encode_meta(broadcast: &MetaBroadcast, tail: MetaTail) -> postcard::Result<Vec<u8>> {
+    let mut data = postcard::to_allocvec(broadcast)?;
+    data.extend(postcard::to_allocvec(&AdoptionTail {
+        bucket_configs_adopted: tail.bucket_configs_adopted,
+    })?);
+    data.extend(postcard::to_allocvec(&PlacementTail {
+        bucket_metadata_placement: tail.bucket_metadata_placement,
+    })?);
+    data.extend(postcard::to_allocvec(&IamTail {
+        iam: tail.iam,
+        iam_adopted: tail.iam_adopted,
+        iam_config: tail.iam_config,
+    })?);
+    data.extend(postcard::to_allocvec(&GenerationTail {
+        pool_generation: tail.pool_generation,
+    })?);
+    Ok(data)
+}
+
+/// A metadata broadcast and its tail: a part of the tail the sender put none
+/// of, or one this release cannot read, reads as its default, and so does
+/// every part after it. What the broadcast itself says — the node's
+/// protocol, capacity and addresses — counts whatever a later release adds
+/// after it.
+fn decode_meta(data: &[u8]) -> postcard::Result<(MetaBroadcast, MetaTail)> {
+    let (broadcast, rest) = postcard::take_from_bytes::<MetaBroadcast>(data)?;
+    let mut tail = MetaTail::default();
+    if rest.is_empty() {
+        return Ok((broadcast, tail));
+    }
+    let not_understood = |e: postcard::Error| {
+        debug!(node_id = %broadcast.node_id, error = %e, "metadata tail not understood, ignored");
+    };
+    let rest = match postcard::take_from_bytes::<AdoptionTail>(rest) {
+        Ok((adoption, rest)) => {
+            tail.bucket_configs_adopted = adoption.bucket_configs_adopted;
+            rest
+        }
+        Err(e) => {
+            not_understood(e);
+            return Ok((broadcast, tail));
+        }
+    };
+    if rest.is_empty() {
+        return Ok((broadcast, tail));
+    }
+    let rest = match postcard::take_from_bytes::<PlacementTail>(rest) {
+        Ok((placement, rest)) => {
+            tail.bucket_metadata_placement = placement.bucket_metadata_placement;
+            rest
+        }
+        Err(e) => {
+            not_understood(e);
+            return Ok((broadcast, tail));
+        }
+    };
+    if rest.is_empty() {
+        return Ok((broadcast, tail));
+    }
+    let rest = match postcard::take_from_bytes::<IamTail>(rest) {
+        Ok((iam, rest)) => {
+            tail.iam = iam.iam;
+            tail.iam_adopted = iam.iam_adopted;
+            tail.iam_config = iam.iam_config;
+            rest
+        }
+        Err(e) => {
+            not_understood(e);
+            return Ok((broadcast, tail));
+        }
+    };
+    if !rest.is_empty() {
+        match postcard::take_from_bytes::<GenerationTail>(rest) {
+            Ok((generation, _)) => tail.pool_generation = generation.pool_generation,
+            Err(e) => not_understood(e),
+        }
+    }
+    Ok((broadcast, tail))
+}
+
 /// Key used by foca to deduplicate and invalidate stale broadcasts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MetaBroadcastKey {
@@ -188,7 +331,7 @@ struct MetaHandler {
     /// Most recent stamp seen per node — used to drop stale broadcasts.
     seen: HashMap<NodeId, MetaStamp>,
     /// Channel for forwarding new metadata to the async run-loop.
-    meta_tx: mpsc::UnboundedSender<(NodeId, NodeMeta)>,
+    meta_tx: mpsc::UnboundedSender<(NodeId, NodeMeta, MetaTail)>,
 }
 
 impl BroadcastHandler<GossipIdentity> for MetaHandler {
@@ -200,8 +343,7 @@ impl BroadcastHandler<GossipIdentity> for MetaHandler {
         data: &[u8],
         _sender: Option<&GossipIdentity>,
     ) -> Result<Option<Self::Key>, Self::Error> {
-        let broadcast: MetaBroadcast =
-            postcard::from_bytes(data).map_err(|e| MetaHandlerError(e.to_string()))?;
+        let (broadcast, tail) = decode_meta(data).map_err(|e| MetaHandlerError(e.to_string()))?;
 
         let stamp = MetaStamp {
             generation: broadcast.meta.started_at,
@@ -213,7 +355,7 @@ impl BroadcastHandler<GossipIdentity> for MetaHandler {
 
         self.seen.insert(broadcast.node_id, stamp);
         // Forward to async loop; if the receiver is dropped we just discard.
-        let _ = self.meta_tx.send((broadcast.node_id, broadcast.meta));
+        let _ = self.meta_tx.send((broadcast.node_id, broadcast.meta, tail));
 
         Ok(Some(MetaBroadcastKey {
             node_id: broadcast.node_id,
@@ -315,7 +457,10 @@ fn publish_membership(
 }
 
 /// Handle returned by [`GossipService::start`] for querying cluster state.
+#[derive(Clone)]
 pub struct GossipHandle {
+    peer_changes: std::sync::Arc<PeerChanges>,
+    local_pool_id: crate::identity::PoolId,
     /// Current view of all known cluster members.
     members: std::sync::Arc<std::sync::RwLock<HashMap<NodeId, NodeState>>>,
     /// Identity of the node this handle belongs to.
@@ -324,9 +469,345 @@ pub struct GossipHandle {
     local_capacity: std::sync::Arc<std::sync::RwLock<LocalCapacity>>,
     /// The pool whose membership the gossip loop reports.
     roster: RosterCell,
+    /// The peers whose latest metadata says they adopted their bucket
+    /// configurations.
+    adopted_peers: AdoptedPeers,
+    /// Whether this node adopted its own; announced in its metadata.
+    adopted_locally: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The latest bucket metadata placement each peer announced.
+    placement_peers: PlacementPeers,
+    /// This node's bucket metadata placement; announced in its metadata.
+    placement_local: PlacementLocal,
+    /// The latest state of IAM each peer announced.
+    iam_peers: IamPeers,
+    /// The state of this node's copy of IAM; announced in its metadata.
+    iam_local: IamLocal,
+    /// The peers whose latest metadata says they keep no IAM of their own.
+    iam_adopted_peers: AdoptedPeers,
+    /// Whether this node keeps no IAM of its own; announced in its metadata.
+    iam_adopted_local: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The fingerprints of IAM configuration each peer announced.
+    iam_config_peers: IamConfigPeers,
+    /// This node's; announced in its metadata.
+    iam_config_local: IamConfigLocal,
+    generation_peers: GenerationPeers,
+    generation_local: GenerationLocal,
+    /// Wakes the gossip loop to broadcast this node's metadata at once.
+    announce: std::sync::Arc<tokio::sync::Notify>,
+}
+
+/// The peers whose latest metadata says they adopted their bucket
+/// configurations.
+type AdoptedPeers = std::sync::Arc<std::sync::RwLock<std::collections::HashSet<NodeId>>>;
+
+/// The latest bucket metadata placement each peer announced.
+type PlacementPeers = std::sync::Arc<std::sync::RwLock<HashMap<NodeId, PlacementRecord>>>;
+
+/// This node's bucket metadata placement, once it has one.
+type PlacementLocal = std::sync::Arc<std::sync::RwLock<Option<PlacementRecord>>>;
+
+/// The latest state of IAM each peer announced.
+type IamPeers = std::sync::Arc<std::sync::RwLock<HashMap<NodeId, IamAnnouncement>>>;
+
+/// The state of this node's copy of IAM, once it has read it.
+type IamLocal = std::sync::Arc<std::sync::RwLock<Option<IamAnnouncement>>>;
+
+/// The fingerprints of IAM configuration each peer announced.
+type IamConfigPeers = std::sync::Arc<std::sync::RwLock<HashMap<NodeId, IamConfigPrint>>>;
+
+/// This node's fingerprints of IAM configuration, once set.
+type IamConfigLocal = std::sync::Arc<std::sync::RwLock<Option<IamConfigPrint>>>;
+type GenerationPeers = std::sync::Arc<std::sync::RwLock<HashMap<NodeId, GenerationAnnouncement>>>;
+type GenerationLocal = std::sync::Arc<std::sync::RwLock<Option<GenerationAnnouncement>>>;
+
+/// A projection deliberately omitting capacity, IAM and last-seen timestamps.
+#[derive(PartialEq, Eq)]
+struct AdoptionPeer {
+    node_id: NodeId,
+    pool_id: crate::identity::PoolId,
+    status: NodeStatus,
+    addr: crate::identity::NodeAddr,
+    protocol_version: u32,
+    s4_version: String,
+    topology_epoch: u64,
+    started_at: u64,
+    identity: Option<GossipIdentity>,
+    placement: Option<PlacementRecord>,
+    generation: Option<GenerationAnnouncement>,
+    adopted: bool,
+}
+
+#[derive(Default)]
+struct PublishedPeers {
+    identities: IdentityTable,
+    peers: HashMap<NodeId, AdoptionPeer>,
+    local_placement: Option<PlacementRecord>,
+    local_generation: Option<GenerationAnnouncement>,
+}
+
+struct PeerChanges {
+    changed: tokio::sync::watch::Sender<()>,
+    /// Serializes snapshot construction and publication, including handle calls.
+    published: Mutex<PublishedPeers>,
+}
+
+impl Default for PeerChanges {
+    fn default() -> Self {
+        Self {
+            changed: tokio::sync::watch::channel(()).0,
+            published: Mutex::default(),
+        }
+    }
 }
 
 impl GossipHandle {
+    /// Subscribes to adoption-relevant changes in this node's pool.
+    ///
+    /// Independent subscribers retain changes received during an adoption pass.
+    /// Multiple changes may coalesce into one pending notification.
+    pub fn subscribe_peer_changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.publish_peer_changes(None);
+        self.peer_changes.changed.subscribe()
+    }
+
+    /// Reads current state only after taking the publication lock: a later
+    /// change can never be overwritten by an older snapshot from another caller.
+    fn publish_peer_changes(&self, identities: Option<&IdentityTable>) {
+        let mut published = self.peer_changes.published.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(identities) = identities {
+            published.identities.clone_from(identities);
+        }
+        let roster = self.roster.lock().unwrap_or_else(|p| p.into_inner());
+        let members = self.members.read().unwrap_or_else(|p| p.into_inner());
+        let placement = self.placement_peers.read().unwrap_or_else(|p| p.into_inner());
+        let generation = self.generation_peers.read().unwrap_or_else(|p| p.into_inner());
+        let adopted = self.adopted_peers.read().unwrap_or_else(|p| p.into_inner());
+        let peers = members
+            .iter()
+            .filter(|(node, state)| {
+                state.meta.pool_id == self.local_pool_id
+                    || roster.as_ref().is_some_and(|roster| roster.name_of(**node).is_some())
+            })
+            .map(|(node, state)| {
+                (
+                    *node,
+                    AdoptionPeer {
+                        node_id: state.meta.node_id,
+                        pool_id: state.meta.pool_id,
+                        status: state.status,
+                        addr: state.meta.addr.clone(),
+                        protocol_version: state.meta.protocol_version,
+                        s4_version: state.meta.s4_version.clone(),
+                        topology_epoch: state.meta.topology_epoch,
+                        started_at: state.meta.started_at,
+                        identity: published.identities.get(node).cloned(),
+                        placement: placement.get(node).copied(),
+                        generation: generation.get(node).copied(),
+                        adopted: adopted.contains(node),
+                    },
+                )
+            })
+            .collect();
+        let local_placement = *self.placement_local.read().unwrap_or_else(|p| p.into_inner());
+        let local_generation = *self.generation_local.read().unwrap_or_else(|p| p.into_inner());
+        if published.peers != peers
+            || published.local_placement != local_placement
+            || published.local_generation != local_generation
+        {
+            published.peers = peers;
+            published.local_placement = local_placement;
+            published.local_generation = local_generation;
+            // Unlike Notify, watch retains a separate unseen version for every
+            // subscriber. send_replace also records the change with no receivers.
+            self.peer_changes.changed.send_replace(());
+        }
+    }
+
+    /// Announces the generations this node durably knows; a bootstrap claim
+    /// is tentative and never opens the growth gate.
+    pub fn announce_pool_generation(&self, generation: GenerationAnnouncement) {
+        *self.generation_local.write().unwrap_or_else(|p| p.into_inner()) = Some(generation);
+        self.publish_peer_changes(None);
+        self.announce.notify_one();
+    }
+
+    /// Latest generation announcement, or none from a pre-protocol-9 peer.
+    pub fn pool_generation(&self, node: &NodeId) -> Option<GenerationAnnouncement> {
+        if *node == self.local_node_id {
+            return *self.generation_local.read().unwrap_or_else(|p| p.into_inner());
+        }
+        self.generation_peers
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(node)
+            .copied()
+    }
+
+    /// Installs a peer's generation announcement for tests.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn set_pool_generation_for_testing(
+        &self,
+        node: NodeId,
+        generation: Option<GenerationAnnouncement>,
+    ) {
+        record_generation(&self.generation_peers, node, generation);
+        self.publish_peer_changes(None);
+    }
+
+    /// Records that this node adopted the bucket configurations it stored
+    /// before protocol 6, and announces it to the pool at once.
+    pub fn announce_bucket_configs_adopted(&self) {
+        self.adopted_locally.store(true, std::sync::atomic::Ordering::Release);
+        self.announce.notify_one();
+    }
+
+    /// Whether `node` adopted its bucket configurations: this node by what it
+    /// announced, a peer by its latest metadata. A peer of a release that
+    /// does not announce it has not.
+    pub fn bucket_configs_adopted(&self, node: &NodeId) -> bool {
+        if *node == self.local_node_id {
+            return self.adopted_locally.load(std::sync::atomic::Ordering::Acquire);
+        }
+        self.adopted_peers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(node)
+    }
+
+    /// Has the metadata of `node` say whether it adopted its bucket
+    /// configurations, as its broadcast would.
+    pub fn set_bucket_configs_adopted_for_testing(&self, node: NodeId, adopted: bool) {
+        record_adoption(&self.adopted_peers, node, adopted);
+        self.publish_peer_changes(None);
+    }
+
+    /// Records where this node is in the move of its pool's bucket metadata,
+    /// and announces it to the pool at once.
+    pub fn announce_bucket_metadata_placement(&self, record: PlacementRecord) {
+        *self.placement_local.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(record);
+        self.publish_peer_changes(None);
+        self.announce.notify_one();
+    }
+
+    /// Where `node` is in the move of its pool's bucket metadata: this node
+    /// by what it announced, a peer by its latest metadata. `None` for a
+    /// peer that announced none, a node of an earlier release among them.
+    pub fn bucket_metadata_placement(&self, node: &NodeId) -> Option<PlacementRecord> {
+        if *node == self.local_node_id {
+            return *self.placement_local.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        self.placement_peers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(node)
+            .copied()
+    }
+
+    /// Has the metadata of `node` announce `record`, as its broadcast would.
+    pub fn set_bucket_metadata_placement_for_testing(
+        &self,
+        node: NodeId,
+        record: Option<PlacementRecord>,
+    ) {
+        record_placement(&self.placement_peers, node, record);
+        self.publish_peer_changes(None);
+    }
+
+    /// Records the state of this node's copy of IAM and announces it to the
+    /// pool at once, unless it is what the node announced already.
+    pub fn announce_iam(&self, state: IamAnnouncement) {
+        {
+            let mut local = self.iam_local.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *local == Some(state) {
+                return;
+            }
+            *local = Some(state);
+        }
+        self.announce.notify_one();
+    }
+
+    /// The state of the copy of IAM `node` holds: this node's by what it
+    /// announced, a peer's by its latest metadata. `None` for a peer that
+    /// announced none, a node of an earlier release among them.
+    pub fn iam_announcement(&self, node: &NodeId) -> Option<IamAnnouncement> {
+        if *node == self.local_node_id {
+            return *self.iam_local.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        self.iam_peers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(node)
+            .copied()
+    }
+
+    /// Has the metadata of `node` announce `state`, as its broadcast would.
+    pub fn set_iam_announcement_for_testing(&self, node: NodeId, state: Option<IamAnnouncement>) {
+        record_iam(&self.iam_peers, node, state);
+    }
+
+    /// Records whether this node keeps no IAM of its own that its pool has
+    /// not taken over, and announces it to the pool at once when it changed.
+    pub fn announce_iam_adopted(&self, adopted: bool) {
+        let before = self.iam_adopted_local.swap(adopted, std::sync::atomic::Ordering::AcqRel);
+        if before != adopted {
+            self.announce.notify_one();
+        }
+    }
+
+    /// Whether `node` keeps no IAM of its own: this node by what it
+    /// announced, a peer by its latest metadata. A peer of a release that
+    /// does not announce it keeps some.
+    pub fn iam_adopted(&self, node: &NodeId) -> bool {
+        if *node == self.local_node_id {
+            return self.iam_adopted_local.load(std::sync::atomic::Ordering::Acquire);
+        }
+        self.iam_adopted_peers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(node)
+    }
+
+    /// Has the metadata of `node` say whether it keeps IAM of its own, as its
+    /// broadcast would.
+    pub fn set_iam_adopted_for_testing(&self, node: NodeId, adopted: bool) {
+        record_adoption(&self.iam_adopted_peers, node, adopted);
+    }
+
+    /// Records the fingerprints of this node's IAM configuration and
+    /// announces them to the pool at once, unless they are what the node
+    /// announced already.
+    pub fn announce_iam_config(&self, print: IamConfigPrint) {
+        {
+            let mut local =
+                self.iam_config_local.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if *local == Some(print) {
+                return;
+            }
+            *local = Some(print);
+        }
+        self.announce.notify_one();
+    }
+
+    /// The fingerprints of the IAM configuration of `node`: this node's by
+    /// what it announced, a peer's by its latest metadata. `None` for a peer
+    /// that announced none, a node of an earlier release among them.
+    pub fn iam_config(&self, node: &NodeId) -> Option<IamConfigPrint> {
+        if *node == self.local_node_id {
+            return *self.iam_config_local.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        self.iam_config_peers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(node)
+            .copied()
+    }
+
+    /// Has the metadata of `node` announce `print`, as its broadcast would.
+    pub fn set_iam_config_for_testing(&self, node: NodeId, print: Option<IamConfigPrint>) {
+        record_iam_config(&self.iam_config_peers, node, print);
+    }
+
     /// Starts reporting the membership of `roster` in `s4_cluster_nodes` and
     /// `s4_cluster_peer_up`: right away, and again after every change gossip
     /// makes to the member map.
@@ -336,6 +817,7 @@ impl GossipHandle {
     pub fn report_membership(&self, roster: PoolRoster) {
         *self.roster.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(roster);
         publish_membership(&self.roster, &self.members);
+        self.publish_peer_changes(None);
     }
 
     /// Return a snapshot of all known member states.
@@ -394,6 +876,18 @@ impl GossipHandle {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(node_id, state);
+        self.publish_peer_changes(None);
+    }
+
+    /// Drop one member entry of a handle built for a test: a node this view
+    /// has never seen, as after a restart while it was down.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn remove_member_for_testing(&self, node_id: NodeId) {
+        self.members
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&node_id);
+        self.publish_peer_changes(None);
     }
 
     /// Create a `GossipHandle` with pre-populated members (for testing).
@@ -404,6 +898,11 @@ impl GossipHandle {
     #[cfg(any(test, feature = "test-util"))]
     pub fn new_for_testing(members: HashMap<NodeId, NodeState>) -> Self {
         Self {
+            peer_changes: std::sync::Arc::default(),
+            local_pool_id: members
+                .values()
+                .next()
+                .map_or(crate::PoolId(0), |state| state.meta.pool_id),
             members: std::sync::Arc::new(std::sync::RwLock::new(members)),
             // No local node: every member of this handle is a peer, so a
             // capacity question about the local id falls through to the map and
@@ -414,6 +913,19 @@ impl GossipHandle {
                 measured_at: Instant::now(),
             })),
             roster: RosterCell::default(),
+            adopted_peers: AdoptedPeers::default(),
+            adopted_locally: std::sync::Arc::default(),
+            placement_peers: PlacementPeers::default(),
+            placement_local: PlacementLocal::default(),
+            iam_peers: IamPeers::default(),
+            iam_local: IamLocal::default(),
+            iam_adopted_peers: AdoptedPeers::default(),
+            iam_adopted_local: std::sync::Arc::default(),
+            iam_config_peers: IamConfigPeers::default(),
+            iam_config_local: IamConfigLocal::default(),
+            generation_peers: GenerationPeers::default(),
+            generation_local: GenerationLocal::default(),
+            announce: std::sync::Arc::default(),
         }
     }
 
@@ -588,6 +1100,27 @@ fn confirms_protocol(state: &NodeState, min_protocol_version: u32) -> bool {
     !state.meta.s4_version.is_empty() && state.meta.protocol_version >= min_protocol_version
 }
 
+impl PlacementView for GossipHandle {
+    fn peer_placement(&self, node: NodeId, min_protocol: u32) -> PeerPlacement {
+        let Some(state) = self.get_node(&node) else {
+            return PeerPlacement::Unknown;
+        };
+        if state.status != NodeStatus::Alive {
+            return PeerPlacement::Down;
+        }
+        if !confirms_protocol(&state, min_protocol) {
+            return PeerPlacement::BelowProtocol {
+                confirmed: (!state.meta.s4_version.is_empty())
+                    .then_some(state.meta.protocol_version),
+            };
+        }
+        match self.bucket_metadata_placement(&node) {
+            Some(record) => PeerPlacement::Announced(record),
+            None => PeerPlacement::Silent,
+        }
+    }
+}
+
 /// A [`ClusterMembershipQuery`] that answers with a fixed verdict.
 ///
 /// Behind the `test-util` feature: its whole purpose is to make the EC v2
@@ -674,6 +1207,20 @@ impl GossipService {
         capacity: Option<std::sync::Arc<dyn crate::capacity::NodeCapacityProvider>>,
     ) -> Result<(GossipHandle, mpsc::Receiver<ClusterEvent>), ClusterError> {
         let socket = UdpSocket::bind(gossip_config.bind_addr).await?;
+        Self::start_on(socket, gossip_config, local_identity, local_meta, capacity).await
+    }
+
+    /// [`Self::start`] on a socket that is already bound. Tests hand over the
+    /// socket they reserved the address with: closing it and binding the same
+    /// port again leaves a moment in which a test running beside it can take
+    /// that port.
+    async fn start_on(
+        socket: UdpSocket,
+        gossip_config: GossipConfig,
+        local_identity: GossipIdentity,
+        local_meta: NodeMeta,
+        capacity: Option<std::sync::Arc<dyn crate::capacity::NodeCapacityProvider>>,
+    ) -> Result<(GossipHandle, mpsc::Receiver<ClusterEvent>), ClusterError> {
         let local_addr = socket.local_addr()?;
         info!(%local_addr, node_id = %local_identity.node_id, "gossip service starting");
 
@@ -705,14 +1252,43 @@ impl GossipService {
         }));
 
         let roster = RosterCell::default();
+        let adopted_peers = AdoptedPeers::default();
+        let adopted_locally = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let placement_peers = PlacementPeers::default();
+        let placement_local = PlacementLocal::default();
+        let iam_peers = IamPeers::default();
+        let iam_local = IamLocal::default();
+        let iam_adopted_peers = AdoptedPeers::default();
+        let iam_adopted_local = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let iam_config_peers = IamConfigPeers::default();
+        let iam_config_local = IamConfigLocal::default();
+        let generation_peers = GenerationPeers::default();
+        let generation_local = GenerationLocal::default();
+        let announce = std::sync::Arc::new(tokio::sync::Notify::new());
         let handle = GossipHandle {
+            peer_changes: std::sync::Arc::default(),
+            local_pool_id: local_meta.pool_id,
             members: members.clone(),
             local_node_id: local_identity.node_id,
             local_capacity: local_capacity.clone(),
             roster: roster.clone(),
+            adopted_peers: adopted_peers.clone(),
+            adopted_locally: adopted_locally.clone(),
+            placement_peers: placement_peers.clone(),
+            placement_local: placement_local.clone(),
+            iam_peers: iam_peers.clone(),
+            iam_local: iam_local.clone(),
+            iam_adopted_peers: iam_adopted_peers.clone(),
+            iam_adopted_local: iam_adopted_local.clone(),
+            iam_config_peers: iam_config_peers.clone(),
+            iam_config_local: iam_config_local.clone(),
+            generation_peers: generation_peers.clone(),
+            generation_local: generation_local.clone(),
+            announce: announce.clone(),
         };
 
         tokio::spawn(run_loop(
+            handle.clone(),
             socket,
             Mutex::new(foca),
             members,
@@ -726,6 +1302,21 @@ impl GossipService {
             gossip_config.seeds,
             gossip_config.meta_broadcast_interval,
             gossip_config.seed_reannounce_interval,
+            LocalAdoption {
+                peers: adopted_peers,
+                local: adopted_locally,
+                placement_peers,
+                placement_local,
+                iam_peers,
+                iam_local,
+                iam_adopted_peers,
+                iam_adopted_local,
+                iam_config_peers,
+                iam_config_local,
+                generation_peers,
+                generation_local,
+                announce,
+            },
         ));
 
         Ok((handle, event_rx))
@@ -764,12 +1355,13 @@ fn build_foca_config(max_packet_size: usize) -> foca::Config {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
+    peer_view: GossipHandle,
     socket: UdpSocket,
     foca: Mutex<S4Foca>,
     members: std::sync::Arc<std::sync::RwLock<HashMap<NodeId, NodeState>>>,
     roster: RosterCell,
     event_tx: mpsc::Sender<ClusterEvent>,
-    mut meta_rx: mpsc::UnboundedReceiver<(NodeId, NodeMeta)>,
+    mut meta_rx: mpsc::UnboundedReceiver<(NodeId, NodeMeta, MetaTail)>,
     mut local_identity: GossipIdentity,
     mut local_meta: NodeMeta,
     capacity: Option<std::sync::Arc<dyn crate::capacity::NodeCapacityProvider>>,
@@ -777,6 +1369,7 @@ async fn run_loop(
     seeds: Vec<SocketAddr>,
     meta_broadcast_interval: Duration,
     seed_reannounce_interval: Duration,
+    adoption: LocalAdoption,
 ) {
     let mut recv_buf = vec![0u8; 65535];
     let (timer_tx, mut timer_rx) = mpsc::unbounded_channel::<Timer<GossipIdentity>>();
@@ -817,7 +1410,7 @@ async fn run_loop(
     // a node that announced zeros and only corrected itself on the first tick
     // would spend that window looking unmeasured to every peer.
     refresh_local_capacity(capacity.as_deref(), &mut local_meta, &local_capacity);
-    broadcast_local_meta(&foca, &local_meta, &mut meta_version);
+    broadcast_local_meta(&foca, &local_meta, adoption.tail(), &mut meta_version);
 
     loop {
         tokio::select! {
@@ -842,10 +1435,11 @@ async fn run_loop(
                             &event_tx,
                             &mut local_identity,
                             &mut identities,
+                            &peer_view,
                         )
                         .await
                         {
-                            broadcast_local_meta(&foca, &local_meta, &mut meta_version);
+                            broadcast_local_meta(&foca, &local_meta, adoption.tail(), &mut meta_version);
                         }
                     }
                     Err(e) => {
@@ -873,16 +1467,38 @@ async fn run_loop(
                     &event_tx,
                     &mut local_identity,
                     &mut identities,
+                    &peer_view,
                 )
                 .await
                 {
-                    broadcast_local_meta(&foca, &local_meta, &mut meta_version);
+                    broadcast_local_meta(&foca, &local_meta, adoption.tail(), &mut meta_version);
                 }
             }
 
             // --- Received metadata from broadcast handler ---
-            Some((node_id, meta)) = meta_rx.recv() => {
+            Some((node_id, meta, tail)) = meta_rx.recv() => {
+                if node_id != local_identity.node_id {
+                    record_adoption(&adoption.peers, node_id, tail.bucket_configs_adopted);
+                    record_placement(
+                        &adoption.placement_peers,
+                        node_id,
+                        tail.bucket_metadata_placement,
+                    );
+                    record_iam(&adoption.iam_peers, node_id, tail.iam);
+                    record_adoption(&adoption.iam_adopted_peers, node_id, tail.iam_adopted);
+                    record_iam_config(&adoption.iam_config_peers, node_id, tail.iam_config);
+                    record_generation(&adoption.generation_peers, node_id, tail.pool_generation);
+                }
                 update_member_meta(&members, &roster, &local_identity, node_id, meta);
+                peer_view.publish_peer_changes(Some(&identities));
+            }
+
+            // --- This node has something new to announce ---
+            _ = adoption.announce.notified() => {
+                if let Some(generation) = *adoption.generation_local.read().unwrap_or_else(|p| p.into_inner()) {
+                    local_meta.topology_epoch = generation.current.epoch;
+                }
+                broadcast_local_meta(&foca, &local_meta, adoption.tail(), &mut meta_version);
             }
 
             // --- Periodic local metadata broadcast ---
@@ -892,7 +1508,7 @@ async fn run_loop(
                 // changes size; re-measuring there would spend syscalls to learn
                 // the same number.
                 refresh_local_capacity(capacity.as_deref(), &mut local_meta, &local_capacity);
-                broadcast_local_meta(&foca, &local_meta, &mut meta_version);
+                broadcast_local_meta(&foca, &local_meta, adoption.tail(), &mut meta_version);
             }
 
             // --- Re-announce to the seeds this node does not see alive ---
@@ -1023,7 +1639,96 @@ fn refresh_local_capacity(
     };
 }
 
-fn broadcast_local_meta(foca: &Mutex<S4Foca>, meta: &NodeMeta, version: &mut u64) {
+/// What the gossip loop keeps of the tail of the metadata: of adoption, the
+/// peers that announced it and whether this node did; of the bucket metadata
+/// placement and of IAM, what each peer and this node announced.
+struct LocalAdoption {
+    peers: AdoptedPeers,
+    local: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    placement_peers: PlacementPeers,
+    placement_local: PlacementLocal,
+    iam_peers: IamPeers,
+    iam_local: IamLocal,
+    iam_adopted_peers: AdoptedPeers,
+    iam_adopted_local: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    iam_config_peers: IamConfigPeers,
+    iam_config_local: IamConfigLocal,
+    generation_peers: GenerationPeers,
+    generation_local: GenerationLocal,
+    announce: std::sync::Arc<tokio::sync::Notify>,
+}
+
+impl LocalAdoption {
+    /// The tail of this node's next metadata broadcast.
+    fn tail(&self) -> MetaTail {
+        MetaTail {
+            pool_generation: *self.generation_local.read().unwrap_or_else(|p| p.into_inner()),
+            bucket_configs_adopted: self.local.load(std::sync::atomic::Ordering::Acquire),
+            bucket_metadata_placement: *self
+                .placement_local
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            iam: *self.iam_local.read().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            iam_adopted: self.iam_adopted_local.load(std::sync::atomic::Ordering::Acquire),
+            iam_config: *self
+                .iam_config_local
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        }
+    }
+}
+
+fn record_generation(
+    peers: &GenerationPeers,
+    node: NodeId,
+    generation: Option<GenerationAnnouncement>,
+) {
+    let mut peers = peers.write().unwrap_or_else(|p| p.into_inner());
+    match generation {
+        Some(generation) => peers.insert(node, generation),
+        None => peers.remove(&node),
+    };
+}
+
+/// Records what the latest metadata of `node` says of its IAM configuration.
+fn record_iam_config(peers: &IamConfigPeers, node: NodeId, print: Option<IamConfigPrint>) {
+    let mut peers = peers.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match print {
+        Some(print) => peers.insert(node, print),
+        None => peers.remove(&node),
+    };
+}
+
+/// Records what the latest metadata of `node` says of its copy of IAM.
+fn record_iam(peers: &IamPeers, node: NodeId, state: Option<IamAnnouncement>) {
+    let mut peers = peers.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match state {
+        Some(state) => peers.insert(node, state),
+        None => peers.remove(&node),
+    };
+}
+
+/// Records what the latest metadata of `node` says of its bucket metadata
+/// placement.
+fn record_placement(peers: &PlacementPeers, node: NodeId, record: Option<PlacementRecord>) {
+    let mut peers = peers.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    match record {
+        Some(record) => peers.insert(node, record),
+        None => peers.remove(&node),
+    };
+}
+
+/// Records what the latest metadata of `node` says of its adoption.
+fn record_adoption(peers: &AdoptedPeers, node: NodeId, adopted: bool) {
+    let mut peers = peers.write().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if adopted {
+        peers.insert(node);
+    } else {
+        peers.remove(&node);
+    }
+}
+
+fn broadcast_local_meta(foca: &Mutex<S4Foca>, meta: &NodeMeta, tail: MetaTail, version: &mut u64) {
     *version += 1;
     let broadcast = MetaBroadcast {
         node_id: meta.node_id,
@@ -1031,7 +1736,7 @@ fn broadcast_local_meta(foca: &Mutex<S4Foca>, meta: &NodeMeta, version: &mut u64
         version: *version,
     };
 
-    match postcard::to_allocvec(&broadcast) {
+    match encode_meta(&broadcast, tail) {
         Ok(data) => {
             let mut foca = lock_foca(foca);
             if let Err(e) = foca.add_broadcast(&data) {
@@ -1044,13 +1749,18 @@ fn broadcast_local_meta(foca: &Mutex<S4Foca>, meta: &NodeMeta, version: &mut u64
     }
 }
 
-/// Returns `true` if a node this process had never seen before appeared.
+/// Returns `true` if a node this process had never seen before appeared, or
+/// a node it knew came back as a new run — restarted.
 ///
 /// The caller answers that by rebroadcasting its own metadata: a fresh member
 /// starts out knowing nothing but node ids, and would otherwise wait up to
 /// `meta_broadcast_interval` before it could tell an EC v2 peer from an old
 /// one. Every existing member reacting to the same join is what makes the new
-/// node's view complete in one round instead of thirty seconds.
+/// node's view complete in one round instead of thirty seconds. A restarted
+/// node knows as little as a fresh one: until the tails of its peers reach
+/// it, it cannot confirm its copy of IAM and refuses IAM credentials (plan
+/// CLUSTER-IAM-REPLICATION.md, decision 4) — in a quiet pool, where nothing
+/// else is broadcast, for most of that interval.
 #[allow(clippy::too_many_arguments)]
 async fn process_outputs(
     outputs: RuntimeOutputs,
@@ -1061,6 +1771,7 @@ async fn process_outputs(
     event_tx: &mpsc::Sender<ClusterEvent>,
     local_identity: &mut GossipIdentity,
     identities: &mut IdentityTable,
+    peer_view: &GossipHandle,
 ) -> bool {
     // Send UDP packets.
     for (addr, data) in &outputs.to_send {
@@ -1085,6 +1796,7 @@ async fn process_outputs(
             event_tx,
             local_identity,
             identities,
+            peer_view,
         )
         .await;
     }
@@ -1203,7 +1915,8 @@ fn note_member_present(
 }
 
 /// Returns `true` when the notification introduced a node this process had not
-/// seen before. See [`process_outputs`] for what the caller does with that.
+/// seen before, or a new run of one it had. See [`process_outputs`] for what
+/// the caller does with that.
 async fn handle_notification(
     notification: foca::OwnedNotification<GossipIdentity>,
     members: &std::sync::Arc<std::sync::RwLock<HashMap<NodeId, NodeState>>>,
@@ -1211,6 +1924,7 @@ async fn handle_notification(
     event_tx: &mpsc::Sender<ClusterEvent>,
     local_identity: &mut GossipIdentity,
     identities: &mut IdentityTable,
+    peer_view: &GossipHandle,
 ) -> bool {
     match notification {
         foca::OwnedNotification::MemberUp(identity) => {
@@ -1228,13 +1942,15 @@ async fn handle_notification(
 
             let node_id = identity.node_id;
             info!(%node_id, addr = %identity.gossip_addr, "node joined cluster");
+            let new_run = identities.get(&node_id) != Some(&identity);
             identities.insert(node_id, identity.clone());
             let (announced_meta, first_sighting) =
                 note_member_present(members, &identity, NodeStatus::Alive);
             publish_membership(roster, members);
+            peer_view.publish_peer_changes(Some(identities));
 
             let _ = event_tx.send(ClusterEvent::Joined(node_id, Box::new(announced_meta))).await;
-            first_sighting
+            first_sighting || new_run
         }
 
         foca::OwnedNotification::MemberDown(identity) => {
@@ -1266,6 +1982,7 @@ async fn handle_notification(
                 }
             }
             publish_membership(roster, members);
+            peer_view.publish_peer_changes(Some(identities));
 
             let _ = event_tx.send(ClusterEvent::Left(node_id)).await;
             false
@@ -1296,6 +2013,7 @@ async fn handle_notification(
             // node's own.
             identities.insert(new_identity.node_id, new_identity.clone());
             *local_identity = new_identity;
+            peer_view.publish_peer_changes(Some(identities));
             true
         }
 
@@ -1323,6 +2041,7 @@ async fn handle_notification(
             if !is_this_node(local_identity, &new)
                 && !identity_is_superseded(identities.get(&new.node_id), &new)
             {
+                let new_run = identities.get(&new.node_id) != Some(&new);
                 identities.insert(new.node_id, new.clone());
                 // The member slot keeps the liveness it had: foca reports a
                 // rename on its own only when the replacement changes nothing
@@ -1333,10 +2052,11 @@ async fn handle_notification(
                     displaced_status.unwrap_or(NodeStatus::Alive),
                 );
                 publish_membership(roster, members);
+                peer_view.publish_peer_changes(Some(identities));
                 let _ = event_tx
                     .send(ClusterEvent::Joined(new.node_id, Box::new(announced_meta)))
                     .await;
-                news = first_sighting;
+                news = first_sighting || new_run;
             }
 
             // The displaced node is not dead — it is unlocatable. Saying it is
@@ -1352,6 +2072,7 @@ async fn handle_notification(
                 identities.remove(&old.node_id);
                 members.write().unwrap_or_else(|p| p.into_inner()).remove(&old.node_id);
                 publish_membership(roster, members);
+                peer_view.publish_peer_changes(Some(identities));
                 let _ = event_tx.send(ClusterEvent::Left(old.node_id)).await;
             }
 
@@ -1448,6 +2169,30 @@ mod tests {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
     }
 
+    /// A loopback address for a gossip node, with the socket that holds it.
+    ///
+    /// The socket is handed to the node rather than closed and bound again: in
+    /// between, a test running beside this one may bind port 0 and be given the
+    /// very same port. A std socket, so a node on a runtime of its own can take
+    /// it there.
+    fn reserve() -> (std::net::UdpSocket, SocketAddr) {
+        let socket = std::net::UdpSocket::bind(localhost(0)).unwrap();
+        socket.set_nonblocking(true).unwrap();
+        let addr = socket.local_addr().unwrap();
+        (socket, addr)
+    }
+
+    /// Starts a gossip node on a socket from [`reserve`].
+    async fn start_reserved(
+        socket: std::net::UdpSocket,
+        config: GossipConfig,
+        identity: GossipIdentity,
+        meta: NodeMeta,
+    ) -> (GossipHandle, mpsc::Receiver<ClusterEvent>) {
+        let socket = UdpSocket::from_std(socket).unwrap();
+        GossipService::start_on(socket, config, identity, meta, None).await.unwrap()
+    }
+
     /// A handle over a member map the test keeps a grip on.
     ///
     /// It has no local node: every id these tests ask about is a peer, so
@@ -1457,6 +2202,8 @@ mod tests {
         members: std::sync::Arc<std::sync::RwLock<HashMap<NodeId, NodeState>>>,
     ) -> GossipHandle {
         GossipHandle {
+            peer_changes: std::sync::Arc::default(),
+            local_pool_id: crate::identity::PoolId(1),
             members,
             local_node_id: NodeId(0),
             local_capacity: std::sync::Arc::new(std::sync::RwLock::new(LocalCapacity {
@@ -1464,7 +2211,260 @@ mod tests {
                 measured_at: Instant::now(),
             })),
             roster: RosterCell::default(),
+            adopted_peers: AdoptedPeers::default(),
+            adopted_locally: std::sync::Arc::default(),
+            placement_peers: PlacementPeers::default(),
+            placement_local: PlacementLocal::default(),
+            iam_peers: IamPeers::default(),
+            iam_local: IamLocal::default(),
+            iam_adopted_peers: AdoptedPeers::default(),
+            iam_adopted_local: std::sync::Arc::default(),
+            iam_config_peers: IamConfigPeers::default(),
+            iam_config_local: IamConfigLocal::default(),
+            generation_peers: GenerationPeers::default(),
+            generation_local: GenerationLocal::default(),
+            announce: std::sync::Arc::default(),
         }
+    }
+
+    #[tokio::test]
+    async fn peer_changes_notify_independent_subscribers_and_preserve_unseen_updates() {
+        let mut view = View::new(identity(NodeId(10), 9000, 1));
+        let handle = view.handle();
+        let mut first = handle.subscribe_peer_changes();
+        let mut second = handle.subscribe_peer_changes();
+        view.meta_arrived(test_meta(NodeId(20), 9200));
+        assert!(
+            first.has_changed().unwrap(),
+            "metadata arrival must wake adoption"
+        );
+        first.changed().await.unwrap();
+        assert!(
+            second.has_changed().unwrap(),
+            "subscribers must not steal updates"
+        );
+        second.changed().await.unwrap();
+        let peer = identity(NodeId(20), 9200, 1);
+        view.notify(foca::OwnedNotification::MemberUp(peer.clone())).await;
+        first.borrow_and_update();
+        second.borrow_and_update();
+        view.notify(foca::OwnedNotification::MemberDown(peer.clone())).await;
+        view.notify(foca::OwnedNotification::MemberUp(peer)).await;
+        assert!(
+            first.has_changed().unwrap(),
+            "changes during a pass must remain pending"
+        );
+        assert!(second.has_changed().unwrap());
+        first.changed().await.unwrap();
+        assert!(
+            !first.has_changed().unwrap(),
+            "multiple changes coalesce into one pending version"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_changes_ignore_capacity_iam_repeats_and_other_pools() {
+        let mut view = View::new(identity(NodeId(10), 9000, 1));
+        let handle = view.handle();
+        let mut peer = test_meta(NodeId(20), 9200);
+        view.meta_arrived(peer.clone());
+        let changes = handle.subscribe_peer_changes();
+        for count in 1..5 {
+            peer.capacity.object_count = count;
+            view.meta_arrived(peer.clone());
+            handle.set_iam_adopted_for_testing(peer.node_id, count % 2 == 0);
+        }
+        let mut foreign = test_meta(NodeId(30), 9300);
+        foreign.pool_id = crate::PoolId(2);
+        view.meta_arrived(foreign);
+        view.notify(foca::OwnedNotification::MemberUp(identity(
+            NodeId(30),
+            9300,
+            1,
+        )))
+        .await;
+        let shape = crate::metadata_placement::QuorumShape::majority(3);
+        handle.set_bucket_metadata_placement_for_testing(
+            NodeId(30),
+            Some(PlacementRecord::starting(shape, shape)),
+        );
+        let generation = crate::pool_generation::PoolGenerationRecord::initial(
+            crate::PoolId(2),
+            vec![NodeId(30)],
+        )
+        .unwrap();
+        handle.set_pool_generation_for_testing(
+            NodeId(30),
+            Some(GenerationAnnouncement::of(&generation, false)),
+        );
+        assert!(!changes.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn peer_changes_notify_protocol_address_identity_and_returning_owner() {
+        let mut view = View::new(identity(NodeId(10), 9000, 1));
+        let handle = view.handle();
+        handle.report_membership(roster(NodeId(10), &[NodeId(20)]));
+        let mut changes = handle.subscribe_peer_changes();
+        let old = identity(NodeId(20), 9200, 1);
+        view.notify(foca::OwnedNotification::MemberUp(old.clone())).await;
+        assert!(
+            changes.has_changed().unwrap(),
+            "configured owner placeholder matters"
+        );
+        changes.borrow_and_update();
+        let mut peer = test_meta(NodeId(20), 9200);
+        view.meta_arrived(peer.clone());
+        changes.borrow_and_update();
+        peer.protocol_version += 1;
+        view.meta_arrived(peer.clone());
+        assert!(
+            changes.has_changed().unwrap(),
+            "protocol confirmation matters"
+        );
+        changes.borrow_and_update();
+        peer.addr.grpc_addr = localhost(9201);
+        view.meta_arrived(peer);
+        assert!(changes.has_changed().unwrap(), "owner RPC address matters");
+        changes.borrow_and_update();
+        view.notify(foca::OwnedNotification::MemberUp(identity(
+            NodeId(20),
+            9200,
+            2,
+        )))
+        .await;
+        assert!(
+            changes.has_changed().unwrap(),
+            "a new incarnation at the same address matters"
+        );
+        changes.borrow_and_update();
+        // A stale death notice must neither change the state nor wake adoption.
+        view.notify(foca::OwnedNotification::MemberDown(old)).await;
+        assert!(!changes.has_changed().unwrap());
+        let returning = identity(NodeId(20), 9200, 2);
+        view.notify(foca::OwnedNotification::MemberDown(returning.clone())).await;
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        view.notify(foca::OwnedNotification::MemberUp(returning)).await;
+        assert!(
+            changes.has_changed().unwrap(),
+            "the owner returning must wake adoption"
+        );
+    }
+
+    #[test]
+    fn peer_changes_notify_placement_and_generation_without_duplicates() {
+        let view = View::new(identity(NodeId(10), 9000, 1));
+        let handle = view.handle();
+        view.meta_arrived(test_meta(NodeId(20), 9200));
+        let mut changes = handle.subscribe_peer_changes();
+        let shape = crate::metadata_placement::QuorumShape::majority(3);
+        let placement = PlacementRecord::starting(shape, shape);
+        handle.set_bucket_metadata_placement_for_testing(NodeId(20), Some(placement));
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        handle.set_bucket_metadata_placement_for_testing(NodeId(20), Some(placement));
+        assert!(!changes.has_changed().unwrap());
+        let record = crate::pool_generation::PoolGenerationRecord::initial(
+            crate::PoolId(1),
+            vec![NodeId(10), NodeId(20)],
+        )
+        .unwrap();
+        let generation = GenerationAnnouncement::of(&record, false);
+        handle.set_pool_generation_for_testing(NodeId(20), Some(generation));
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        handle.set_pool_generation_for_testing(NodeId(20), Some(generation));
+        assert!(!changes.has_changed().unwrap());
+        handle.announce_bucket_metadata_placement(placement);
+        assert!(
+            changes.has_changed().unwrap(),
+            "local placement matters too"
+        );
+        changes.borrow_and_update();
+        handle.announce_pool_generation(generation);
+        assert!(
+            changes.has_changed().unwrap(),
+            "local generation matters too"
+        );
+        changes.borrow_and_update();
+        handle.announce_pool_generation(generation);
+        handle.announce_bucket_metadata_placement(placement);
+        assert!(
+            !changes.has_changed().unwrap(),
+            "identical local announcements are quiet"
+        );
+        handle.set_pool_generation_for_testing(NodeId(20), None);
+        assert!(
+            changes.has_changed().unwrap(),
+            "withdrawn generation matters"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_changes_follow_live_metadata_and_placement_broadcasts() {
+        let (socket_a, addr_a) = reserve();
+        let (socket_b, addr_b) = reserve();
+        let id_a = NodeId(100);
+        let id_b = NodeId(200);
+        let (a, _events_a) = start_reserved(
+            socket_a,
+            GossipConfig {
+                bind_addr: addr_a,
+                seeds: vec![addr_b],
+                meta_broadcast_interval: Duration::from_millis(100),
+                ..Default::default()
+            },
+            identity(id_a, addr_a.port(), 1),
+            test_meta(id_a, addr_a.port()),
+        )
+        .await;
+        let mut changes = a.subscribe_peer_changes();
+        let (b, _events_b) = start_reserved(
+            socket_b,
+            GossipConfig {
+                bind_addr: addr_b,
+                seeds: vec![addr_a],
+                meta_broadcast_interval: Duration::from_millis(100),
+                ..Default::default()
+            },
+            identity(id_b, addr_b.port(), 1),
+            test_meta(id_b, addr_b.port()),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while a.members().get(&id_b).is_none_or(|state| state.meta.protocol_version == 0) {
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("live metadata must wake adoption");
+        changes.borrow_and_update();
+        let shape = crate::metadata_placement::QuorumShape::majority(3);
+        let placement = PlacementRecord::starting(shape, shape);
+        b.announce_bucket_metadata_placement(placement);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while a.bucket_metadata_placement(&id_b) != Some(placement) {
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("live placement must wake adoption");
+        changes.borrow_and_update();
+        let generation = crate::pool_generation::PoolGenerationRecord::initial(
+            crate::PoolId(1),
+            vec![id_a, id_b],
+        )
+        .unwrap();
+        let announcement = GenerationAnnouncement::of(&generation, false);
+        b.announce_pool_generation(announcement);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while a.pool_generation(&id_b) != Some(announcement) {
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("live generation must wake adoption");
     }
 
     fn stamp(generation: u64, version: u64) -> MetaStamp {
@@ -1568,7 +2568,7 @@ mod tests {
         let key = handler.receive_item(&data, None).unwrap();
         assert!(key.is_some(), "new broadcast should return Some(key)");
 
-        let (received_id, received_meta) = rx.try_recv().unwrap();
+        let (received_id, received_meta, _) = rx.try_recv().unwrap();
         assert_eq!(received_id, node_id);
         assert_eq!(received_meta, meta);
     }
@@ -1642,7 +2642,7 @@ mod tests {
             .unwrap()
             .is_some());
 
-        let (received_id, received_meta) = rx.try_recv().unwrap();
+        let (received_id, received_meta, _) = rx.try_recv().unwrap();
         assert_eq!(received_id, node_id);
         assert_eq!(received_meta, restarted);
     }
@@ -1698,6 +2698,352 @@ mod tests {
         assert_eq!(decoded.node_id, broadcast.node_id);
         assert_eq!(decoded.version, broadcast.version);
         assert_eq!(decoded.meta, broadcast.meta);
+    }
+
+    #[test]
+    fn pool_generation_tail_preserves_every_older_tail() {
+        use crate::pool_generation::{GenerationAnnouncement, PoolGenerationRecord};
+        let record = PoolGenerationRecord::initial(crate::PoolId(0), vec![NodeId(1)])
+            .unwrap()
+            .configure(vec![NodeId(1), NodeId(2)])
+            .unwrap();
+        let broadcast = MetaBroadcast {
+            node_id: NodeId(1),
+            meta: test_meta(NodeId(1), 9200),
+            version: 42,
+        };
+        let tail = MetaTail {
+            pool_generation: Some(GenerationAnnouncement::of(&record, false)),
+            ..MetaTail::default()
+        };
+        let bytes = encode_meta(&broadcast, tail).unwrap();
+        let (_, rest) = postcard::take_from_bytes::<MetaBroadcast>(&bytes).unwrap();
+        let (_, rest) = postcard::take_from_bytes::<AdoptionTail>(rest).unwrap();
+        let (_, rest) = postcard::take_from_bytes::<PlacementTail>(rest).unwrap();
+        let (_, generation) = postcard::take_from_bytes::<IamTail>(rest).unwrap();
+        assert_eq!(decode_meta(&bytes).unwrap().1, tail);
+        let old_len = bytes.len() - generation.len();
+        assert_eq!(
+            decode_meta(&bytes[..old_len]).unwrap().1.pool_generation,
+            None
+        );
+        // An unreadable future tail does not discard protocol-8 information.
+        let mut damaged = bytes[..old_len].to_vec();
+        damaged.extend([0xff; 12]);
+        assert_eq!(decode_meta(&damaged).unwrap().1.pool_generation, None);
+        assert!(postcard::from_bytes::<MetaBroadcast>(&bytes).is_ok());
+    }
+
+    /// The tail of a metadata broadcast is invisible to a node of an older
+    /// release, which decodes `MetaBroadcast` alone and stops there; a
+    /// broadcast from such a node, which has no tail, reads as not adopted;
+    /// and a tail that says adopted is read as sent.
+    #[test]
+    fn the_adoption_tail_passes_older_nodes_by() {
+        let node_id = NodeId::generate();
+        let broadcast = MetaBroadcast {
+            node_id,
+            meta: test_meta(node_id, 9200),
+            version: 7,
+        };
+        let adopted = MetaTail {
+            pool_generation: None,
+            bucket_configs_adopted: true,
+            bucket_metadata_placement: None,
+            iam: None,
+            iam_adopted: false,
+            iam_config: None,
+        };
+        let encoded = encode_meta(&broadcast, adopted).unwrap();
+
+        let as_older: MetaBroadcast = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(as_older.meta, broadcast.meta);
+        assert_eq!(as_older.version, 7);
+
+        let (decoded, tail) = decode_meta(&encoded).unwrap();
+        assert_eq!(
+            (decoded.meta, decoded.version, tail),
+            (broadcast.meta.clone(), 7, adopted)
+        );
+
+        let from_older = postcard::to_allocvec(&broadcast).unwrap();
+        let (decoded, tail) = decode_meta(&from_older).unwrap();
+        assert_eq!((decoded.version, tail), (7, MetaTail::default()));
+        assert!(!tail.bucket_configs_adopted);
+
+        // A tail this release cannot read leaves the broadcast as it is.
+        let mut from_later = postcard::to_allocvec(&broadcast).unwrap();
+        from_later.push(0xFF);
+        let (decoded, tail) = decode_meta(&from_later).unwrap();
+        assert_eq!(
+            (decoded.meta, decoded.version, tail),
+            (broadcast.meta, 7, MetaTail::default())
+        );
+    }
+
+    /// The IAM part of the tail comes after the placement part: a node of an
+    /// earlier release reads up to the placement and stops there, its own
+    /// broadcast reads as no IAM, and an IAM part this release cannot read
+    /// keeps what came before it.
+    #[test]
+    fn the_iam_tail_passes_earlier_nodes_by() {
+        let node_id = NodeId::generate();
+        let broadcast = MetaBroadcast {
+            node_id,
+            meta: test_meta(node_id, 9200),
+            version: 7,
+        };
+        let iam = IamAnnouncement {
+            epoch: crate::hlc::HlcTimestamp::from_record(1_700_000_000_000, 3, 9),
+            digest: [7; 16],
+        };
+        let tail = MetaTail {
+            pool_generation: None,
+            bucket_configs_adopted: true,
+            bucket_metadata_placement: None,
+            iam: Some(iam),
+            iam_adopted: true,
+            iam_config: Some(IamConfigPrint {
+                root: Some([1; 16]),
+                jwt_secret: None,
+                encryption_key: Some([3; 16]),
+            }),
+        };
+        let encoded = encode_meta(&broadcast, tail).unwrap();
+        assert_eq!(decode_meta(&encoded).unwrap().1, tail);
+
+        // A node of the previous release: the broadcast, adoption, placement.
+        let (_, rest) = postcard::take_from_bytes::<MetaBroadcast>(&encoded).unwrap();
+        let (adoption, rest) = postcard::take_from_bytes::<AdoptionTail>(rest).unwrap();
+        let (placement, _) = postcard::take_from_bytes::<PlacementTail>(rest).unwrap();
+        assert!(adoption.bucket_configs_adopted);
+        assert_eq!(placement.bucket_metadata_placement, None);
+
+        // A broadcast of the previous release.
+        let mut earlier = postcard::to_allocvec(&broadcast).unwrap();
+        earlier.extend(
+            postcard::to_allocvec(&AdoptionTail {
+                bucket_configs_adopted: true,
+            })
+            .unwrap(),
+        );
+        earlier.extend(
+            postcard::to_allocvec(&PlacementTail {
+                bucket_metadata_placement: None,
+            })
+            .unwrap(),
+        );
+        let without_iam = MetaTail {
+            iam: None,
+            iam_adopted: false,
+            iam_config: None,
+            ..tail
+        };
+        assert_eq!(decode_meta(&earlier).unwrap().1, without_iam);
+
+        // An IAM part this release cannot read.
+        let mut later = earlier.clone();
+        later.extend([1, 0xFF]);
+        assert_eq!(decode_meta(&later).unwrap().1, without_iam);
+    }
+
+    /// A node announces the state of its copy of IAM once per change, and
+    /// reads its peers' from their metadata.
+    #[test]
+    fn the_copy_of_iam_is_announced_and_read_back() {
+        let handle = test_handle(std::sync::Arc::default());
+        let peer = NodeId(5);
+        let state = IamAnnouncement {
+            epoch: crate::hlc::HlcTimestamp::from_record(10, 0, 1),
+            digest: [1; 16],
+        };
+        assert_eq!(handle.iam_announcement(&NodeId(0)), None);
+        handle.announce_iam(state);
+        assert_eq!(handle.iam_announcement(&NodeId(0)), Some(state));
+
+        assert_eq!(handle.iam_announcement(&peer), None);
+        handle.set_iam_announcement_for_testing(peer, Some(state));
+        assert_eq!(handle.iam_announcement(&peer), Some(state));
+        handle.set_iam_announcement_for_testing(peer, None);
+        assert_eq!(handle.iam_announcement(&peer), None);
+    }
+
+    /// A node announces the fingerprints of its IAM configuration once per
+    /// change, and reads its peers' from their metadata.
+    #[test]
+    fn the_iam_configuration_is_announced_and_read_back() {
+        let handle = test_handle(std::sync::Arc::default());
+        let peer = NodeId(5);
+        let print = IamConfigPrint {
+            root: Some([1; 16]),
+            jwt_secret: Some([2; 16]),
+            encryption_key: None,
+        };
+        assert_eq!(handle.iam_config(&NodeId(0)), None);
+        handle.announce_iam_config(print);
+        assert_eq!(handle.iam_config(&NodeId(0)), Some(print));
+        assert_eq!(handle.iam_config(&peer), None);
+        handle.set_iam_config_for_testing(peer, Some(print));
+        assert_eq!(handle.iam_config(&peer), Some(print));
+        handle.set_iam_config_for_testing(peer, None);
+        assert_eq!(handle.iam_config(&peer), None);
+    }
+
+    /// A node announces whether it keeps IAM of its own, once per change,
+    /// and reads its peers' from their metadata; a peer that said nothing
+    /// keeps some.
+    #[test]
+    fn the_adoption_of_iam_is_announced_and_read_back() {
+        let handle = test_handle(std::sync::Arc::default());
+        let peer = NodeId(5);
+        assert!(!handle.iam_adopted(&NodeId(0)));
+        handle.announce_iam_adopted(true);
+        assert!(handle.iam_adopted(&NodeId(0)));
+        assert!(!handle.iam_adopted(&peer));
+        handle.set_iam_adopted_for_testing(peer, true);
+        assert!(handle.iam_adopted(&peer));
+        handle.set_iam_adopted_for_testing(peer, false);
+        assert!(!handle.iam_adopted(&peer));
+    }
+
+    /// The placement part of the tail comes after the adoption part: a node
+    /// of protocol 6 reads its adoption flag and stops there, a broadcast of
+    /// protocol 6 reads as no placement with its adoption kept, and a
+    /// placement part this release cannot read keeps the adoption flag.
+    #[test]
+    fn the_placement_tail_passes_protocol_6_by() {
+        let node_id = NodeId::generate();
+        let broadcast = MetaBroadcast {
+            node_id,
+            meta: test_meta(node_id, 9200),
+            version: 7,
+        };
+        let s3 = crate::metadata_placement::QuorumShape::majority(3);
+        let record = PlacementRecord {
+            stage: crate::metadata_placement::Stage::DualWrite,
+            backfill_complete: true,
+            ..PlacementRecord::starting(s3, crate::metadata_placement::QuorumShape::majority(5))
+        };
+        let tail = MetaTail {
+            pool_generation: None,
+            bucket_configs_adopted: true,
+            bucket_metadata_placement: Some(record),
+            iam: None,
+            iam_adopted: false,
+            iam_config: None,
+        };
+        let encoded = encode_meta(&broadcast, tail).unwrap();
+        assert_eq!(decode_meta(&encoded).unwrap().1, tail);
+
+        // A node of protocol 6: the broadcast, then its own tail, and stop.
+        #[derive(Deserialize)]
+        struct Protocol6Tail {
+            bucket_configs_adopted: bool,
+        }
+        let (as_6, rest) = postcard::take_from_bytes::<MetaBroadcast>(&encoded).unwrap();
+        assert_eq!(as_6.meta, broadcast.meta);
+        let as_6_tail: Protocol6Tail = postcard::from_bytes(rest).unwrap();
+        assert!(as_6_tail.bucket_configs_adopted);
+
+        // A broadcast of protocol 6.
+        let mut from_6 = postcard::to_allocvec(&broadcast).unwrap();
+        from_6.extend(postcard::to_allocvec(&true).unwrap());
+        let (_, tail_6) = decode_meta(&from_6).unwrap();
+        assert_eq!(
+            tail_6,
+            MetaTail {
+                pool_generation: None,
+                bucket_configs_adopted: true,
+                bucket_metadata_placement: None,
+                iam: None,
+                iam_adopted: false,
+                iam_config: None,
+            }
+        );
+
+        // A placement part this release cannot read.
+        let mut later = from_6.clone();
+        later.extend([1, 0xFF, 0xFF]);
+        assert_eq!(decode_meta(&later).unwrap().1, tail_6);
+    }
+
+    /// The gate's view of a peer: unknown, down, below the protocol, silent,
+    /// or what it announced.
+    #[test]
+    fn the_placement_view_reads_the_member_map() {
+        let members = std::sync::Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let handle = test_handle(members.clone());
+        let min = crate::protocol::BUCKET_METADATA_MIN_PROTOCOL_VERSION;
+        let state = |protocol_version: u32, status: NodeStatus, s4_version: &str| NodeState {
+            meta: NodeMeta {
+                protocol_version,
+                s4_version: s4_version.into(),
+                ..test_meta(NodeId(1), 9200)
+            },
+            status,
+            last_seen: Instant::now(),
+        };
+        {
+            let mut m = members.write().unwrap();
+            m.insert(NodeId(2), state(min, NodeStatus::Dead, "1.0.0"));
+            m.insert(NodeId(3), state(min - 1, NodeStatus::Alive, "1.0.0"));
+            m.insert(NodeId(4), state(0, NodeStatus::Alive, ""));
+            m.insert(NodeId(5), state(min, NodeStatus::Alive, "1.0.0"));
+            m.insert(NodeId(6), state(min, NodeStatus::Alive, "1.0.0"));
+        }
+        let record = PlacementRecord::starting(
+            crate::metadata_placement::QuorumShape::majority(3),
+            crate::metadata_placement::QuorumShape::majority(5),
+        );
+        handle.set_bucket_metadata_placement_for_testing(NodeId(6), Some(record));
+        assert_eq!(
+            handle.peer_placement(NodeId(1), min),
+            PeerPlacement::Unknown
+        );
+        assert_eq!(handle.peer_placement(NodeId(2), min), PeerPlacement::Down);
+        assert_eq!(
+            handle.peer_placement(NodeId(3), min),
+            PeerPlacement::BelowProtocol {
+                confirmed: Some(min - 1)
+            }
+        );
+        assert_eq!(
+            handle.peer_placement(NodeId(4), min),
+            PeerPlacement::BelowProtocol { confirmed: None }
+        );
+        assert_eq!(handle.peer_placement(NodeId(5), min), PeerPlacement::Silent);
+        assert_eq!(
+            handle.peer_placement(NodeId(6), min),
+            PeerPlacement::Announced(record)
+        );
+        handle.set_bucket_metadata_placement_for_testing(NodeId(6), None);
+        assert_eq!(handle.peer_placement(NodeId(6), min), PeerPlacement::Silent);
+
+        // This node answers by what it announced.
+        assert_eq!(handle.bucket_metadata_placement(&NodeId(0)), None);
+        handle.announce_bucket_metadata_placement(record);
+        assert_eq!(handle.bucket_metadata_placement(&NodeId(0)), Some(record));
+    }
+
+    /// What a peer's latest metadata says of its adoption is what the handle
+    /// answers; this node answers by what it announced.
+    #[test]
+    fn the_handle_answers_adoption_as_the_latest_metadata_says() {
+        let handle = test_handle(std::sync::Arc::default());
+        let peer = NodeId(8);
+        assert!(!handle.bucket_configs_adopted(&peer));
+        record_adoption(&handle.adopted_peers, peer, true);
+        assert!(handle.bucket_configs_adopted(&peer));
+        record_adoption(&handle.adopted_peers, peer, false);
+        assert!(
+            !handle.bucket_configs_adopted(&peer),
+            "a restart that has not adopted yet"
+        );
+
+        let local = handle.local_node_id;
+        assert!(!handle.bucket_configs_adopted(&local));
+        handle.announce_bucket_configs_adopted();
+        assert!(handle.bucket_configs_adopted(&local));
     }
 
     #[test]
@@ -1758,15 +3104,14 @@ mod tests {
     #[tokio::test]
     async fn a_node_appears_in_its_own_membership_view() {
         let node_id = NodeId::generate();
-        let socket = UdpSocket::bind(localhost(0)).await.unwrap();
-        let bind_addr = socket.local_addr().unwrap();
-        drop(socket);
+        let (socket, bind_addr) = reserve();
 
         let mut meta = test_meta(node_id, bind_addr.port());
         meta.protocol_version = PROTOCOL_VERSION;
         meta.s4_version = "0.1.0".into();
 
-        let (handle, _rx) = GossipService::start(
+        let (handle, _rx) = start_reserved(
+            socket,
             GossipConfig {
                 bind_addr,
                 seeds: Vec::new(),
@@ -1778,10 +3123,8 @@ mod tests {
                 incarnation: 0,
             },
             meta,
-            None,
         )
-        .await
-        .unwrap();
+        .await;
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -1807,9 +3150,7 @@ mod tests {
     async fn two_nodes_discover_each_other() {
         // Node A
         let id_a = NodeId::generate();
-        let socket_a = UdpSocket::bind(localhost(0)).await.unwrap();
-        let addr_a = socket_a.local_addr().unwrap();
-        drop(socket_a); // Release so GossipService can bind
+        let (socket_a, addr_a) = reserve();
 
         let config_a = GossipConfig {
             bind_addr: addr_a,
@@ -1822,16 +3163,17 @@ mod tests {
             incarnation: 0,
         };
 
-        let (handle_a, mut rx_a) =
-            GossipService::start(config_a, identity_a, test_meta(id_a, addr_a.port()), None)
-                .await
-                .unwrap();
+        let (handle_a, mut rx_a) = start_reserved(
+            socket_a,
+            config_a,
+            identity_a,
+            test_meta(id_a, addr_a.port()),
+        )
+        .await;
 
         // Node B (seeds = [addr_a])
         let id_b = NodeId::generate();
-        let socket_b = UdpSocket::bind(localhost(0)).await.unwrap();
-        let addr_b = socket_b.local_addr().unwrap();
-        drop(socket_b);
+        let (socket_b, addr_b) = reserve();
 
         let config_b = GossipConfig {
             bind_addr: addr_b,
@@ -1844,10 +3186,13 @@ mod tests {
             incarnation: 0,
         };
 
-        let (handle_b, mut rx_b) =
-            GossipService::start(config_b, identity_b, test_meta(id_b, addr_b.port()), None)
-                .await
-                .unwrap();
+        let (handle_b, mut rx_b) = start_reserved(
+            socket_b,
+            config_b,
+            identity_b,
+            test_meta(id_b, addr_b.port()),
+        )
+        .await;
 
         // Wait for discovery (with timeout).
         let deadline = tokio::time::sleep(Duration::from_secs(10));
@@ -1884,6 +3229,53 @@ mod tests {
         assert!(handle_b.alive_count() >= 1);
     }
 
+    /// A node that adopted its bucket configurations announces it at once: its
+    /// peer learns it well before the next periodic metadata broadcast.
+    #[tokio::test]
+    async fn an_adoption_announced_reaches_the_peer_at_once() {
+        let start = |seeds: Vec<SocketAddr>| async move {
+            let id = NodeId::generate();
+            let (socket, addr) = reserve();
+            let config = GossipConfig {
+                bind_addr: addr,
+                seeds,
+                meta_broadcast_interval: Duration::from_secs(3600),
+                ..Default::default()
+            };
+            let identity = GossipIdentity {
+                node_id: id,
+                gossip_addr: addr,
+                incarnation: 0,
+            };
+            let (handle, rx) =
+                start_reserved(socket, config, identity, test_meta(id, addr.port())).await;
+            (id, addr, handle, rx)
+        };
+        let (id_a, addr_a, handle_a, _rx_a) = start(Vec::new()).await;
+        let (_id_b, _addr_b, handle_b, _rx_b) = start(vec![addr_a]).await;
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while handle_b.get_node(&id_a).is_none_or(|state| state.meta.node_id != id_a) {
+            assert!(
+                Instant::now() < deadline,
+                "node B never saw node A's metadata"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!handle_b.bucket_configs_adopted(&id_a));
+
+        handle_a.announce_bucket_configs_adopted();
+        assert!(handle_a.bucket_configs_adopted(&id_a));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !handle_b.bucket_configs_adopted(&id_a) {
+            assert!(
+                Instant::now() < deadline,
+                "node B never learned that node A adopted"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
     /// A node whose seed is not listening yet still joins once it comes up.
     ///
     /// This is the ordinary case when a whole cluster starts at once, or during
@@ -1902,15 +3294,16 @@ mod tests {
 
         let mut ids = Vec::new();
         let mut addrs = Vec::new();
+        let mut sockets = Vec::new();
         for _ in 0..NODES {
-            let socket = UdpSocket::bind(localhost(0)).await.unwrap();
-            addrs.push(socket.local_addr().unwrap());
-            drop(socket);
+            let (socket, addr) = reserve();
+            addrs.push(addr);
+            sockets.push(socket);
             ids.push(NodeId::generate());
         }
 
         let mut handles = Vec::new();
-        for idx in 0..NODES {
+        for (idx, socket) in sockets.into_iter().enumerate() {
             let mut meta = test_meta(ids[idx], addrs[idx].port());
             meta.addr.gossip_addr = addrs[idx];
             meta.addr.grpc_addr = addrs[idx];
@@ -1927,7 +3320,7 @@ mod tests {
                 gossip_addr: addrs[idx],
                 incarnation: 1_700_000_000_000 + idx as u64,
             };
-            let (handle, _rx) = GossipService::start(config, identity, meta, None).await.unwrap();
+            let (handle, _rx) = start_reserved(socket, config, identity, meta).await;
             handles.push(handle);
         }
 
@@ -1965,18 +3358,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_node_joins_a_seed_that_starts_after_it() {
-        // Reserve both addresses first, so the late seed can bind the exact
+        // Reserve both addresses first, so the late seed starts on the exact
         // address the early node was told to announce to.
-        let socket_a = UdpSocket::bind(localhost(0)).await.unwrap();
-        let addr_a = socket_a.local_addr().unwrap();
-        drop(socket_a);
-        let socket_b = UdpSocket::bind(localhost(0)).await.unwrap();
-        let addr_b = socket_b.local_addr().unwrap();
-        drop(socket_b);
+        let (socket_a, addr_a) = reserve();
+        let (socket_b, addr_b) = reserve();
 
         // Node B starts first and announces into the void.
         let id_b = NodeId::generate();
-        let (handle_b, mut rx_b) = GossipService::start(
+        let (handle_b, mut rx_b) = start_reserved(
+            socket_b,
             GossipConfig {
                 bind_addr: addr_b,
                 seeds: vec![addr_a],
@@ -1988,10 +3378,8 @@ mod tests {
                 incarnation: 0,
             },
             test_meta(id_b, addr_b.port()),
-            None,
         )
-        .await
-        .unwrap();
+        .await;
 
         // Long enough that the one-shot announcement is definitely spent. The
         // local node counts itself as a member, so the check is for peers.
@@ -2006,8 +3394,16 @@ mod tests {
             "node B must know no peer while its seed is not up"
         );
 
+        // The seed's address was held, not closed, so what B announced while the
+        // seed was down waits in that socket. Thrown away here: the seed must be
+        // reached by what B sends once it is up, as a seed that was really down
+        // would be.
+        let mut stale = [0u8; 65_536];
+        while socket_a.recv_from(&mut stale).is_ok() {}
+
         let id_a = NodeId::generate();
-        let (handle_a, _rx_a) = GossipService::start(
+        let (handle_a, _rx_a) = start_reserved(
+            socket_a,
             GossipConfig {
                 bind_addr: addr_a,
                 seeds: Vec::new(),
@@ -2019,10 +3415,8 @@ mod tests {
                 incarnation: 0,
             },
             test_meta(id_a, addr_a.port()),
-            None,
         )
-        .await
-        .unwrap();
+        .await;
 
         let deadline = tokio::time::sleep(Duration::from_secs(15));
         tokio::pin!(deadline);
@@ -2051,6 +3445,7 @@ mod tests {
     /// replies — the way SIGSTOP stops a process, and its peers go on without
     /// it. The thread ends once the test drops the flag.
     fn start_pausable_node(
+        socket: std::net::UdpSocket,
         config: GossipConfig,
         identity: GossipIdentity,
         meta: NodeMeta,
@@ -2062,7 +3457,7 @@ mod tests {
             let runtime =
                 tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             runtime.block_on(async move {
-                let (handle, _) = GossipService::start(config, identity, meta, None).await.unwrap();
+                let (handle, _) = start_reserved(socket, config, identity, meta).await;
                 handle_tx.send(handle).unwrap();
                 while std::sync::Arc::strong_count(&node_paused) > 1 {
                     // Blocks this thread, and with it every task of the node.
@@ -2132,16 +3527,17 @@ mod tests {
 
         let mut ids = Vec::new();
         let mut addrs = Vec::new();
+        let mut sockets = Vec::new();
         for _ in 0..NODES {
-            let socket = UdpSocket::bind(localhost(0)).await.unwrap();
-            addrs.push(socket.local_addr().unwrap());
-            drop(socket);
+            let (socket, addr) = reserve();
+            addrs.push(addr);
+            sockets.push(socket);
             ids.push(NodeId::generate());
         }
 
         let mut handles = Vec::new();
         let mut paused = None;
-        for idx in 0..NODES {
+        for (idx, socket) in sockets.into_iter().enumerate() {
             let config = GossipConfig {
                 bind_addr: addrs[idx],
                 seeds: addrs.clone(),
@@ -2154,11 +3550,11 @@ mod tests {
             };
             let meta = test_meta(ids[idx], addrs[idx].port());
             if idx == PAUSED {
-                let (handle, node_paused) = start_pausable_node(config, identity, meta);
+                let (handle, node_paused) = start_pausable_node(socket, config, identity, meta);
                 handles.push(handle);
                 paused = Some(node_paused);
             } else {
-                let (handle, _) = GossipService::start(config, identity, meta, None).await.unwrap();
+                let (handle, _) = start_reserved(socket, config, identity, meta).await;
                 handles.push(handle);
             }
         }
@@ -2255,11 +3651,12 @@ mod tests {
         // Every node is known to its peers only by its relay's address.
         let split = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut nodes = Vec::new();
+        let mut sockets = Vec::new();
         let mut relays = Vec::new();
         for _ in 0..NODES {
-            let socket = UdpSocket::bind(localhost(0)).await.unwrap();
-            nodes.push(socket.local_addr().unwrap());
-            drop(socket);
+            let (socket, addr) = reserve();
+            nodes.push(addr);
+            sockets.push(socket);
             relays.push(UdpSocket::bind(localhost(0)).await.unwrap());
         }
         let relay_addrs: Vec<_> = relays.iter().map(|r| r.local_addr().unwrap()).collect();
@@ -2269,7 +3666,7 @@ mod tests {
 
         let ids: Vec<_> = (0..NODES).map(|_| NodeId::generate()).collect();
         let mut handles = Vec::new();
-        for idx in 0..NODES {
+        for (idx, socket) in sockets.into_iter().enumerate() {
             let config = GossipConfig {
                 bind_addr: nodes[idx],
                 seeds: relay_addrs.clone(),
@@ -2281,7 +3678,7 @@ mod tests {
                 incarnation: 1_700_000_000_000 + idx as u64,
             };
             let meta = test_meta(ids[idx], relay_addrs[idx].port());
-            let (handle, _) = GossipService::start(config, identity, meta, None).await.unwrap();
+            let (handle, _) = start_reserved(socket, config, identity, meta).await;
             handles.push(handle);
         }
         let (handles, ids) = (&handles[..], &ids[..]);
@@ -2689,6 +4086,7 @@ mod tests {
     /// map, this node's own identity, and what it believes every other node's
     /// identity to be. Notifications take the same path they take in the loop.
     struct View {
+        peer_view: GossipHandle,
         members: std::sync::Arc<std::sync::RwLock<HashMap<NodeId, NodeState>>>,
         roster: RosterCell,
         local: GossipIdentity,
@@ -2700,9 +4098,15 @@ mod tests {
     impl View {
         fn new(local: GossipIdentity) -> Self {
             let (event_tx, events) = mpsc::channel(32);
+            let members = std::sync::Arc::new(std::sync::RwLock::new(HashMap::new()));
+            let roster = RosterCell::default();
+            let mut peer_view = test_handle(members.clone());
+            peer_view.local_node_id = local.node_id;
+            peer_view.roster = roster.clone();
             Self {
-                members: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
-                roster: RosterCell::default(),
+                peer_view,
+                members,
+                roster,
                 identities: IdentityTable::from([(local.node_id, local.clone())]),
                 local,
                 event_tx,
@@ -2718,12 +4122,14 @@ mod tests {
                 &self.event_tx,
                 &mut self.local,
                 &mut self.identities,
+                &self.peer_view,
             )
             .await
         }
 
         fn meta_arrived(&self, meta: NodeMeta) {
             update_member_meta(&self.members, &self.roster, &self.local, meta.node_id, meta);
+            self.peer_view.publish_peer_changes(Some(&self.identities));
         }
 
         fn state(&self, node_id: NodeId) -> Option<NodeState> {
@@ -2740,10 +4146,7 @@ mod tests {
 
         /// A handle over this view, as bootstrap holds one over the loop's.
         fn handle(&self) -> GossipHandle {
-            let mut handle = test_handle(self.members.clone());
-            handle.local_node_id = self.local.node_id;
-            handle.roster = self.roster.clone();
-            handle
+            self.peer_view.clone()
         }
     }
 
@@ -2984,13 +4387,16 @@ mod tests {
         meta.protocol_version = 2;
         view.meta_arrived(meta);
 
-        let first_sighting = view
+        let news = view
             .notify(foca::OwnedNotification::MemberUp(identity(
                 node_id, 9200, 0,
             )))
             .await;
 
-        assert!(!first_sighting, "the node was already known");
+        assert!(
+            news,
+            "a run this node did not track yet is told this node's metadata"
+        );
         let state = view.state(node_id).unwrap();
         assert_eq!(
             state.meta.protocol_version, 2,
@@ -3012,6 +4418,47 @@ mod tests {
             }
             other => panic!("expected Joined, got {other:?}"),
         }
+    }
+
+    /// A node that comes back as a new run — restarted — knows nothing of its
+    /// peers, as a fresh one: the join is answered with this node's metadata,
+    /// so that the tails it needs — its copy of IAM confirmed among them —
+    /// reach it in one round rather than at the next periodic broadcast. A
+    /// join of the run already tracked is not.
+    #[tokio::test]
+    async fn a_node_back_as_a_new_run_is_told_this_nodes_metadata() {
+        let node_id = NodeId::generate();
+        let mut view = View::new(identity(NodeId::generate(), 9000, 100));
+        assert!(
+            view.notify(foca::OwnedNotification::MemberUp(identity(
+                node_id, 9200, 10
+            )))
+            .await
+        );
+        view.meta_arrived(test_meta(node_id, 9200));
+        assert!(
+            !view
+                .notify(foca::OwnedNotification::MemberUp(identity(
+                    node_id, 9200, 10
+                )))
+                .await,
+            "the same run again is no news"
+        );
+        assert!(
+            view.notify(foca::OwnedNotification::MemberUp(identity(
+                node_id, 9200, 20
+            )))
+            .await,
+            "a restarted node is told this node's metadata"
+        );
+        assert!(
+            !view
+                .notify(foca::OwnedNotification::MemberUp(identity(
+                    node_id, 9200, 15
+                )))
+                .await,
+            "a run this node has moved on from is ignored"
+        );
     }
 
     /// A node nobody has heard from still gets an entry, so that failure
@@ -3350,6 +4797,8 @@ mod tests {
         let local = NodeId(7);
         let other = NodeId(8);
         let handle = GossipHandle {
+            peer_changes: std::sync::Arc::default(),
+            local_pool_id: crate::PoolId(1),
             members: std::sync::Arc::new(std::sync::RwLock::new(HashMap::new())),
             local_node_id: local,
             local_capacity: std::sync::Arc::new(std::sync::RwLock::new(LocalCapacity {
@@ -3362,6 +4811,19 @@ mod tests {
                 measured_at: Instant::now(),
             })),
             roster: RosterCell::default(),
+            adopted_peers: AdoptedPeers::default(),
+            adopted_locally: std::sync::Arc::default(),
+            placement_peers: PlacementPeers::default(),
+            placement_local: PlacementLocal::default(),
+            iam_peers: IamPeers::default(),
+            iam_local: IamLocal::default(),
+            iam_adopted_peers: AdoptedPeers::default(),
+            iam_adopted_local: std::sync::Arc::default(),
+            iam_config_peers: IamConfigPeers::default(),
+            iam_config_local: IamConfigLocal::default(),
+            generation_peers: GenerationPeers::default(),
+            generation_local: GenerationLocal::default(),
+            announce: std::sync::Arc::default(),
         };
 
         let report = handle.node_capacity(local).unwrap();

@@ -25,9 +25,15 @@ jsonwebtoken = "9"
 nanoid = "0.4"
 subtle = "2.5"
 rand = "0.8"
+hmac = "0.12"
+sha2 = { workspace = true }
+async-trait = "0.1"
+aes-gcm = "0.10"
+hkdf = "0.12"
 
 [dev-dependencies]
 tokio-test = "0.4"
+tempfile = "3"
 
 [lints]
 workspace = true

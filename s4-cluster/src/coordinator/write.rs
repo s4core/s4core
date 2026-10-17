@@ -46,7 +46,7 @@ use s4_core::types::{
     composite::{MultipartPartRecord, MultipartUploadSession, MultipartUploadState},
     ObjectLayout, S4_STORAGE_CLASS_METADATA_KEY,
 };
-use s4_core::{IndexRecord, StorageEngine};
+use s4_core::{IndexRecord, PutOutcome, StorageEngine};
 use sha2::{Digest, Sha256};
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
@@ -59,8 +59,9 @@ use crate::config::ClusterConfig;
 use crate::error::ClusterError;
 use crate::hints::{HintEntry, HintedHandoffManager};
 use crate::hlc::{HlcTimestamp, HybridClock};
+use crate::iam_lease::{IamLeaseKeeper, LeaseFence, Refusal};
 use crate::identity::{NodeId, PoolId};
-use crate::placement::PlacementRouter;
+use crate::placement::{PlacementDecision, PlacementRouter, ReplicationClass, WriteRule};
 use crate::replica::MultipartReplicaStorage;
 use crate::rpc::proto;
 use crate::rpc::NodeClient;
@@ -155,6 +156,8 @@ struct MultipartCompletePlan {
     total_size: u64,
     content_type: String,
     metadata: HashMap<String, String>,
+    /// The newest version of the key among the replicas inspected.
+    newest_key_version: Option<HlcTimestamp>,
 }
 
 #[derive(Debug, Clone)]
@@ -162,6 +165,8 @@ struct MultipartReplicaInspection {
     node_id: NodeId,
     session: MultipartUploadSession,
     parts: Vec<MultipartPartRecord>,
+    /// The HLC of the version the replica holds for the key, if any.
+    key_hlc: Option<HlcTimestamp>,
 }
 
 /// Timeout configuration for write operations.
@@ -196,7 +201,13 @@ pub struct QuorumWriteCoordinator {
     hints: Arc<HintedHandoffManager>,
     timeouts: WriteTimeouts,
     topology_epoch: u64,
-    write_quorum: u8,
+    /// This node's grants of the lease of IAM changes: its own replica fences
+    /// the writes of the cluster's control state as a remote one does.
+    iam_lease: Option<Arc<IamLeaseKeeper>>,
+    placement_minimum: crate::placement_fence::PlacementFloor,
+    /// Brings the replicas of a growing pool's new generation to an upload
+    /// begun before the growth, before a part or the completion needs them.
+    uploads: Option<Arc<crate::rebalance::MultipartTransfer>>,
 }
 
 impl QuorumWriteCoordinator {
@@ -222,14 +233,117 @@ impl QuorumWriteCoordinator {
             hints,
             timeouts,
             topology_epoch: cluster_config.epoch,
-            write_quorum: cluster_config.default_write_quorum,
+            iam_lease: None,
+            placement_minimum: crate::placement_fence::PlacementFloor::default(),
+            uploads: None,
         }
+    }
+
+    /// Fence the local replica by the same floor as remote replicas.
+    pub fn with_placement_generation(mut self, minimum: u64) -> Self {
+        self.placement_minimum = crate::placement_fence::PlacementFloor::new(minimum);
+        self
+    }
+
+    /// Fence the local replica by `floor`, shared with this node's replica
+    /// handlers, as it rises when the pool's move begins.
+    pub fn with_placement_floor(mut self, floor: crate::placement_fence::PlacementFloor) -> Self {
+        self.placement_minimum = floor;
+        self
+    }
+
+    fn admit_placement(
+        &self,
+        decision: &PlacementDecision,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), ClusterError> {
+        crate::placement_fence::check(
+            self.placement_minimum.get(),
+            decision.placement_generation,
+            bucket,
+            key,
+            false,
+            None,
+        )
+    }
+
+    /// The local replica fencing the writes of the cluster's control state
+    /// by `keeper`, as the node's replica handler does for remote ones (plan
+    /// CLUSTER-IAM-REPLICATION.md, decision 3).
+    pub fn with_iam_lease(mut self, keeper: Arc<IamLeaseKeeper>) -> Self {
+        self.iam_lease = Some(keeper);
+        self
+    }
+
+    /// The keeper the local replica fences class writes by, for a write of
+    /// `decision`'s class: `None` for any other class.
+    fn lease_keeper(&self, decision: &PlacementDecision) -> Option<Arc<IamLeaseKeeper>> {
+        (decision.class == ReplicationClass::ClusterControl)
+            .then(|| self.iam_lease.clone())
+            .flatten()
+    }
+
+    /// Whether the replica `node` of `decision` is sent its writes and deletes
+    /// ([`super::takes_class`]).
+    fn takes(&self, node: NodeId, decision: &PlacementDecision) -> bool {
+        super::takes_class(&self.rpc_client, self.local_node_id, node, decision.class)
     }
 
     /// Attach native multipart storage for cluster-mode multipart quorum writes.
     pub fn with_multipart_storage(mut self, storage: Arc<dyn MultipartReplicaStorage>) -> Self {
         self.multipart_storage = Some(storage);
         self
+    }
+
+    /// Hands an upload begun before a pool's growth to the replicas of the new
+    /// generation that lack it, before a part or the completion goes to them
+    /// (`align_upload`).
+    pub fn with_upload_transfer(
+        mut self,
+        transfer: Arc<crate::rebalance::MultipartTransfer>,
+    ) -> Self {
+        self.uploads = Some(transfer);
+        self
+    }
+
+    /// Brings every replica of a growing pool — both generations — that holds
+    /// no session of the upload to it, while a write quorum of one of them
+    /// holds it: an upload begun before the growth lives on the old owners
+    /// only, and the part or the completion about to go out needs the joint
+    /// quorum. Without this a new owner answers `NoSuchUpload` to an upload
+    /// that exists until the move hands it over. Nothing is sent when the
+    /// pool does not grow, or when the upload is closed — the operation then
+    /// answers as it would.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` (503) when the upload could not be handed over now: the
+    /// client tries again, and no replica took the operation.
+    async fn align_upload(
+        &self,
+        decision: &PlacementDecision,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), ClusterError> {
+        if decision.write_rule.requirements().len() < 2 {
+            return Ok(());
+        }
+        let Some(uploads) = &self.uploads else {
+            return Ok(());
+        };
+        match uploads.bring_to(bucket, key, upload_id, None).await {
+            crate::rebalance::UploadHandedOver::InStep { .. }
+            | crate::rebalance::UploadHandedOver::Gone => Ok(()),
+            crate::rebalance::UploadHandedOver::Failed(why)
+            | crate::rebalance::UploadHandedOver::Damaged(why) => {
+                Err(ClusterError::Unavailable(format!(
+                    "upload {upload_id} could not be handed to the grown pool's new owners yet: \
+                     {why}"
+                )))
+            }
+        }
     }
 
     fn metadata_with_pool_storage_class(
@@ -266,6 +380,30 @@ impl QuorumWriteCoordinator {
         .await
     }
 
+    /// A quorum write of the cluster's control state made under the lease of
+    /// IAM changes `fence`: its HLC inside the epoch's window, and every
+    /// replica, this node's own too, fencing it by the epoch.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when this node's clock is already past the epoch's
+    /// ceiling; `QuorumNotMet` when too few replicas took it, fenced or not.
+    pub async fn write_fenced(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        content_type: &str,
+        metadata: &HashMap<String, String>,
+        fence: LeaseFence,
+    ) -> Result<QuorumWriteResult, ClusterError> {
+        observe_quorum(
+            QuorumOperation::Write,
+            self.write_inner_fenced(bucket, key, data, content_type, metadata, Some(fence)),
+        )
+        .await
+    }
+
     async fn write_inner(
         &self,
         bucket: &str,
@@ -274,7 +412,20 @@ impl QuorumWriteCoordinator {
         content_type: &str,
         metadata: &HashMap<String, String>,
     ) -> Result<QuorumWriteResult, ClusterError> {
+        self.write_inner_fenced(bucket, key, data, content_type, metadata, None).await
+    }
+
+    async fn write_inner_fenced(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        content_type: &str,
+        metadata: &HashMap<String, String>,
+        fence: Option<LeaseFence>,
+    ) -> Result<QuorumWriteResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
+        self.admit_placement(&decision, bucket, key)?;
         let metadata = self.metadata_with_pool_storage_class(decision.pool_id, metadata);
         let replicas = &decision.replicas;
 
@@ -283,9 +434,69 @@ impl QuorumWriteCoordinator {
             return self.write_single_node(bucket, key, data, content_type, &metadata).await;
         }
 
-        let operation_id = uuid::Uuid::new_v4().as_u128();
         let hlc = self.clock.now();
+        check_window(fence.as_ref(), hlc)?;
+        let (result, superseded_by) = self
+            .write_attempt(
+                bucket,
+                key,
+                data,
+                content_type,
+                &metadata,
+                &decision,
+                hlc,
+                fence,
+            )
+            .await?;
+        let Some(newer) = superseded_by.filter(|newer| *newer > hlc) else {
+            return Ok(result);
+        };
+        // A replica holds a version newer than this write's HLC: this
+        // coordinator's clock is behind the one that issued it. The write
+        // goes again above that version (plan ANTI-ENTROPY-PHASE-1-2.md,
+        // `AE12-013`); a version newer still was written during this write,
+        // and the two are concurrent.
+        self.clock.observe(&newer);
+        let raised = self.clock.now();
+        debug!(%bucket, %key, %hlc, %newer, %raised, "write outranked, raising its HLC");
+        check_window(fence.as_ref(), raised)?;
+        let (result, still_superseded) = self
+            .write_attempt(
+                bucket,
+                key,
+                data,
+                content_type,
+                &metadata,
+                &decision,
+                raised,
+                fence,
+            )
+            .await?;
+        if let Some(newer) = still_superseded.filter(|newer| *newer > raised) {
+            info!(%bucket, %key, %raised, %newer, "write ordered before a concurrent one");
+        }
+        Ok(result)
+    }
+
+    /// One fan-out of a quorum write at `hlc`: the result, and the HLC of the
+    /// newest version that outranked the write on a replica that answered,
+    /// if any did.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_attempt(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        content_type: &str,
+        metadata: &HashMap<String, String>,
+        decision: &PlacementDecision,
+        hlc: HlcTimestamp,
+        fence: Option<LeaseFence>,
+    ) -> Result<(QuorumWriteResult, Option<HlcTimestamp>), ClusterError> {
+        let replicas = &decision.replicas;
+        let operation_id = uuid::Uuid::new_v4().as_u128();
         let content_hash = compute_sha256(data);
+        let lease_keeper = self.lease_keeper(decision);
 
         let replicas_total = replicas.len() as u8;
 
@@ -293,6 +504,9 @@ impl QuorumWriteCoordinator {
         let mut handles = Vec::with_capacity(replicas.len());
 
         for &node_id in replicas {
+            if !self.takes(node_id, decision) {
+                continue;
+            }
             let handle = if node_id == self.local_node_id {
                 // Local write: direct storage engine call
                 let storage = self.storage.clone();
@@ -309,16 +523,35 @@ impl QuorumWriteCoordinator {
                 metadata_with_hlc.insert("_s4_hlc_node_id".to_string(), hlc.node_id.to_string());
                 metadata_with_hlc.insert("_s4_operation_id".to_string(), operation_id.to_string());
                 let timeout_dur = self.timeouts.replica_write_timeout;
+                let lease_keeper = lease_keeper.clone();
 
                 tokio::spawn(async move {
+                    // Held until the write is in storage: no newer epoch is
+                    // granted here before it lands.
+                    let _admitted = match admit_local(lease_keeper, fence.as_ref(), hlc).await {
+                        Ok(admitted) => admitted,
+                        Err(refusal) => return refused_locally(node_id, refusal),
+                    };
                     let result = timeout(
                         timeout_dur,
-                        storage.put_object(&bucket, &key, &data, &content_type, &metadata_with_hlc),
+                        storage.put_object_outcome(
+                            &bucket,
+                            &key,
+                            &data,
+                            &content_type,
+                            &metadata_with_hlc,
+                        ),
                     )
                     .await;
 
                     match result {
-                        Ok(Ok(etag)) => ReplicaResult::Success { node_id, etag },
+                        Ok(Ok(PutOutcome::Stored { etag })) => {
+                            ReplicaResult::Success { node_id, etag }
+                        }
+                        Ok(Ok(PutOutcome::Superseded { by })) => ReplicaResult::Superseded {
+                            node_id,
+                            by: HlcTimestamp::of_record(&by),
+                        },
                         Ok(Err(e)) => ReplicaResult::Failure {
                             node_id,
                             error: format!("local storage error: {e}"),
@@ -333,6 +566,7 @@ impl QuorumWriteCoordinator {
                 // Remote write: gRPC
                 let client = self.rpc_client.clone();
                 let request = proto::WriteBlobRequest {
+                    verify_content: false,
                     bucket: bucket.to_string(),
                     key: key.to_string(),
                     data: data.to_vec(),
@@ -344,6 +578,11 @@ impl QuorumWriteCoordinator {
                     coordinator_id: self.local_node_id.to_bytes().to_vec(),
                     operation_id: operation_id.to_be_bytes().to_vec(),
                     topology_epoch: self.topology_epoch,
+                    placement_generation: decision.placement_generation,
+                    etag: String::new(),
+                    bucket_metadata_stage: stage_on_wire(decision),
+                    repair_copy: false,
+                    iam_lease: fence.map(|fence| fence.to_proto()),
                 };
                 let timeout_dur = self.timeouts.replica_write_timeout;
                 let hints = self.hints.clone();
@@ -353,9 +592,25 @@ impl QuorumWriteCoordinator {
                     let result = timeout(timeout_dur, client.send_write(node_id, request)).await;
 
                     let outcome = match result {
-                        Ok(Ok(resp)) if resp.success => ReplicaResult::Success {
+                        Ok(Ok(resp)) if resp.success => match &resp.superseded_by {
+                            Some(by) => ReplicaResult::Superseded {
+                                node_id,
+                                by: HlcTimestamp::from_proto(by),
+                            },
+                            None => ReplicaResult::Success {
+                                node_id,
+                                etag: String::new(),
+                            },
+                        },
+                        Ok(Ok(resp)) if resp.stage_fenced => ReplicaResult::Fenced {
                             node_id,
-                            etag: String::new(),
+                            error: resp.error,
+                        },
+                        // Behind or ahead of the holder's epoch: a hint brings
+                        // the replica to the current state, whatever it is.
+                        Ok(Ok(resp)) if resp.lease_fenced => ReplicaResult::Failure {
+                            node_id,
+                            error: resp.error,
                         },
                         Ok(Ok(resp)) if resp.epoch_mismatch => {
                             ReplicaResult::EpochMismatch { node_id }
@@ -364,10 +619,7 @@ impl QuorumWriteCoordinator {
                             node_id,
                             error: resp.error,
                         },
-                        Ok(Err(e)) => ReplicaResult::Failure {
-                            node_id,
-                            error: e.to_string(),
-                        },
+                        Ok(Err(e)) => ReplicaResult::from_remote_error(node_id, e),
                         Err(_) => ReplicaResult::Failure {
                             node_id,
                             error: "replica write timeout".into(),
@@ -382,25 +634,25 @@ impl QuorumWriteCoordinator {
         }
 
         // Wait for W responses with quorum timeout
-        let results = self.collect_quorum_results(handles, self.write_quorum).await?;
+        let results = self.collect_quorum_results(handles, &decision.write_rule).await?;
 
         let acked: Vec<_> = results.iter().filter(|r| r.is_success()).collect();
+        let acked_nodes: Vec<NodeId> = acked.iter().map(|r| r.node_id()).collect();
 
-        if (acked.len() as u8) < self.write_quorum {
-            return Err(ClusterError::QuorumNotMet {
-                needed: self.write_quorum,
-                achieved: acked.len() as u8,
-            });
+        if let Some((needed, achieved)) = decision.write_rule.unmet(&acked_nodes) {
+            return Err(ClusterError::QuorumNotMet { needed, achieved });
         }
 
-        // Extract ETag from the first successful response
+        // Extract ETag from the first successful response, or compute it as
+        // the storage does when no local replica stored the write
         let etag = acked
             .iter()
             .find_map(|r| match r {
                 ReplicaResult::Success { etag, .. } if !etag.is_empty() => Some(etag.clone()),
                 _ => None,
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| format!("{:x}", md5::compute(data)));
+        let superseded_by = superseded_by(&results);
 
         info!(
             bucket = %bucket,
@@ -409,25 +661,46 @@ impl QuorumWriteCoordinator {
             "quorum write completed"
         );
 
-        Ok(QuorumWriteResult {
-            etag,
-            replicas_acked: acked.len() as u8,
-            replicas_total,
-            replica_nodes: replicas.clone(),
-            hlc,
-        })
+        Ok((
+            QuorumWriteResult {
+                etag,
+                replicas_acked: acked.len() as u8,
+                replicas_total,
+                replica_nodes: replicas.to_vec(),
+                hlc,
+            },
+            superseded_by,
+        ))
     }
 
     /// Execute a quorum delete (DELETE object).
+    ///
+    /// A client's delete: when a replica holds a version newer than the
+    /// delete's HLC, this coordinator's clock is behind the one that issued
+    /// it, and the delete goes again above that version, once (plan
+    /// ANTI-ENTROPY-PHASE-1-2.md, `AE12-013`).
     pub async fn delete(
         &self,
         bucket: &str,
         key: &str,
     ) -> Result<QuorumDeleteResult, ClusterError> {
-        observe_quorum(
-            QuorumOperation::Delete,
-            self.delete_with_expected_hlc(bucket, key, None),
-        )
+        observe_quorum(QuorumOperation::Delete, self.delete_raised(bucket, key)).await
+    }
+
+    /// Execute a quorum delete that is never raised above a newer version: a
+    /// replica that holds one keeps it. For a delete that is not a client's
+    /// — the erasure-coding garbage collector removing the replicated copy of
+    /// an object deleted earlier, where a newer version is a client's write
+    /// made since.
+    pub async fn delete_once(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<QuorumDeleteResult, ClusterError> {
+        observe_quorum(QuorumOperation::Delete, async {
+            let hlc = self.clock.now();
+            Ok(self.delete_with_expected_hlc(bucket, key, None, hlc, None).await?.0)
+        })
         .await
     }
 
@@ -438,11 +711,68 @@ impl QuorumWriteCoordinator {
         key: &str,
         expected_source_hlc: HlcTimestamp,
     ) -> Result<QuorumDeleteResult, ClusterError> {
+        observe_quorum(QuorumOperation::Delete, async {
+            let hlc = self.clock.now();
+            Ok(self
+                .delete_with_expected_hlc(bucket, key, Some(expected_source_hlc), hlc, None)
+                .await?
+                .0)
+        })
+        .await
+    }
+
+    /// A quorum delete of the cluster's control state made under the lease
+    /// of IAM changes `fence`, as [`Self::write_fenced`] writes: the
+    /// tombstone's HLC inside the epoch's window, every replica fencing it.
+    ///
+    /// # Errors
+    ///
+    /// `Unavailable` when this node's clock is already past the epoch's
+    /// ceiling; `QuorumNotMet` when too few replicas took it.
+    pub async fn delete_fenced(
+        &self,
+        bucket: &str,
+        key: &str,
+        fence: LeaseFence,
+    ) -> Result<QuorumDeleteResult, ClusterError> {
         observe_quorum(
             QuorumOperation::Delete,
-            self.delete_with_expected_hlc(bucket, key, Some(expected_source_hlc)),
+            self.delete_raised_fenced(bucket, key, Some(fence)),
         )
         .await
+    }
+
+    async fn delete_raised(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<QuorumDeleteResult, ClusterError> {
+        self.delete_raised_fenced(bucket, key, None).await
+    }
+
+    async fn delete_raised_fenced(
+        &self,
+        bucket: &str,
+        key: &str,
+        fence: Option<LeaseFence>,
+    ) -> Result<QuorumDeleteResult, ClusterError> {
+        let hlc = self.clock.now();
+        check_window(fence.as_ref(), hlc)?;
+        let (result, superseded_by) =
+            self.delete_with_expected_hlc(bucket, key, None, hlc, fence).await?;
+        let Some(newer) = superseded_by.filter(|newer| *newer > hlc) else {
+            return Ok(result);
+        };
+        self.clock.observe(&newer);
+        let raised = self.clock.now();
+        debug!(%bucket, %key, %hlc, %newer, %raised, "delete outranked, raising its HLC");
+        check_window(fence.as_ref(), raised)?;
+        let (result, still_superseded) =
+            self.delete_with_expected_hlc(bucket, key, None, raised, fence).await?;
+        if let Some(newer) = still_superseded.filter(|newer| *newer > raised) {
+            info!(%bucket, %key, %raised, %newer, "delete ordered before a concurrent write");
+        }
+        Ok(result)
     }
 
     /// Allocate a coordinator HLC for metadata-only delete commits.
@@ -450,17 +780,29 @@ impl QuorumWriteCoordinator {
         self.clock.now()
     }
 
+    /// One fan-out of a quorum delete at `hlc`: the result, and the HLC of
+    /// the newest version that kept a replica from leaving the tombstone, if
+    /// any did.
     async fn delete_with_expected_hlc(
         &self,
         bucket: &str,
         key: &str,
         expected_source_hlc: Option<HlcTimestamp>,
-    ) -> Result<QuorumDeleteResult, ClusterError> {
+        hlc: HlcTimestamp,
+        fence: Option<LeaseFence>,
+    ) -> Result<(QuorumDeleteResult, Option<HlcTimestamp>), ClusterError> {
         let decision = self.router.route(bucket, key)?;
+        self.admit_placement(&decision, bucket, key)?;
+        // A purge of the garbage collector removes a version the pool
+        // settled; it is no change of IAM.
+        let lease_keeper = if expected_source_hlc.is_none() {
+            self.lease_keeper(&decision)
+        } else {
+            None
+        };
         let replicas = &decision.replicas;
         let operation_uuid = uuid::Uuid::new_v4();
         let operation_id = operation_uuid.as_u128();
-        let hlc = self.clock.now();
 
         // Single-node bypass
         if replicas.len() == 1 && replicas[0] == self.local_node_id {
@@ -481,27 +823,42 @@ impl QuorumWriteCoordinator {
                     .await
                     .map_err(|e| ClusterError::Storage(e.to_string()))?;
             }
-            return Ok(QuorumDeleteResult {
-                replicas_acked: 1,
-                replicas_total: 1,
-                replica_nodes: replicas.clone(),
-                hlc,
-                operation_id: operation_uuid,
-            });
+            return Ok((
+                QuorumDeleteResult {
+                    replicas_acked: 1,
+                    replicas_total: 1,
+                    replica_nodes: replicas.clone(),
+                    hlc,
+                    operation_id: operation_uuid,
+                },
+                None,
+            ));
         }
 
         let replicas_total = replicas.len() as u8;
+        let leaves_tombstone = crate::replica::delete_leaves_tombstone(bucket, key);
 
         let mut handles = Vec::with_capacity(replicas.len());
 
         for &node_id in replicas {
+            if !self.takes(node_id, &decision) {
+                continue;
+            }
             let handle = if node_id == self.local_node_id {
                 let storage = self.storage.clone();
                 let bucket = bucket.to_string();
                 let key = key.to_string();
                 let timeout_dur = self.timeouts.replica_write_timeout;
+                let lease_keeper = lease_keeper.clone();
 
                 tokio::spawn(async move {
+                    let _admitted = match admit_local(lease_keeper, fence.as_ref(), hlc).await {
+                        Ok(admitted) => admitted,
+                        Err(refusal) => return refused_locally(node_id, refusal),
+                    };
+                    // The local replica takes the delete as a remote one does:
+                    // a purge removes its generation, a delete leaves the
+                    // tombstone at the delete's HLC where the key keeps one.
                     let result = if let Some(expected) = expected_source_hlc {
                         timeout(
                             timeout_dur,
@@ -514,12 +871,21 @@ impl QuorumWriteCoordinator {
                             ),
                         )
                         .await
-                        .map(|inner| inner.map(|_| ()))
+                        .map(|inner| inner.map(|_| None))
+                    } else if leaves_tombstone {
+                        timeout(
+                            timeout_dur,
+                            crate::replica::leave_tombstone(&*storage, &bucket, &key, hlc),
+                        )
+                        .await
                     } else {
-                        timeout(timeout_dur, storage.delete_object(&bucket, &key)).await
+                        timeout(timeout_dur, storage.delete_object(&bucket, &key))
+                            .await
+                            .map(|inner| inner.map(|()| None))
                     };
                     match result {
-                        Ok(Ok(())) => ReplicaResult::Success {
+                        Ok(Ok(Some(by))) => ReplicaResult::Superseded { node_id, by },
+                        Ok(Ok(None)) => ReplicaResult::Success {
                             node_id,
                             etag: String::new(),
                         },
@@ -542,8 +908,12 @@ impl QuorumWriteCoordinator {
                     coordinator_id: self.local_node_id.to_bytes().to_vec(),
                     operation_id: operation_id.to_be_bytes().to_vec(),
                     topology_epoch: self.topology_epoch,
+                    placement_generation: decision.placement_generation,
                     version_id: None,
                     expected_source_hlc: expected_source_hlc.map(|hlc| hlc.to_proto()),
+                    bucket_metadata_stage: stage_on_wire(&decision),
+                    repair_copy: false,
+                    iam_lease: fence.map(|fence| fence.to_proto()),
                 };
                 let timeout_dur = self.timeouts.replica_write_timeout;
                 let hints = self.hints.clone();
@@ -555,9 +925,25 @@ impl QuorumWriteCoordinator {
                 tokio::spawn(async move {
                     let result = timeout(timeout_dur, client.send_delete(node_id, request)).await;
                     let outcome = match result {
-                        Ok(Ok(resp)) if resp.success => ReplicaResult::Success {
+                        Ok(Ok(resp)) if resp.success => match &resp.superseded_by {
+                            Some(by) => ReplicaResult::Superseded {
+                                node_id,
+                                by: HlcTimestamp::from_proto(by),
+                            },
+                            None => ReplicaResult::Success {
+                                node_id,
+                                etag: String::new(),
+                            },
+                        },
+                        Ok(Ok(resp)) if resp.stage_fenced => ReplicaResult::Fenced {
                             node_id,
-                            etag: String::new(),
+                            error: resp.error,
+                        },
+                        // Behind or ahead of the holder's epoch: a hint brings
+                        // the replica to the current state, whatever it is.
+                        Ok(Ok(resp)) if resp.lease_fenced => ReplicaResult::Failure {
+                            node_id,
+                            error: resp.error,
                         },
                         Ok(Ok(resp)) if resp.epoch_mismatch => {
                             ReplicaResult::EpochMismatch { node_id }
@@ -566,10 +952,7 @@ impl QuorumWriteCoordinator {
                             node_id,
                             error: resp.error,
                         },
-                        Ok(Err(e)) => ReplicaResult::Failure {
-                            node_id,
-                            error: e.to_string(),
-                        },
+                        Ok(Err(e)) => ReplicaResult::from_remote_error(node_id, e),
                         Err(_) => ReplicaResult::Failure {
                             node_id,
                             error: "replica delete timeout".into(),
@@ -583,24 +966,26 @@ impl QuorumWriteCoordinator {
             handles.push(handle);
         }
 
-        let results = self.collect_quorum_results(handles, self.write_quorum).await?;
+        let results = self.collect_quorum_results(handles, &decision.write_rule).await?;
 
-        let acked = results.iter().filter(|r| r.is_success()).count() as u8;
+        let acked_nodes: Vec<NodeId> =
+            results.iter().filter(|r| r.is_success()).map(|r| r.node_id()).collect();
+        let acked = acked_nodes.len() as u8;
 
-        if acked < self.write_quorum {
-            return Err(ClusterError::QuorumNotMet {
-                needed: self.write_quorum,
-                achieved: acked,
-            });
+        if let Some((needed, achieved)) = decision.write_rule.unmet(&acked_nodes) {
+            return Err(ClusterError::QuorumNotMet { needed, achieved });
         }
 
-        Ok(QuorumDeleteResult {
-            replicas_acked: acked,
-            replicas_total,
-            replica_nodes: replicas.clone(),
-            hlc,
-            operation_id: operation_uuid,
-        })
+        Ok((
+            QuorumDeleteResult {
+                replicas_acked: acked,
+                replicas_total,
+                replica_nodes: replicas.clone(),
+                hlc,
+                operation_id: operation_uuid,
+            },
+            superseded_by(&results),
+        ))
     }
 
     /// Release the replicas' local copies of an object, keeping it in the
@@ -652,6 +1037,7 @@ impl QuorumWriteCoordinator {
             topology_epoch: ec_topology_epoch,
         };
         let decision = self.router.route(bucket, key)?;
+        self.admit_placement(&decision, bucket, key)?;
         let replicas = &decision.replicas;
         let operation_uuid = uuid::Uuid::new_v4();
         let operation_id = operation_uuid.as_u128();
@@ -727,6 +1113,7 @@ impl QuorumWriteCoordinator {
                     coordinator_id: self.local_node_id.to_bytes().to_vec(),
                     operation_id: operation_id.to_be_bytes().to_vec(),
                     topology_epoch: self.topology_epoch,
+                    placement_generation: decision.placement_generation,
                     expected_source_hlc: Some(expected_source_hlc.to_proto()),
                     erasure_set_id,
                     ec_topology_epoch,
@@ -751,10 +1138,7 @@ impl QuorumWriteCoordinator {
                             node_id,
                             error: resp.error,
                         },
-                        Ok(Err(e)) => ReplicaResult::Failure {
-                            node_id,
-                            error: e.to_string(),
-                        },
+                        Ok(Err(e)) => ReplicaResult::from_remote_error(node_id, e),
                         Err(_) => ReplicaResult::Failure {
                             node_id,
                             error: "replica detach timeout".into(),
@@ -766,15 +1150,11 @@ impl QuorumWriteCoordinator {
             handles.push(handle);
         }
 
-        let results = self.collect_quorum_results(handles, self.write_quorum).await?;
-        let acked = results.iter().filter(|r| r.is_success()).count() as u8;
-
-        if acked < self.write_quorum {
-            return Err(ClusterError::QuorumNotMet {
-                needed: self.write_quorum,
-                achieved: acked,
-            });
-        }
+        let results = self.collect_quorum_results(handles, &decision.write_rule).await?;
+        let acked_nodes: Vec<_> =
+            results.iter().filter(|r| r.is_success()).map(|r| r.node_id()).collect();
+        require_write_rule(&decision.write_rule, &acked_nodes)?;
+        let acked = acked_nodes.len() as u8;
 
         Ok(QuorumDeleteResult {
             replicas_acked: acked,
@@ -830,6 +1210,7 @@ impl QuorumWriteCoordinator {
         expected_source_hlc: HlcTimestamp,
     ) -> Result<QuorumDeleteResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
+        self.admit_placement(&decision, bucket, key)?;
         let replicas = &decision.replicas;
         let operation_uuid = uuid::Uuid::new_v4();
         let operation_id = operation_uuid.as_u128();
@@ -915,6 +1296,7 @@ impl QuorumWriteCoordinator {
                     coordinator_id: self.local_node_id.to_bytes().to_vec(),
                     operation_id: operation_id.to_be_bytes().to_vec(),
                     topology_epoch: self.topology_epoch,
+                    placement_generation: decision.placement_generation,
                     expected_source_hlc: Some(expected_source_hlc.to_proto()),
                     data: data.to_vec(),
                 };
@@ -944,10 +1326,7 @@ impl QuorumWriteCoordinator {
                             node_id,
                             error: resp.error,
                         },
-                        Ok(Err(e)) => ReplicaResult::Failure {
-                            node_id,
-                            error: e.to_string(),
-                        },
+                        Ok(Err(e)) => ReplicaResult::from_remote_error(node_id, e),
                         Err(_) => ReplicaResult::Failure {
                             node_id,
                             error: "replica attach timeout".into(),
@@ -959,15 +1338,11 @@ impl QuorumWriteCoordinator {
             handles.push(handle);
         }
 
-        let results = self.collect_quorum_results(handles, self.write_quorum).await?;
-        let acked = results.iter().filter(|r| r.is_success()).count() as u8;
-
-        if acked < self.write_quorum {
-            return Err(ClusterError::QuorumNotMet {
-                needed: self.write_quorum,
-                achieved: acked,
-            });
-        }
+        let results = self.collect_quorum_results(handles, &decision.write_rule).await?;
+        let acked_nodes: Vec<_> =
+            results.iter().filter(|r| r.is_success()).map(|r| r.node_id()).collect();
+        require_write_rule(&decision.write_rule, &acked_nodes)?;
+        let acked = acked_nodes.len() as u8;
 
         Ok(QuorumDeleteResult {
             replicas_acked: acked,
@@ -1012,6 +1387,7 @@ impl QuorumWriteCoordinator {
         record: &IndexRecord,
     ) -> Result<usize, ClusterError> {
         let decision = self.router.route(bucket, key)?;
+        self.admit_placement(&decision, bucket, key)?;
         let replicas = &decision.replicas;
         let operation_id = uuid::Uuid::new_v4().as_u128();
         let encoded = bincode::serialize(record)
@@ -1067,6 +1443,7 @@ impl QuorumWriteCoordinator {
                     coordinator_id: self.local_node_id.to_bytes().to_vec(),
                     operation_id: operation_id.to_be_bytes().to_vec(),
                     topology_epoch: self.topology_epoch,
+                    placement_generation: decision.placement_generation,
                 };
                 let timeout_dur = self.timeouts.replica_write_timeout;
 
@@ -1094,13 +1471,7 @@ impl QuorumWriteCoordinator {
                             },
                             false,
                         ),
-                        Ok(Err(e)) => (
-                            ReplicaResult::Failure {
-                                node_id,
-                                error: e.to_string(),
-                            },
-                            false,
-                        ),
+                        Ok(Err(e)) => (ReplicaResult::from_remote_error(node_id, e), false),
                         Err(_) => (
                             ReplicaResult::Failure {
                                 node_id,
@@ -1115,12 +1486,12 @@ impl QuorumWriteCoordinator {
             handles.push(handle);
         }
 
-        let mut acked = 0u8;
+        let mut acked = Vec::new();
         for handle in handles {
             match handle.await {
                 Ok((result, written)) => {
                     if result.is_success() {
-                        acked = acked.saturating_add(1);
+                        acked.push(result.node_id());
                     }
                     if written {
                         restored = restored.saturating_add(1);
@@ -1132,12 +1503,7 @@ impl QuorumWriteCoordinator {
             }
         }
 
-        if acked < self.write_quorum {
-            return Err(ClusterError::QuorumNotMet {
-                needed: self.write_quorum,
-                achieved: acked,
-            });
-        }
+        require_write_rule(&decision.write_rule, &acked)?;
 
         Ok(restored)
     }
@@ -1167,6 +1533,8 @@ impl QuorumWriteCoordinator {
         metadata: &HashMap<String, String>,
     ) -> Result<QuorumMultipartCreateResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
+        self.admit_placement(&decision, bucket, key)?;
+        let hints_uploads = self.hints_uploads(&decision);
         let metadata = self.metadata_with_pool_storage_class(decision.pool_id, metadata);
         let replicas = &decision.replicas;
         let operation_id = uuid::Uuid::new_v4().as_u128();
@@ -1224,6 +1592,7 @@ impl QuorumWriteCoordinator {
                     coordinator_id: self.local_node_id.to_bytes().to_vec(),
                     operation_id: operation_id.to_be_bytes().to_vec(),
                     topology_epoch: self.topology_epoch,
+                    placement_generation: decision.placement_generation,
                 };
                 let timeout_dur = self.timeouts.replica_write_timeout;
 
@@ -1243,10 +1612,7 @@ impl QuorumWriteCoordinator {
                             node_id,
                             error: resp.error,
                         },
-                        Ok(Err(e)) => MultipartReplicaResult::Failure {
-                            node_id,
-                            error: e.to_string(),
-                        },
+                        Ok(Err(e)) => MultipartReplicaResult::from_remote_error(node_id, e),
                         Err(_) => MultipartReplicaResult::Failure {
                             node_id,
                             error: "replica multipart create timeout".into(),
@@ -1254,19 +1620,33 @@ impl QuorumWriteCoordinator {
                     }
                 })
             };
+            let handle = if node_id != self.local_node_id && hints_uploads {
+                let hints = self.hints.clone();
+                let hint = HintEntry::multipart(bucket, key, upload_id, self.clock.now());
+                tokio::spawn(async move {
+                    let result = match handle.await {
+                        Ok(result) => result,
+                        Err(error) => MultipartReplicaResult::Failure {
+                            node_id,
+                            error: error.to_string(),
+                        },
+                    };
+                    hint_multipart_if_failed(&hints, &result, hint);
+                    result
+                })
+            } else {
+                handle
+            };
             handles.push(handle);
         }
 
         let results = self
-            .collect_multipart_results(handles, self.write_quorum, self.timeouts.quorum_timeout)
+            .collect_multipart_results(handles, &decision.write_rule, self.timeouts.quorum_timeout)
             .await?;
-        let acked = results.iter().filter(|r| r.is_success()).count() as u8;
-        if acked < self.write_quorum {
-            return Err(ClusterError::QuorumNotMet {
-                needed: self.write_quorum,
-                achieved: acked,
-            });
-        }
+        let acked_nodes: Vec<_> =
+            results.iter().filter(|r| r.is_success()).map(|r| r.node_id()).collect();
+        require_write_rule(&decision.write_rule, &acked_nodes)?;
+        let acked = acked_nodes.len() as u8;
 
         Ok(QuorumMultipartCreateResult {
             replicas_acked: acked,
@@ -1340,6 +1720,9 @@ impl QuorumWriteCoordinator {
         S: Stream<Item = Result<Bytes, io::Error>> + Send + 'static,
     {
         let decision = self.router.route(bucket, key)?;
+        self.admit_placement(&decision, bucket, key)?;
+        self.align_upload(&decision, bucket, key, upload_id).await?;
+        let hints_uploads = self.hints_uploads(&decision);
         let replicas = &decision.replicas;
         let operation_id = uuid::Uuid::new_v4().as_u128();
         let replicas_total = replicas.len() as u8;
@@ -1415,6 +1798,7 @@ impl QuorumWriteCoordinator {
                             coordinator_id: self.local_node_id.to_bytes().to_vec(),
                             operation_id: operation_id.to_be_bytes().to_vec(),
                             topology_epoch: self.topology_epoch,
+                            placement_generation: decision.placement_generation,
                             total_size: content_length,
                         },
                     )),
@@ -1461,16 +1845,30 @@ impl QuorumWriteCoordinator {
                             node_id,
                             error: resp.error,
                         },
-                        Ok(Err(e)) => MultipartReplicaResult::Failure {
-                            node_id,
-                            error: e.to_string(),
-                        },
+                        Ok(Err(e)) => MultipartReplicaResult::from_remote_error(node_id, e),
                         Err(_) => MultipartReplicaResult::Failure {
                             node_id,
                             error: "replica multipart part timeout".into(),
                         },
                     }
                 })
+            };
+            let handle = if node_id != self.local_node_id && hints_uploads {
+                let hints = self.hints.clone();
+                let hint = HintEntry::multipart(bucket, key, upload_id, self.clock.now());
+                tokio::spawn(async move {
+                    let result = match handle.await {
+                        Ok(result) => result,
+                        Err(error) => MultipartReplicaResult::Failure {
+                            node_id,
+                            error: error.to_string(),
+                        },
+                    };
+                    hint_multipart_if_failed(&hints, &result, hint);
+                    result
+                })
+            } else {
+                handle
             };
             handles.push(handle);
         }
@@ -1494,19 +1892,18 @@ impl QuorumWriteCoordinator {
         drop(local_senders);
         drop(remote_senders);
 
-        let results =
-            self.collect_multipart_results(handles, self.write_quorum, timeout_dur).await?;
+        let results = self
+            .collect_multipart_results(handles, &decision.write_rule, timeout_dur)
+            .await?;
         let acked: Vec<_> = results.iter().filter(|r| r.is_success()).collect();
-        if (acked.len() as u8) < self.write_quorum {
-            if results.iter().any(|r| r.is_no_such_upload()) {
+        let acked_nodes: Vec<_> = acked.iter().map(|r| r.node_id()).collect();
+        if let Some((needed, achieved)) = decision.write_rule.unmet(&acked_nodes) {
+            if upload_not_found(&acked_nodes, &results) {
                 return Err(ClusterError::MultipartUploadNotFound {
                     upload_id: upload_id.to_string(),
                 });
             }
-            return Err(ClusterError::QuorumNotMet {
-                needed: self.write_quorum,
-                achieved: acked.len() as u8,
-            });
+            return Err(ClusterError::QuorumNotMet { needed, achieved });
         }
 
         let etag = acked
@@ -1526,14 +1923,31 @@ impl QuorumWriteCoordinator {
         })
     }
 
+    /// The plan of a completion, from the replicas' sessions and parts.
+    ///
+    /// While the pool grows (a joint write rule), every replica of both
+    /// generations is inspected, and the replicas with a valid plan must meet
+    /// every requirement of the rule: a completion the old owners would take
+    /// and the new ones refuse would be applied while the client is told it
+    /// failed. Short of that the completion is refused before any replica is
+    /// sent it.
     async fn prepare_multipart_complete(
         &self,
+        decision: &PlacementDecision,
         bucket: &str,
         key: &str,
         upload_id: &str,
         manifest_parts: &[(u32, String)],
     ) -> Result<MultipartCompletePlan, ClusterError> {
-        let inspections = self.inspect_multipart_upload(bucket, key, upload_id).await?;
+        let joint = decision.write_rule.requirements().len() > 1;
+        let write_quorum = decision.read_quorum;
+        let inspections = if joint {
+            self.inspect_multipart_upload_on(bucket, key, upload_id, &decision.replicas, 1)
+                .await?
+        } else {
+            self.inspect_multipart_upload(bucket, key, upload_id).await?
+        };
+        let mut valid_nodes = Vec::new();
 
         let mut valid_plans = Vec::new();
         let mut first_validation_error = None;
@@ -1552,12 +1966,14 @@ impl QuorumWriteCoordinator {
                 Ok(selected_parts) => {
                     let s3_etag = compute_native_multipart_etag(&selected_parts);
                     let total_size = selected_parts.iter().map(|p| p.size).sum();
+                    valid_nodes.push(inspection.node_id);
                     valid_plans.push(MultipartCompletePlan {
                         selected_parts,
                         s3_etag,
                         total_size,
                         content_type: inspection.session.content_type.clone(),
                         metadata: inspection.session.metadata.clone(),
+                        newest_key_version: None,
                     });
                 }
                 Err(e) => {
@@ -1568,7 +1984,12 @@ impl QuorumWriteCoordinator {
             }
         }
 
-        if (valid_plans.len() as u8) < self.write_quorum {
+        if joint && !valid_plans.is_empty() {
+            if let Some((needed, achieved)) = decision.write_rule.unmet(&valid_nodes) {
+                return Err(ClusterError::QuorumNotMet { needed, achieved });
+            }
+        }
+        if (valid_plans.len() as u8) < write_quorum {
             if inspections.is_empty() {
                 return Err(ClusterError::MultipartUploadNotFound {
                     upload_id: upload_id.to_string(),
@@ -1583,12 +2004,15 @@ impl QuorumWriteCoordinator {
                 }));
             }
             return Err(ClusterError::QuorumNotMet {
-                needed: self.write_quorum,
+                needed: write_quorum,
                 achieved: valid_plans.len() as u8,
             });
         }
 
-        Ok(valid_plans.remove(0))
+        let mut plan = valid_plans.remove(0);
+        plan.newest_key_version =
+            inspections.iter().filter_map(|inspection| inspection.key_hlc).max();
+        Ok(plan)
     }
 
     async fn inspect_multipart_upload(
@@ -1598,7 +2022,26 @@ impl QuorumWriteCoordinator {
         upload_id: &str,
     ) -> Result<Vec<MultipartReplicaInspection>, ClusterError> {
         let decision = self.router.route(bucket, key)?;
-        let replicas = &decision.replicas;
+        self.inspect_multipart_upload_on(
+            bucket,
+            key,
+            upload_id,
+            &decision.read_replicas,
+            decision.read_quorum,
+        )
+        .await
+    }
+
+    /// The sessions and parts of the upload on `replicas`, at least
+    /// `write_quorum` of them answering with one.
+    async fn inspect_multipart_upload_on(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        replicas: &[NodeId],
+        write_quorum: u8,
+    ) -> Result<Vec<MultipartReplicaInspection>, ClusterError> {
         let operation_id = uuid::Uuid::new_v4().as_u128();
         let mut handles = Vec::with_capacity(replicas.len());
 
@@ -1640,13 +2083,34 @@ impl QuorumWriteCoordinator {
 
                     let parts =
                         timeout(timeout_dur, storage.list_multipart_parts(&upload_id)).await;
+                    let key_hlc = match timeout(
+                        timeout_dur,
+                        storage.current_key_version(&bucket, &key),
+                    )
+                    .await
+                    {
+                        Ok(Ok(version)) => version.record().map(HlcTimestamp::of_record),
+                        Ok(Err(e)) => {
+                            return MultipartInspectResult::Failure {
+                                node_id,
+                                error: e.to_string(),
+                            };
+                        }
+                        Err(_) => {
+                            return MultipartInspectResult::Failure {
+                                node_id,
+                                error: "local multipart inspect key timeout".into(),
+                            };
+                        }
+                    };
                     match parts {
                         Ok(Ok(parts)) => {
-                            MultipartInspectResult::Success(MultipartReplicaInspection {
+                            MultipartInspectResult::Success(Box::new(MultipartReplicaInspection {
                                 node_id,
                                 session,
                                 parts,
-                            })
+                                key_hlc,
+                            }))
                         }
                         Ok(Err(e)) => MultipartInspectResult::Failure {
                             node_id,
@@ -1698,11 +2162,12 @@ impl QuorumWriteCoordinator {
                                     }
                                 }
                             }
-                            MultipartInspectResult::Success(MultipartReplicaInspection {
+                            MultipartInspectResult::Success(Box::new(MultipartReplicaInspection {
                                 node_id,
                                 session,
                                 parts,
-                            })
+                                key_hlc: resp.key_hlc.as_ref().map(HlcTimestamp::from_proto),
+                            }))
                         }
                         Ok(Ok(resp)) if resp.epoch_mismatch => {
                             MultipartInspectResult::EpochMismatch { node_id }
@@ -1725,12 +2190,12 @@ impl QuorumWriteCoordinator {
             handles.push(handle);
         }
 
-        let results = self.collect_multipart_inspections(handles, self.write_quorum).await?;
+        let results = self.collect_multipart_inspections(handles, write_quorum).await?;
         let success_count = results.iter().filter(|result| result.is_success()).count() as u8;
-        if success_count < self.write_quorum {
+        if success_count < write_quorum {
             if results.iter().any(|result| !result.is_success() && !result.is_no_such_upload()) {
                 return Err(ClusterError::QuorumNotMet {
-                    needed: self.write_quorum,
+                    needed: write_quorum,
                     achieved: success_count,
                 });
             }
@@ -1742,7 +2207,7 @@ impl QuorumWriteCoordinator {
         let successes: Vec<_> = results
             .into_iter()
             .filter_map(|result| match result {
-                MultipartInspectResult::Success(inspection) => Some(inspection),
+                MultipartInspectResult::Success(inspection) => Some(*inspection),
                 _ => None,
             })
             .collect();
@@ -1772,7 +2237,9 @@ impl QuorumWriteCoordinator {
         key: &str,
         upload_id: &str,
     ) -> Result<QuorumMultipartListPartsResult, ClusterError> {
-        let replicas_total = self.router.route(bucket, key)?.replicas.len() as u8;
+        let decision = self.router.route(bucket, key)?;
+        let replicas_total = decision.replicas.len() as u8;
+        let write_quorum = decision.read_quorum;
         let inspections = self.inspect_multipart_upload(bucket, key, upload_id).await?;
         let replicas_responded = inspections.len() as u8;
 
@@ -1781,9 +2248,9 @@ impl QuorumWriteCoordinator {
                 upload_id: upload_id.to_string(),
             });
         }
-        if replicas_responded < self.write_quorum {
+        if replicas_responded < write_quorum {
             return Err(ClusterError::QuorumNotMet {
-                needed: self.write_quorum,
+                needed: write_quorum,
                 achieved: replicas_responded,
             });
         }
@@ -1826,12 +2293,22 @@ impl QuorumWriteCoordinator {
         upload_id: &str,
         manifest_parts: &[(u32, String)],
     ) -> Result<QuorumMultipartCompleteResult, ClusterError> {
-        let mut plan =
-            self.prepare_multipart_complete(bucket, key, upload_id, manifest_parts).await?;
         let decision = self.router.route(bucket, key)?;
+        self.admit_placement(&decision, bucket, key)?;
+        self.align_upload(&decision, bucket, key, upload_id).await?;
+        let mut plan = self
+            .prepare_multipart_complete(&decision, bucket, key, upload_id, manifest_parts)
+            .await?;
         plan.metadata = self.metadata_with_pool_storage_class(decision.pool_id, &plan.metadata);
         let replicas = &decision.replicas;
         let operation_id = uuid::Uuid::new_v4().as_u128();
+        // Above every version of the key the inspection saw: a completion
+        // cannot be raised and sent again once a replica has closed its
+        // upload, so it is issued above them from the start (plan
+        // ANTI-ENTROPY-PHASE-1-2.md, `AE12-013`).
+        if let Some(newest) = &plan.newest_key_version {
+            self.clock.observe(newest);
+        }
         let hlc = self.clock.now();
         let replicas_total = replicas.len() as u8;
 
@@ -1930,6 +2407,7 @@ impl QuorumWriteCoordinator {
                     coordinator_id: self.local_node_id.to_bytes().to_vec(),
                     operation_id: operation_id.to_be_bytes().to_vec(),
                     topology_epoch: self.topology_epoch,
+                    placement_generation: decision.placement_generation,
                 };
                 let timeout_dur = self.timeouts.replica_write_timeout;
 
@@ -1952,10 +2430,7 @@ impl QuorumWriteCoordinator {
                             node_id,
                             error: resp.error,
                         },
-                        Ok(Err(e)) => MultipartReplicaResult::Failure {
-                            node_id,
-                            error: e.to_string(),
-                        },
+                        Ok(Err(e)) => MultipartReplicaResult::from_remote_error(node_id, e),
                         Err(_) => MultipartReplicaResult::Failure {
                             node_id,
                             error: "replica multipart complete timeout".into(),
@@ -1963,23 +2438,39 @@ impl QuorumWriteCoordinator {
                     }
                 })
             };
+            let handle = if node_id != self.local_node_id {
+                let hints = self.hints.clone();
+                let hint = HintEntry::written(bucket, key, hlc);
+                tokio::spawn(async move {
+                    let result = match handle.await {
+                        Ok(result) => result,
+                        Err(error) => MultipartReplicaResult::Failure {
+                            node_id,
+                            error: error.to_string(),
+                        },
+                    };
+                    hint_multipart_if_failed(&hints, &result, hint);
+                    result
+                })
+            } else {
+                handle
+            };
             handles.push(handle);
         }
 
         let results = self
-            .collect_multipart_results(handles, self.write_quorum, self.timeouts.quorum_timeout)
+            .collect_multipart_results(handles, &decision.write_rule, self.timeouts.quorum_timeout)
             .await?;
-        let acked = results.iter().filter(|r| r.is_success()).count() as u8;
-        if acked < self.write_quorum {
-            if results.iter().any(|r| r.is_no_such_upload()) {
+        let acked_nodes: Vec<_> =
+            results.iter().filter(|r| r.is_success()).map(|r| r.node_id()).collect();
+        let acked = acked_nodes.len() as u8;
+        if let Some((needed, achieved)) = decision.write_rule.unmet(&acked_nodes) {
+            if upload_not_found(&acked_nodes, &results) {
                 return Err(ClusterError::MultipartUploadNotFound {
                     upload_id: upload_id.to_string(),
                 });
             }
-            return Err(ClusterError::QuorumNotMet {
-                needed: self.write_quorum,
-                achieved: acked,
-            });
+            return Err(ClusterError::QuorumNotMet { needed, achieved });
         }
 
         Ok(QuorumMultipartCompleteResult {
@@ -2013,6 +2504,8 @@ impl QuorumWriteCoordinator {
         upload_id: &str,
     ) -> Result<QuorumMultipartCreateResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
+        self.admit_placement(&decision, bucket, key)?;
+        let hints_uploads = self.hints_uploads(&decision);
         let replicas = &decision.replicas;
         let operation_id = uuid::Uuid::new_v4().as_u128();
         let replicas_total = replicas.len() as u8;
@@ -2076,6 +2569,7 @@ impl QuorumWriteCoordinator {
                     coordinator_id: self.local_node_id.to_bytes().to_vec(),
                     operation_id: operation_id.to_be_bytes().to_vec(),
                     topology_epoch: self.topology_epoch,
+                    placement_generation: decision.placement_generation,
                 };
                 let timeout_dur = self.timeouts.replica_write_timeout;
 
@@ -2095,10 +2589,7 @@ impl QuorumWriteCoordinator {
                             node_id,
                             error: resp.error,
                         },
-                        Ok(Err(e)) => MultipartReplicaResult::Failure {
-                            node_id,
-                            error: e.to_string(),
-                        },
+                        Ok(Err(e)) => MultipartReplicaResult::from_remote_error(node_id, e),
                         Err(_) => MultipartReplicaResult::Failure {
                             node_id,
                             error: "replica multipart abort timeout".into(),
@@ -2106,19 +2597,33 @@ impl QuorumWriteCoordinator {
                     }
                 })
             };
+            let handle = if node_id != self.local_node_id && hints_uploads {
+                let hints = self.hints.clone();
+                let hint = HintEntry::multipart(bucket, key, upload_id, self.clock.now());
+                tokio::spawn(async move {
+                    let result = match handle.await {
+                        Ok(result) => result,
+                        Err(error) => MultipartReplicaResult::Failure {
+                            node_id,
+                            error: error.to_string(),
+                        },
+                    };
+                    hint_multipart_if_failed(&hints, &result, hint);
+                    result
+                })
+            } else {
+                handle
+            };
             handles.push(handle);
         }
 
         let results = self
-            .collect_multipart_results(handles, self.write_quorum, self.timeouts.quorum_timeout)
+            .collect_multipart_results(handles, &decision.write_rule, self.timeouts.quorum_timeout)
             .await?;
-        let acked = results.iter().filter(|r| r.is_success()).count() as u8;
-        if acked < self.write_quorum {
-            return Err(ClusterError::QuorumNotMet {
-                needed: self.write_quorum,
-                achieved: acked,
-            });
-        }
+        let acked_nodes: Vec<_> =
+            results.iter().filter(|r| r.is_success()).map(|r| r.node_id()).collect();
+        require_write_rule(&decision.write_rule, &acked_nodes)?;
+        let acked = acked_nodes.len() as u8;
 
         Ok(QuorumMultipartCreateResult {
             replicas_acked: acked,
@@ -2169,8 +2674,10 @@ impl QuorumWriteCoordinator {
     ///
     /// Used by CompleteMultipartUpload: the local node already has the correct
     /// composite manifest from `complete_multipart_native()`, so we only need
-    /// to send the assembled data to remote replicas. The local node is counted
-    /// as 1 ACK toward the quorum (W), so we need W-1 remote ACKs.
+    /// to send the assembled data to remote replicas. Every write requirement
+    /// that contains the local node counts that existing copy as one ACK; all
+    /// other requirements, including a disjoint successor generation, remain
+    /// unchanged.
     pub async fn replicate_to_remotes(
         &self,
         bucket: &str,
@@ -2195,6 +2702,7 @@ impl QuorumWriteCoordinator {
         metadata: &HashMap<String, String>,
     ) -> Result<QuorumWriteResult, ClusterError> {
         let decision = self.router.route(bucket, key)?;
+        self.admit_placement(&decision, bucket, key)?;
         let metadata = self.metadata_with_pool_storage_class(decision.pool_id, metadata);
         let replicas = &decision.replicas;
 
@@ -2225,6 +2733,7 @@ impl QuorumWriteCoordinator {
 
             let client = self.rpc_client.clone();
             let request = proto::WriteBlobRequest {
+                verify_content: false,
                 bucket: bucket.to_string(),
                 key: key.to_string(),
                 data: data.to_vec(),
@@ -2236,6 +2745,11 @@ impl QuorumWriteCoordinator {
                 coordinator_id: self.local_node_id.to_bytes().to_vec(),
                 operation_id: operation_id.to_be_bytes().to_vec(),
                 topology_epoch: self.topology_epoch,
+                placement_generation: decision.placement_generation,
+                etag: String::new(),
+                bucket_metadata_stage: stage_on_wire(&decision),
+                repair_copy: false,
+                iam_lease: None,
             };
             let timeout_dur = self.timeouts.replica_write_timeout;
             let hints = self.hints.clone();
@@ -2254,10 +2768,7 @@ impl QuorumWriteCoordinator {
                         node_id,
                         error: resp.error,
                     },
-                    Ok(Err(e)) => ReplicaResult::Failure {
-                        node_id,
-                        error: e.to_string(),
-                    },
+                    Ok(Err(e)) => ReplicaResult::from_remote_error(node_id, e),
                     Err(_) => ReplicaResult::Failure {
                         node_id,
                         error: "replica write timeout".into(),
@@ -2270,29 +2781,43 @@ impl QuorumWriteCoordinator {
             handles.push(handle);
         }
 
-        // We need W-1 remote ACKs (local counts as 1)
-        let remote_quorum = self.write_quorum.saturating_sub(1).max(1);
-        let results = self.collect_quorum_results(handles, remote_quorum).await?;
-
+        let local_acked = replicas.contains(&self.local_node_id);
+        let remote_rule = WriteRule::all(
+            decision
+                .write_rule
+                .requirements()
+                .iter()
+                .map(|requirement| crate::placement::WriteRequirement {
+                    nodes: requirement
+                        .nodes
+                        .iter()
+                        .copied()
+                        .filter(|node| *node != self.local_node_id)
+                        .collect(),
+                    count: requirement.count.saturating_sub(u8::from(
+                        local_acked && requirement.nodes.contains(&self.local_node_id),
+                    )),
+                })
+                .collect(),
+        );
+        let results = self.collect_quorum_results(handles, &remote_rule).await?;
         let acked: Vec<_> = results.iter().filter(|r| r.is_success()).collect();
-
-        if (acked.len() as u8) < remote_quorum {
-            return Err(ClusterError::QuorumNotMet {
-                needed: self.write_quorum,
-                achieved: acked.len() as u8 + 1, // +1 for local
-            });
+        let mut acked_nodes: Vec<_> = acked.iter().map(|r| r.node_id()).collect();
+        if local_acked {
+            acked_nodes.push(self.local_node_id);
         }
+        require_write_rule(&decision.write_rule, &acked_nodes)?;
 
         info!(
             bucket = %bucket,
             key = %key,
-            acked = acked.len() + 1, // +1 for local
+            acked = acked_nodes.len(),
             "multipart remote replication completed"
         );
 
         Ok(QuorumWriteResult {
             etag: String::new(),
-            replicas_acked: acked.len() as u8 + 1, // +1 for local
+            replicas_acked: acked_nodes.len() as u8,
             replicas_total,
             replica_nodes: replicas.clone(),
             hlc,
@@ -2304,11 +2829,14 @@ impl QuorumWriteCoordinator {
     async fn collect_quorum_results(
         &self,
         handles: Vec<tokio::task::JoinHandle<ReplicaResult>>,
-        quorum: u8,
+        rule: &WriteRule,
     ) -> Result<Vec<ReplicaResult>, ClusterError> {
         let total = handles.len();
+        if total == 0 {
+            return Ok(Vec::new());
+        }
         let mut results = Vec::with_capacity(total);
-        let mut success_count = 0u8;
+        let mut acked: Vec<NodeId> = Vec::with_capacity(total);
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(total);
         for handle in handles {
@@ -2334,11 +2862,11 @@ impl QuorumWriteCoordinator {
                     match maybe_result {
                         Some(result) => {
                             if result.is_success() {
-                                success_count += 1;
+                                acked.push(result.node_id());
                             }
                             results.push(result);
 
-                            if success_count >= quorum {
+                            if rule.met(&acked) {
                                 break;
                             }
                         }
@@ -2347,8 +2875,8 @@ impl QuorumWriteCoordinator {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     warn!(
-                        success = success_count,
-                        needed = quorum,
+                        success = acked.len(),
+                        needed = ?rule.unmet(&acked).map(|(needed, _)| needed),
                         pending = total - results.len(),
                         "quorum timeout reached"
                     );
@@ -2363,12 +2891,15 @@ impl QuorumWriteCoordinator {
     async fn collect_multipart_results(
         &self,
         handles: Vec<tokio::task::JoinHandle<MultipartReplicaResult>>,
-        quorum: u8,
+        rule: &WriteRule,
         wait_timeout: Duration,
     ) -> Result<Vec<MultipartReplicaResult>, ClusterError> {
         let total = handles.len();
+        if total == 0 {
+            return Ok(Vec::new());
+        }
         let mut results = Vec::with_capacity(total);
-        let mut success_count = 0u8;
+        let mut acked = Vec::new();
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(total);
         for handle in handles {
@@ -2394,11 +2925,11 @@ impl QuorumWriteCoordinator {
                     match maybe_result {
                         Some(result) => {
                             if result.is_success() {
-                                success_count += 1;
+                                acked.push(result.node_id());
                             }
                             results.push(result);
 
-                            if success_count >= quorum {
+                            if rule.met(&acked) {
                                 break;
                             }
                         }
@@ -2407,8 +2938,8 @@ impl QuorumWriteCoordinator {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     warn!(
-                        success = success_count,
-                        needed = quorum,
+                        success = acked.len(),
+                        needed = ?rule.unmet(&acked),
                         pending = total - results.len(),
                         "multipart quorum timeout reached"
                     );
@@ -2426,6 +2957,9 @@ impl QuorumWriteCoordinator {
         quorum: u8,
     ) -> Result<Vec<MultipartInspectResult>, ClusterError> {
         let total = handles.len();
+        if total == 0 {
+            return Ok(Vec::new());
+        }
         let mut results = Vec::with_capacity(total);
         let mut success_count = 0u8;
 
@@ -2471,6 +3005,17 @@ impl QuorumWriteCoordinator {
         Ok(results)
     }
 
+    /// Whether a replica that missed a native multipart operation on a key
+    /// placed by `decision` gets a multipart hint: only while its pool grows.
+    /// A replica of a stable pool catches up as before growth existed — the
+    /// write quorum holds the upload, and its completion reaches the replica
+    /// as the object's own write — and the hint log of a stable pool stays
+    /// readable by the release before, which knows no multipart hints: a
+    /// rollback is allowed until a growth begins.
+    fn hints_uploads(&self, decision: &PlacementDecision) -> bool {
+        self.router.pool_generation_moving(&decision.pool_id)
+    }
+
     fn multipart_transfer_timeout(&self, _content_length: u64) -> Duration {
         if self.timeouts.replica_write_timeout > MULTIPART_TRANSFER_TIMEOUT {
             self.timeouts.replica_write_timeout
@@ -2484,9 +3029,29 @@ impl QuorumWriteCoordinator {
 #[derive(Debug)]
 #[allow(dead_code)]
 enum ReplicaResult {
-    Success { node_id: NodeId, etag: String },
-    Failure { node_id: NodeId, error: String },
-    EpochMismatch { node_id: NodeId },
+    Success {
+        node_id: NodeId,
+        etag: String,
+    },
+    /// The replica answered, and holds a version newer than the operation,
+    /// at `by`: it did not apply it.
+    Superseded {
+        node_id: NodeId,
+        by: HlcTimestamp,
+    },
+    Failure {
+        node_id: NodeId,
+        error: String,
+    },
+    EpochMismatch {
+        node_id: NodeId,
+    },
+    /// The replica refused admission by a metadata stage or placement generation.
+    /// The operation must not be replayed as repair.
+    Fenced {
+        node_id: NodeId,
+        error: String,
+    },
 }
 
 #[derive(Debug)]
@@ -2503,12 +3068,17 @@ enum MultipartReplicaResult {
     EpochMismatch {
         node_id: NodeId,
     },
+    /// An explicit admission refusal, which must not generate a repair hint.
+    Fenced {
+        node_id: NodeId,
+        error: String,
+    },
 }
 
 #[derive(Debug)]
 #[allow(dead_code)]
 enum MultipartInspectResult {
-    Success(MultipartReplicaInspection),
+    Success(Box<MultipartReplicaInspection>),
     Failure { node_id: NodeId, error: String },
     EpochMismatch { node_id: NodeId },
 }
@@ -2527,6 +3097,28 @@ impl MultipartInspectResult {
 }
 
 impl MultipartReplicaResult {
+    fn from_remote_error(node_id: NodeId, error: ClusterError) -> Self {
+        if is_replica_admission_refusal(&error) {
+            Self::Fenced {
+                node_id,
+                error: error.to_string(),
+            }
+        } else {
+            Self::Failure {
+                node_id,
+                error: error.to_string(),
+            }
+        }
+    }
+
+    /// Only a missed operation may be replayed as repair; a refusal must not land.
+    fn hint_target(&self) -> Option<NodeId> {
+        match self {
+            Self::Failure { node_id, .. } => Some(*node_id),
+            _ => None,
+        }
+    }
+
     fn is_success(&self) -> bool {
         matches!(self, MultipartReplicaResult::Success { .. })
     }
@@ -2557,21 +3149,117 @@ impl MultipartReplicaResult {
         match self {
             MultipartReplicaResult::Success { node_id, .. }
             | MultipartReplicaResult::Failure { node_id, .. }
-            | MultipartReplicaResult::EpochMismatch { node_id } => *node_id,
+            | MultipartReplicaResult::EpochMismatch { node_id }
+            | MultipartReplicaResult::Fenced { node_id, .. } => *node_id,
         }
     }
 }
 
 impl ReplicaResult {
-    fn is_success(&self) -> bool {
-        matches!(self, ReplicaResult::Success { .. })
+    fn from_remote_error(node_id: NodeId, error: ClusterError) -> Self {
+        if is_replica_admission_refusal(&error) {
+            Self::Fenced {
+                node_id,
+                error: error.to_string(),
+            }
+        } else {
+            Self::Failure {
+                node_id,
+                error: error.to_string(),
+            }
+        }
     }
+
+    fn is_success(&self) -> bool {
+        matches!(
+            self,
+            ReplicaResult::Success { .. } | ReplicaResult::Superseded { .. }
+        )
+    }
+
+    fn node_id(&self) -> NodeId {
+        match self {
+            ReplicaResult::Success { node_id, .. }
+            | ReplicaResult::Superseded { node_id, .. }
+            | ReplicaResult::Failure { node_id, .. }
+            | ReplicaResult::EpochMismatch { node_id }
+            | ReplicaResult::Fenced { node_id, .. } => *node_id,
+        }
+    }
+}
+
+/// Keep an explicit refusal distinct from failures that hinted handoff repairs.
+fn is_replica_admission_refusal(error: &ClusterError) -> bool {
+    matches!(
+        error,
+        ClusterError::ReplicaFenced(_) | ClusterError::PlacementGenerationFenced { .. }
+    )
+}
+
+/// Checks every layout's acknowledgement requirement.
+fn require_write_rule(rule: &WriteRule, acked: &[NodeId]) -> Result<(), ClusterError> {
+    match rule.unmet(acked) {
+        Some((needed, achieved)) => Err(ClusterError::QuorumNotMet { needed, achieved }),
+        None => Ok(()),
+    }
+}
+
+/// The stage a write of `decision` carries to the replicas: the stage of
+/// moving bucket metadata it was placed by, 0 for any other key.
+fn stage_on_wire(decision: &PlacementDecision) -> u32 {
+    decision.bucket_metadata_stage.map_or(0, |stage| u32::from(stage.number()))
+}
+
+/// The newest version that outranked an operation on a replica that
+/// answered, if any did.
+fn superseded_by(results: &[ReplicaResult]) -> Option<HlcTimestamp> {
+    results
+        .iter()
+        .filter_map(|result| match result {
+            ReplicaResult::Superseded { by, .. } => Some(*by),
+            _ => None,
+        })
+        .max()
 }
 
 fn compute_sha256(data: &[u8]) -> Vec<u8> {
     let mut hasher = Sha256::new();
     hasher.update(data);
     hasher.finalize().to_vec()
+}
+
+/// Refuses a write of the cluster's control state at `hlc` outside the
+/// window of its lease's epoch before any replica is asked: this node's clock
+/// ran past the epoch's ceiling, and the lease with it.
+fn check_window(fence: Option<&LeaseFence>, hlc: HlcTimestamp) -> Result<(), ClusterError> {
+    match fence {
+        Some(fence) if !fence.admits_hlc(hlc) => Err(ClusterError::Unavailable(format!(
+            "IAM lease epoch {} ran out before the change was written",
+            fence.epoch
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Whether the local replica takes a write at `hlc` under `fence`, when it
+/// fences the writes of the key's class at all.
+async fn admit_local(
+    keeper: Option<Arc<IamLeaseKeeper>>,
+    fence: Option<&LeaseFence>,
+    hlc: HlcTimestamp,
+) -> Result<Option<crate::iam_lease::Admitted>, Refusal> {
+    match keeper {
+        Some(keeper) => keeper.admit(fence, hlc).await.map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The local replica's refusal of a write made outside the lease.
+fn refused_locally(node_id: NodeId, refusal: Refusal) -> ReplicaResult {
+    ReplicaResult::Failure {
+        node_id,
+        error: format!("local replica: {refusal}"),
+    }
 }
 
 /// Leaves `hint` for a remote replica whose own write or delete did not land.
@@ -2585,6 +3273,28 @@ fn compute_sha256(data: &[u8]) -> Vec<u8> {
 fn hint_if_failed(hints: &Arc<HintedHandoffManager>, outcome: &ReplicaResult, hint: HintEntry) {
     if let ReplicaResult::Failure { node_id, .. } = outcome {
         hints.store_in_background(*node_id, hint);
+    }
+}
+
+/// Queue repair only for a missed multipart mutation, never for an admission refusal.
+/// Whether a multipart operation that missed its write rule answers
+/// `NoSuchUpload`: only when no replica took it and one has no such upload.
+/// Once a replica took it the upload exists, and the client is told to try
+/// again (503) rather than that it does not (404) — a completion may already
+/// have closed the upload on the replicas that took it.
+fn upload_not_found(acked: &[NodeId], results: &[MultipartReplicaResult]) -> bool {
+    acked.is_empty() && results.iter().any(MultipartReplicaResult::is_no_such_upload)
+}
+
+fn hint_multipart_if_failed(
+    hints: &Arc<HintedHandoffManager>,
+    outcome: &MultipartReplicaResult,
+    hint: HintEntry,
+) {
+    if let Some(node_id) = outcome.hint_target() {
+        hints.store_in_background(node_id, hint);
+    } else if let MultipartReplicaResult::Fenced { node_id, error } = outcome {
+        debug!(%node_id, %error, "multipart admission refused; repair hint not queued");
     }
 }
 
@@ -2693,6 +3403,40 @@ mod tests {
     use crate::placement::PlacementRouter;
     use crate::rpc::NodeClientConfig;
     use s4_core::types::StorageClass;
+
+    #[test]
+    fn replica_admission_refusals_are_not_acknowledgements_or_hint_targets() {
+        for error in [
+            ClusterError::ReplicaFenced("placement refused".into()),
+            ClusterError::PlacementGenerationFenced {
+                coordinator: 0,
+                minimum: 2,
+            },
+        ] {
+            let outcome = ReplicaResult::from_remote_error(NodeId(2), error);
+            assert!(matches!(outcome, ReplicaResult::Fenced { .. }));
+            assert!(!outcome.is_success());
+            assert_eq!(outcome.node_id(), NodeId(2));
+        }
+        for error in [
+            ClusterError::ReplicaFenced("multipart refused".into()),
+            ClusterError::PlacementGenerationFenced {
+                coordinator: 0,
+                minimum: 2,
+            },
+        ] {
+            let outcome = MultipartReplicaResult::from_remote_error(NodeId(2), error);
+            assert!(matches!(outcome, MultipartReplicaResult::Fenced { .. }));
+            assert!(!outcome.is_success());
+            assert_eq!(outcome.node_id(), NodeId(2));
+            assert_eq!(outcome.hint_target(), None);
+        }
+        let ordinary = MultipartReplicaResult::from_remote_error(
+            NodeId(2),
+            ClusterError::Rpc("connection lost".into()),
+        );
+        assert_eq!(ordinary.hint_target(), Some(NodeId(2)));
+    }
 
     fn setup_single_node() -> (QuorumWriteCoordinator, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
@@ -2861,13 +3605,59 @@ mod tests {
 
         let results = tokio::time::timeout(
             Duration::from_secs(1),
-            coordinator.collect_quorum_results(handles, 2),
+            coordinator.collect_quorum_results(
+                handles,
+                &WriteRule::quorum(&[NodeId(1), NodeId(2), NodeId(3)], 2),
+            ),
         )
         .await
         .unwrap()
         .unwrap();
 
         assert_eq!(results.iter().filter(|r| r.is_success()).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn multipart_collection_waits_for_both_generation_quorums() {
+        let (coordinator, _tmp) = setup_single_node();
+        let handles = [1u128, 2, 4, 5]
+            .into_iter()
+            .map(|n| {
+                tokio::spawn(async move {
+                    if n > 3 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    MultipartReplicaResult::Success {
+                        node_id: NodeId(n),
+                        etag: String::new(),
+                        part_record: None,
+                    }
+                })
+            })
+            .collect();
+        let joint = WriteRule::all(vec![
+            crate::placement::WriteRequirement {
+                nodes: vec![NodeId(1), NodeId(2), NodeId(3)],
+                count: 2,
+            },
+            crate::placement::WriteRequirement {
+                nodes: vec![NodeId(4), NodeId(5), NodeId(6)],
+                count: 2,
+            },
+        ]);
+        let results = coordinator
+            .collect_multipart_results(handles, &joint, Duration::from_secs(1))
+            .await
+            .unwrap();
+        let acked: Vec<_> = results
+            .iter()
+            .filter(|r| r.is_success())
+            .map(MultipartReplicaResult::node_id)
+            .collect();
+        assert!(
+            joint.met(&acked),
+            "multipart returned before the new generation acknowledged: {acked:?}"
+        );
     }
 
     #[tokio::test]
@@ -2898,7 +3688,11 @@ mod tests {
 
         let results = tokio::time::timeout(
             Duration::from_secs(1),
-            coordinator.collect_multipart_results(handles, 2, Duration::from_secs(60)),
+            coordinator.collect_multipart_results(
+                handles,
+                &WriteRule::quorum(&[NodeId(1), NodeId(2), NodeId(3)], 2),
+                Duration::from_secs(60),
+            ),
         )
         .await
         .unwrap()
@@ -2917,14 +3711,14 @@ mod tests {
         let (coordinator, _tmp) = setup_single_node();
         let handles = vec![
             tokio::spawn(async {
-                MultipartInspectResult::Success(sample_inspection(NodeId(1), Vec::new()))
+                MultipartInspectResult::Success(Box::new(sample_inspection(NodeId(1), Vec::new())))
             }),
             tokio::spawn(async {
-                MultipartInspectResult::Success(sample_inspection(NodeId(2), Vec::new()))
+                MultipartInspectResult::Success(Box::new(sample_inspection(NodeId(2), Vec::new())))
             }),
             tokio::spawn(async {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                MultipartInspectResult::Success(sample_inspection(NodeId(3), Vec::new()))
+                MultipartInspectResult::Success(Box::new(sample_inspection(NodeId(3), Vec::new())))
             }),
         ];
 
@@ -2998,6 +3792,7 @@ mod tests {
                 updated_at: 0,
             },
             parts,
+            key_hlc: None,
         }
     }
 
@@ -3046,6 +3841,17 @@ mod tests {
         }
         async fn delete_object(&self, _b: &str, _k: &str) -> Result<(), s4_core::StorageError> {
             self.check()
+        }
+        async fn tombstone_object(
+            &self,
+            _b: &str,
+            _k: &str,
+            _wall: u64,
+            _logical: u32,
+            _node: u128,
+        ) -> Result<bool, s4_core::StorageError> {
+            self.check()?;
+            Ok(true)
         }
         async fn head_object(
             &self,
@@ -3256,36 +4062,65 @@ mod tests {
         (coordinator, tmp)
     }
 
+    /// Served for a request, an operation is the client's; outside that scope
+    /// it is the node's own work, whoever calls the coordinator.
     #[tokio::test]
-    async fn each_operation_is_counted_once_with_its_outcome_and_duration() {
+    async fn each_operation_is_counted_once_with_its_outcome_duration_and_origin() {
         let metrics = TestMetrics::install();
         let (coordinator, _tmp) = setup_single_node();
 
+        crate::cluster_metrics::on_behalf_of_client(async {
+            coordinator
+                .write("bucket", "key", b"data", "text/plain", &HashMap::new())
+                .await
+                .expect("single-node write");
+            coordinator.delete("bucket", "key").await.expect("single-node delete");
+            // The unary part upload hands its body to the streaming one: one
+            // multipart operation, not two, whatever its outcome.
+            let _ = coordinator
+                .upload_multipart_part("bucket", "key", "upload", 1, b"part".to_vec())
+                .await;
+        })
+        .await;
         coordinator
-            .write("bucket", "key", b"data", "text/plain", &HashMap::new())
+            .write("bucket", "own", b"data", "text/plain", &HashMap::new())
             .await
             .expect("single-node write");
-        coordinator.delete("bucket", "key").await.expect("single-node delete");
-        // The unary part upload hands its body to the streaming one: one
-        // multipart operation, not two, whatever its outcome.
-        let _ = coordinator
-            .upload_multipart_part("bucket", "key", "upload", 1, b"part".to_vec())
-            .await;
 
+        let client = ("origin", "client");
         assert_eq!(
-            metrics.value(OPS, &[("operation", "write"), ("outcome", "ok")]),
+            metrics.value(OPS, &[("operation", "write"), ("outcome", "ok"), client]),
             Some(1.0)
         );
         assert_eq!(
-            metrics.value(OPS, &[("operation", "delete"), ("outcome", "ok")]),
+            metrics.value(OPS, &[("operation", "delete"), ("outcome", "ok"), client]),
             Some(1.0)
         );
-        assert_eq!(metrics.sum(OPS, &[("operation", "multipart")]), 1.0);
-        assert_eq!(metrics.sum(OPS, &[]), 3.0);
+        assert_eq!(metrics.sum(OPS, &[("operation", "multipart"), client]), 1.0);
+        assert_eq!(metrics.sum(OPS, &[client]), 3.0);
+        assert_eq!(
+            metrics.value(
+                OPS,
+                &[
+                    ("operation", "write"),
+                    ("outcome", "ok"),
+                    ("origin", "system")
+                ]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(metrics.sum(OPS, &[]), 4.0);
         assert_eq!(
             metrics.value(
                 "s4_quorum_duration_seconds_count",
-                &[("operation", "write")]
+                &[("operation", "write"), client]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            metrics.value(
+                "s4_quorum_duration_seconds_count",
+                &[("operation", "write"), ("origin", "system")]
             ),
             Some(1.0)
         );
@@ -3312,13 +4147,17 @@ mod tests {
         assert_eq!(
             metrics.value(
                 OPS,
-                &[("operation", "write"), ("outcome", "quorum_not_met")]
+                &[
+                    ("operation", "write"),
+                    ("outcome", "quorum_not_met"),
+                    ("origin", "system")
+                ]
             ),
             Some(1.0)
         );
         assert_eq!(
-            metrics.value(OPS, &[("operation", "write"), ("outcome", "ok")]),
-            None
+            metrics.sum(OPS, &[("operation", "write"), ("outcome", "ok")]),
+            0.0
         );
         // The replicas that failed are the two dead peers, each counted once.
         for peer in [NodeId(2), NodeId(3)] {
@@ -3651,7 +4490,7 @@ mod tests {
 
         let mut hints = pool.hints_once(3, 3).await;
         hints.sort_by(|a, b| a.key.cmp(&b.key));
-        let got: Vec<_> = hints.iter().map(|h| (h.key.as_str(), h.kind, h.hlc)).collect();
+        let got: Vec<_> = hints.iter().map(|h| (h.key.as_str(), h.kind.clone(), h.hlc)).collect();
         assert_eq!(
             got,
             [
@@ -3668,5 +4507,252 @@ mod tests {
         );
         assert_eq!(pool.hints.pending(NodeId(1)).await, 0);
         assert_eq!(pool.hints.pending(NodeId(2)).await, 0);
+    }
+
+    // ---- An operation from a clock behind another node's ----
+
+    /// What `node` holds for `key` once it settles: the quorum answers after
+    /// two replicas, and the third takes the operation a moment later.
+    async fn settled_on(
+        pool: &crate::coordinator::test_pool::TestPool,
+        node: u128,
+        key: &str,
+        expected: HlcTimestamp,
+    ) -> s4_core::KeyVersion {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let version = pool
+                .storage(node)
+                .key_version(crate::coordinator::test_pool::BUCKET, key)
+                .await
+                .unwrap();
+            let settled = version.record().map(HlcTimestamp::of_record) == Some(expected);
+            if settled || tokio::time::Instant::now() >= deadline {
+                return version;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// An HLC an hour ahead of this node's clock: issued by a node whose
+    /// clock runs ahead.
+    fn from_a_clock_ahead() -> HlcTimestamp {
+        crate::coordinator::test_pool::at(crate::hlc::now_millis() + 3_600_000)
+    }
+
+    /// A write that meets a delete issued by a clock ahead of this one is not
+    /// lost: the replicas report the delete's HLC, and the write goes again
+    /// above it, on every replica.
+    #[tokio::test]
+    async fn a_write_after_a_delete_from_a_clock_ahead_lands_above_it() {
+        use crate::coordinator::test_pool::{Replica, TestPool, BUCKET};
+        use s4_core::KeyVersion;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21064).await;
+        let deleted = from_a_clock_ahead();
+        for node in 1..=3 {
+            assert!(pool
+                .storage(node)
+                .tombstone_object(BUCKET, "key", deleted.wall_time, 0, deleted.node_id)
+                .await
+                .unwrap());
+        }
+
+        let written = pool
+            .write_coordinator(tmp.path())
+            .write(
+                BUCKET,
+                "key",
+                b"after the delete",
+                "text/plain",
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            written.hlc > deleted,
+            "{} is not above {deleted}",
+            written.hlc
+        );
+        assert_eq!(
+            written.etag,
+            format!("{:x}", md5::compute(b"after the delete"))
+        );
+        for node in 1..=3 {
+            assert!(
+                matches!(
+                    settled_on(&pool, node, "key", written.hlc).await,
+                    KeyVersion::Live(record) if HlcTimestamp::of_record(&record) == written.hlc
+                ),
+                "node {node}"
+            );
+        }
+    }
+
+    /// A delete that meets a write issued by a clock ahead of this one is not
+    /// lost either: it goes again above the write, and every replica keeps
+    /// its tombstone.
+    #[tokio::test]
+    async fn a_delete_after_a_write_from_a_clock_ahead_lands_above_it() {
+        use crate::coordinator::test_pool::{Replica, TestPool, BUCKET};
+        use s4_core::KeyVersion;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21068).await;
+        let written = from_a_clock_ahead();
+        for node in 1..=3 {
+            pool.put(node, "key", b"from a clock ahead", written).await;
+        }
+
+        let deleted = pool.write_coordinator(tmp.path()).delete(BUCKET, "key").await.unwrap();
+        assert!(
+            deleted.hlc > written,
+            "{} is not above {written}",
+            deleted.hlc
+        );
+        for node in 1..=3 {
+            assert!(
+                matches!(
+                    settled_on(&pool, node, "key", deleted.hlc).await,
+                    KeyVersion::Tombstone(record) if HlcTimestamp::of_record(&record) == deleted.hlc
+                ),
+                "node {node}"
+            );
+        }
+    }
+
+    /// A delete that is not a client's is never raised: a newer version on
+    /// the replicas — a client's write made since — stays.
+    #[tokio::test]
+    async fn a_delete_once_leaves_a_newer_version() {
+        use crate::coordinator::test_pool::{Replica, TestPool, BUCKET};
+        use s4_core::KeyVersion;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21072).await;
+        let written = from_a_clock_ahead();
+        for node in 1..=3 {
+            pool.put(node, "key", b"written since", written).await;
+        }
+
+        pool.write_coordinator(tmp.path()).delete_once(BUCKET, "key").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        for node in 1..=3 {
+            assert!(
+                matches!(
+                    pool.storage(node).key_version(BUCKET, "key").await.unwrap(),
+                    KeyVersion::Live(record) if HlcTimestamp::of_record(&record) == written
+                ),
+                "node {node}"
+            );
+        }
+    }
+
+    // ---- A delete through the quorum, on real storage ----
+
+    /// Every replica takes the delete as a tombstone at the HLC the client's
+    /// delete was issued with, the coordinating node's own storage included,
+    /// and a key no replica held gets one too. A write older than the delete
+    /// that arrives afterwards does not bring the key back.
+    #[tokio::test]
+    async fn a_delete_leaves_the_same_tombstone_on_every_replica() {
+        use crate::coordinator::test_pool::{at, Replica, TestPool, BUCKET};
+        use s4_core::KeyVersion;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21016).await;
+        let coordinator = pool.write_coordinator(tmp.path());
+        for node in 1..=3 {
+            pool.put(node, "held", b"bytes", at(10)).await;
+        }
+
+        let held = coordinator.delete(BUCKET, "held").await.unwrap();
+        let never_held = coordinator.delete(BUCKET, "never-held").await.unwrap();
+
+        for (key, deleted) in [("held", held.hlc), ("never-held", never_held.hlc)] {
+            for node in 1..=3 {
+                // The quorum answers once two replicas have; the third takes
+                // the delete a moment later.
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+                let tombstone = loop {
+                    match pool.storage(node).key_version(BUCKET, key).await.unwrap() {
+                        KeyVersion::Tombstone(record) => break HlcTimestamp::of_record(&record),
+                        other => assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "{key} on node {node}: {other:?}"
+                        ),
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                assert_eq!(tombstone, deleted, "{key} on node {node}");
+            }
+        }
+
+        pool.put(2, "held", b"older than the delete", at(10)).await;
+        assert!(matches!(
+            pool.storage(2).key_version(BUCKET, "held").await.unwrap(),
+            KeyVersion::Tombstone(_)
+        ));
+
+        // Erasure-coding metadata in `__system__` keeps no tombstone: it goes
+        // from every replica as it always did.
+        let ec_key = "__s4_ec_v1/tiering/bucket";
+        for node in 1..=3 {
+            pool.storage(node)
+                .put_object(
+                    "__system__",
+                    ec_key,
+                    b"{}",
+                    "application/json",
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap();
+        }
+        coordinator.delete("__system__", ec_key).await.unwrap();
+        for node in 1..=3 {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match pool.storage(node).key_version("__system__", ec_key).await.unwrap() {
+                    KeyVersion::Absent => break,
+                    other => assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "{ec_key} on node {node}: {other:?}"
+                    ),
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        // A bucket configuration is a replicated key: its delete leaves the
+        // same tombstone on every replica, and a write older than the delete
+        // does not bring it back.
+        let config_key = "__s4_bucket_cors_bucket";
+        for node in 1..=3 {
+            pool.put_system(node, config_key, b"<CORSConfiguration/>", at(10)).await;
+        }
+        let deleted = coordinator.delete("__system__", config_key).await.unwrap().hlc;
+        for node in 1..=3 {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match pool.storage(node).key_version("__system__", config_key).await.unwrap() {
+                    KeyVersion::Tombstone(record) => {
+                        assert_eq!(HlcTimestamp::of_record(&record), deleted);
+                        break;
+                    }
+                    other => assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "{config_key} on node {node}: {other:?}"
+                    ),
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        pool.put_system(2, config_key, b"<CORSConfiguration/>", at(20)).await;
+        assert!(matches!(
+            pool.storage(2).key_version("__system__", config_key).await.unwrap(),
+            KeyVersion::Tombstone(_)
+        ));
     }
 }

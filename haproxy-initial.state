@@ -1,0 +1,6 @@
+1
+# Start every backend DOWN; readiness checks bring it UP. Resolve addresses from configuration.
+# be_id be_name srv_id srv_name srv_addr srv_op_state srv_admin_state srv_uweight srv_iweight srv_time_since_last_change srv_check_status srv_check_result srv_check_health srv_check_state srv_agent_state bk_f_forced_id srv_f_forced_id srv_fqdn srv_port srvrecord srv_use_ssl srv_check_port srv_check_addr srv_agent_addr srv_agent_port
+2 s4_nodes 1 s4-node1 127.0.0.1 0 0 1 1 0 1 0 0 6 0 0 0 - 9000 - 0 0 - - 0
+2 s4_nodes 2 s4-node2 127.0.0.1 0 0 1 1 0 1 0 0 6 0 0 0 - 9000 - 0 0 - - 0
+2 s4_nodes 3 s4-node3 127.0.0.1 0 0 1 1 0 1 0 0 6 0 0 0 - 9000 - 0 0 - - 0

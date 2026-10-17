@@ -478,3 +478,182 @@ async fn test_compaction_reclaims_deleted_composite_segments() {
          If live_blobs > 0, orphaned dedup/blob_ref entries are keeping dead data alive."
     );
 }
+
+/// System records written first — the IAM root state, a bucket marker — sit
+/// in the first volume next to objects deleted later. A compaction that stops
+/// after two volumes moves them out of it, and every one still reads after
+/// the engine is reopened: every object deleted leaves an index with records,
+/// which is not taken for a lost one, and the journal's last entry of each
+/// record moved names the location it was moved to.
+#[tokio::test]
+async fn test_limited_compaction_keeps_system_records() {
+    let temp = TempDir::new().unwrap();
+    let metadata = HashMap::new();
+    let root_state = br#"{"credential_version":1,"fingerprint":"abc"}"#.to_vec();
+    {
+        let engine = create_engine(&temp).await;
+        engine
+            .put_object(
+                "__system__",
+                "__s4_iam_v2_root_state",
+                &root_state,
+                "application/json",
+                &metadata,
+            )
+            .await
+            .unwrap();
+        engine
+            .put_object(
+                "__system__",
+                "__s4_bucket_marker_ghost",
+                b"1",
+                "application/octet-stream",
+                &metadata,
+            )
+            .await
+            .unwrap();
+        for i in 0..12 {
+            let data = format!("object-{i:04}-{}", "z".repeat(3000)).into_bytes();
+            engine
+                .put_object("ghost", &format!("big-{i}"), &data, "text/plain", &metadata)
+                .await
+                .unwrap();
+        }
+        engine.sync().await.unwrap();
+        for i in 0..12 {
+            engine.delete_object("ghost", &format!("big-{i}")).await.unwrap();
+        }
+        engine.sync().await.unwrap();
+
+        let compactor = VolumeCompactor::new(
+            engine.volumes_dir().to_path_buf(),
+            engine.index_db().clone(),
+            engine.deduplicator().clone(),
+            engine.volume_writer().clone(),
+            CompactionConfig {
+                fragmentation_threshold: 0.1,
+                min_dead_bytes: 0,
+                max_volumes_per_run: 2,
+                dry_run: false,
+                ..Default::default()
+            },
+        )
+        .with_journal(engine.journal_handle());
+        let stats = compactor.run().await.unwrap();
+        assert_eq!(stats.errors, 0, "{stats:?}");
+        assert!(stats.volumes_compacted > 0, "{stats:?}");
+        for (full_key, bucket, key) in [
+            (
+                "__system__/__s4_iam_v2_root_state",
+                "__system__",
+                "__s4_iam_v2_root_state",
+            ),
+            (
+                "__system__/__s4_bucket_marker_ghost",
+                "__system__",
+                "__s4_bucket_marker_ghost",
+            ),
+        ] {
+            let current = engine.index_db().get(full_key).await.unwrap().unwrap();
+            let journaled = engine
+                .journal()
+                .iter_entries()
+                .unwrap()
+                .into_iter()
+                .rev()
+                .find_map(|entry| match entry.event {
+                    s4_core::storage::JournalEventType::ObjectPut {
+                        bucket: b,
+                        key: k,
+                        record,
+                        ..
+                    } if b == bucket && k == key => Some(record),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                (journaled.file_id, journaled.offset),
+                (current.file_id, current.offset),
+                "the journal's last entry of {full_key} names where it is now"
+            );
+        }
+        let (data, _) = engine.get_object("__system__", "__s4_iam_v2_root_state").await.unwrap();
+        assert_eq!(data, root_state, "root state after compaction");
+        engine.get_object("__system__", "__s4_bucket_marker_ghost").await.unwrap();
+    }
+    let engine = reopen_engine(&temp).await;
+    let (data, _) = engine
+        .get_object("__system__", "__s4_iam_v2_root_state")
+        .await
+        .unwrap_or_else(|e| panic!("root state after reopening: {e}"));
+    assert_eq!(data, root_state);
+    engine
+        .get_object("__system__", "__s4_bucket_marker_ghost")
+        .await
+        .unwrap_or_else(|e| panic!("bucket marker after reopening: {e}"));
+}
+
+/// Every object deleted, the journal cleared by a compaction, and the deleted
+/// objects' bytes still in the volume being written: the index keeps the
+/// buckets and IAM state, so reopening it is no recovery, and the deleted
+/// objects stay deleted rather than come back from the volume.
+#[tokio::test]
+async fn test_deleting_every_object_is_not_a_lost_index() {
+    let temp = TempDir::new().unwrap();
+    let metadata = HashMap::new();
+    {
+        let engine = create_engine(&temp).await;
+        engine
+            .put_object(
+                "__system__",
+                "__s4_iam_v2_root_state",
+                b"{}",
+                "application/json",
+                &metadata,
+            )
+            .await
+            .unwrap();
+        engine
+            .put_object(
+                "__system__",
+                "__s4_bucket_marker_ghost",
+                b"1",
+                "application/octet-stream",
+                &metadata,
+            )
+            .await
+            .unwrap();
+        engine
+            .put_object("ghost", "gone", b"deleted bytes", "text/plain", &metadata)
+            .await
+            .unwrap();
+        engine.delete_object("ghost", "gone").await.unwrap();
+        engine.sync().await.unwrap();
+        let compactor = VolumeCompactor::new(
+            engine.volumes_dir().to_path_buf(),
+            engine.index_db().clone(),
+            engine.deduplicator().clone(),
+            engine.volume_writer().clone(),
+            CompactionConfig {
+                fragmentation_threshold: 0.1,
+                min_dead_bytes: 0,
+                max_volumes_per_run: 0,
+                dry_run: false,
+                compact_journal: true,
+                ..Default::default()
+            },
+        )
+        .with_journal(engine.journal_handle());
+        compactor.run().await.unwrap();
+        assert!(
+            engine.journal().is_empty().unwrap(),
+            "the compaction cleared the journal"
+        );
+    }
+    let engine = reopen_engine(&temp).await;
+    assert!(
+        engine.get_object("ghost", "gone").await.is_err(),
+        "a deleted object came back"
+    );
+    engine.get_object("__system__", "__s4_iam_v2_root_state").await.unwrap();
+}

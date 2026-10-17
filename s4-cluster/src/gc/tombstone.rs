@@ -12,24 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Tombstone lifecycle policy and purge eligibility checks (Phase 8).
+//! Tombstone lifecycle policy and purge eligibility checks.
 //!
 //! # Tombstone Lifecycle
 //!
-//! 1. `DELETE` → tombstone created (`is_delete_marker = true`)
-//! 2. Tombstone replicated to W replicas via quorum write
-//! 3. Tombstone participates in anti-entropy (never deleted early)
-//! 4. After `gc_grace` period + repair frontier check → safe to purge
+//! 1. A delete of a replicated key leaves a tombstone with the delete's HLC
+//!    on every replica it reaches.
+//! 2. Anti-entropy carries it to the replicas that missed it; each complete
+//!    round with a peer moves that peer's cut of the repair frontier.
+//! 3. A node removes its tombstone once it is older than `gc_grace` and the
+//!    cut of every other replica of its key is past its HLC: every replica has
+//!    the delete, or something newer.
 //!
 //! # Safety Invariant
 //!
 //! ```text
-//! gc_grace > max_rejoin_downtime + max_repair_interval + max_clock_skew
+//! gc_grace > max_rejoin_downtime + turn of rounds over the peers
+//!            + replica write timeout + max_clock_skew
 //! ```
 //!
-//! This ensures a node returning from downtime within `max_rejoin_downtime`
-//! will still find all relevant tombstones alive for safe incremental repair.
-//! If a node was offline longer, it must perform a full bootstrap instead.
+//! A node returning from downtime within `max_rejoin_downtime` still finds
+//! the tombstones of the deletes it missed, and its peers' rounds — each takes
+//! every peer once per turn — bring them to it. A write of an older version
+//! still on its way to a replica lands within the replica write timeout, while
+//! the tombstone it lost to is still there to outrank it. The frontier guards
+//! the rest on its own — a replica that is down holds the tombstones of its
+//! keys on every other node — and the invariant keeps a tombstone that
+//! anti-entropy does not carry to a replica without the key (one older than
+//! `gc_grace`) from being one that replica still needs.
 
 use std::time::Duration;
 
@@ -38,7 +48,6 @@ use serde::{Deserialize, Serialize};
 use crate::clock::hlc::HlcTimestamp;
 use crate::identity::NodeId;
 use crate::repair::frontier::RepairFrontier;
-use crate::repair::merkle::KeyRange;
 
 /// Default GC grace period: 7 days (matches Cassandra convention).
 const DEFAULT_GC_GRACE_SECS: u64 = 7 * 24 * 3600;
@@ -46,14 +55,28 @@ const DEFAULT_GC_GRACE_SECS: u64 = 7 * 24 * 3600;
 /// Default maximum rejoin downtime: 3 days.
 const DEFAULT_MAX_REJOIN_DOWNTIME_SECS: u64 = 3 * 24 * 3600;
 
-/// Default GC cycle interval: 6 hours.
-const DEFAULT_GC_INTERVAL_SECS: u64 = 6 * 3600;
+/// Default interval between tombstone GC passes: 6 hours.
+pub const DEFAULT_GC_INTERVAL_SECS: u64 = 6 * 3600;
 
-/// Maximum repair interval (anti-entropy round time).
-const MAX_REPAIR_INTERVAL: Duration = Duration::from_secs(600);
+/// Default turn of anti-entropy rounds over the peers: the default interval
+/// of 600 s, two peers of a three-node pool.
+const DEFAULT_REPAIR_TURN_SECS: u64 = 2 * 600;
+
+/// Default replica write timeout of the write coordinator.
+const DEFAULT_WRITE_SETTLE_SECS: u64 = 60;
 
 /// Maximum tolerated clock skew between nodes.
-const MAX_CLOCK_SKEW: Duration = Duration::from_millis(500);
+pub const MAX_CLOCK_SKEW: Duration = Duration::from_millis(500);
+
+/// How long after its HLC a tombstone may still land on a replica through the
+/// write of its delete: the coordinator gives up on a replica after
+/// `replica_write_timeout`, and the replica's clock may differ from the
+/// coordinator's by the tolerated skew. A repair round's cut is set back by
+/// this much, so that every tombstone the coordinator's write brought to the
+/// node before the cut was in the round.
+pub fn arrival_window(replica_write_timeout: Duration) -> Duration {
+    replica_write_timeout.saturating_add(MAX_CLOCK_SKEW)
+}
 
 /// Tombstone retention and purge policy.
 ///
@@ -63,8 +86,8 @@ const MAX_CLOCK_SKEW: Duration = Duration::from_millis(500);
 pub struct TombstonePolicy {
     /// Minimum lifetime of a tombstone before purge eligibility.
     ///
-    /// Must be greater than `max_rejoin_downtime + repair_interval + clock_skew`.
-    /// Default: 7 days.
+    /// Must be greater than `max_rejoin_downtime + repair_turn + write_settle
+    /// + clock_skew`. Default: 7 days.
     pub gc_grace: Duration,
 
     /// Maximum time a node can be offline and still rejoin via incremental
@@ -72,6 +95,15 @@ pub struct TombstonePolicy {
     ///
     /// Default: 3 days.
     pub max_rejoin_downtime: Duration,
+
+    /// How long a node's anti-entropy rounds take to visit every peer once:
+    /// `S4_ANTI_ENTROPY_INTERVAL_SECS` × the other nodes of the pool.
+    /// Default: 20 minutes.
+    pub repair_turn: Duration,
+
+    /// How long a write may still be on its way to a replica: the write
+    /// coordinator's replica write timeout. Default: 60 s.
+    pub write_settle: Duration,
 }
 
 impl Default for TombstonePolicy {
@@ -79,24 +111,35 @@ impl Default for TombstonePolicy {
         Self {
             gc_grace: Duration::from_secs(DEFAULT_GC_GRACE_SECS),
             max_rejoin_downtime: Duration::from_secs(DEFAULT_MAX_REJOIN_DOWNTIME_SECS),
+            repair_turn: Duration::from_secs(DEFAULT_REPAIR_TURN_SECS),
+            write_settle: Duration::from_secs(DEFAULT_WRITE_SETTLE_SECS),
         }
     }
 }
 
 impl TombstonePolicy {
-    /// Validate the policy invariant: `gc_grace > max_rejoin_downtime + safety_margin`.
+    /// Validate the policy invariant: `gc_grace > max_rejoin_downtime +
+    /// repair_turn + write_settle + clock_skew`. A sum past what a `Duration`
+    /// holds is an error too, not a panic.
     pub fn validate(&self) -> Result<(), String> {
-        let required_minimum = self.max_rejoin_downtime + MAX_REPAIR_INTERVAL + MAX_CLOCK_SKEW;
+        let terms = format!(
+            "the rejoin downtime ({:?}, S4_MAX_REJOIN_DOWNTIME_DAYS) + a turn of anti-entropy \
+             rounds over the peers ({:?}, S4_ANTI_ENTROPY_INTERVAL_SECS × the other nodes of \
+             the pool) + the replica write timeout ({:?}) + the clock skew ({:?})",
+            self.max_rejoin_downtime, self.repair_turn, self.write_settle, MAX_CLOCK_SKEW,
+        );
+        let required_minimum = self
+            .max_rejoin_downtime
+            .checked_add(self.repair_turn)
+            .and_then(|sum| sum.checked_add(self.write_settle))
+            .and_then(|sum| sum.checked_add(MAX_CLOCK_SKEW))
+            .ok_or_else(|| format!("{terms} add up past any grace period"))?;
 
         if self.gc_grace <= required_minimum {
             return Err(format!(
-                "gc_grace ({:?}) must be > max_rejoin_downtime ({:?}) + \
-                 repair_interval ({:?}) + clock_skew ({:?}) = {:?}",
+                "the tombstone grace period ({:?}, S4_GC_GRACE_SECS or S4_GC_GRACE_DAYS) must be \
+                 longer than {terms} = {required_minimum:?}",
                 self.gc_grace,
-                self.max_rejoin_downtime,
-                MAX_REPAIR_INTERVAL,
-                MAX_CLOCK_SKEW,
-                required_minimum,
             ));
         }
 
@@ -110,7 +153,7 @@ pub struct GcConfig {
     /// Whether distributed GC is enabled.
     pub enabled: bool,
 
-    /// Interval between GC purge cycles.
+    /// Interval between GC purge passes (`S4_TOMBSTONE_GC_INTERVAL_SECS`).
     /// Default: 6 hours.
     pub interval: Duration,
 
@@ -132,54 +175,61 @@ impl GcConfig {
     /// Validate the GC configuration.
     pub fn validate(&self) -> Result<(), String> {
         if self.interval.is_zero() {
-            return Err("GC interval must be > 0".into());
+            return Err("S4_TOMBSTONE_GC_INTERVAL_SECS must be > 0".into());
         }
         self.tombstone_policy.validate()
     }
 }
 
-/// Check whether a tombstone is eligible for safe purge.
+/// Whether a node may remove its tombstone issued at `tombstone`.
 ///
-/// A tombstone can be purged **only** when both conditions are met:
+/// Both have to hold:
 ///
-/// 1. **Age check**: tombstone age > `gc_grace`
-/// 2. **Frontier check**: all replicas have confirmed reconciliation past
-///    the tombstone's HLC timestamp
+/// 1. **Age**: the tombstone is older than `gc_grace`;
+/// 2. **Frontier**: the cut of every replica of its key other than this node,
+///    `other_replicas`, is past its HLC — each of them has had everything
+///    this node held before its cut, the tombstone among it.
+///
+/// The node itself is not in the condition: what it holds is what it compares
+/// its peers with. A key with no other replica has nothing to wait for.
 ///
 /// ```text
-/// purgeable(T) ⟺ age(T) > gc_grace AND repair_frontier ≥ version(T) FOR ALL replicas
+/// purgeable(T) ⟺ age(T) > gc_grace ∧ ∀ replica ≠ self: cut(replica) > hlc(T)
 /// ```
 pub fn can_purge_tombstone(
-    tombstone_hlc_wall: u64,
-    tombstone_hlc_logical: u32,
+    tombstone: HlcTimestamp,
     now_millis: u64,
     gc_grace: Duration,
     repair_frontier: &RepairFrontier,
-    key_range: &KeyRange,
-    all_replicas: &[NodeId],
+    other_replicas: &[NodeId],
 ) -> bool {
-    // Age check: tombstone must be older than gc_grace.
-    let age_millis = now_millis.saturating_sub(tombstone_hlc_wall);
-    let gc_grace_millis = gc_grace.as_millis() as u64;
-    let old_enough = age_millis > gc_grace_millis;
-
-    if !old_enough {
+    let age_millis = now_millis.saturating_sub(tombstone.wall_time);
+    let gc_grace_millis = u64::try_from(gc_grace.as_millis()).unwrap_or(u64::MAX);
+    if age_millis <= gc_grace_millis {
         return false;
     }
-
-    // Frontier check: all replicas must have reconciled past this tombstone.
-    let tombstone_hlc = HlcTimestamp {
-        wall_time: tombstone_hlc_wall,
-        logical: tombstone_hlc_logical,
-        node_id: 0, // node_id is irrelevant for comparison
-    };
-
-    repair_frontier.is_safe_to_purge(key_range, &tombstone_hlc, all_replicas)
+    other_replicas.iter().all(|replica| {
+        repair_frontier.peer_cut(replica).is_some_and(|cut| {
+            (cut.wall_time, cut.logical) > (tombstone.wall_time, tombstone.logical)
+        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ts(wall: u64) -> HlcTimestamp {
+        HlcTimestamp::from_record(wall, 0, 0)
+    }
+
+    fn frontier(cuts: &[(u128, u64)]) -> RepairFrontier {
+        let mut frontier = RepairFrontier::new();
+        for (node, wall) in cuts {
+            frontier.advance_peer(NodeId(*node), ts(*wall));
+        }
+        frontier
+    }
 
     #[test]
     fn default_policy_is_valid() {
@@ -192,8 +242,47 @@ mod tests {
         let policy = TombstonePolicy {
             gc_grace: Duration::from_secs(100),
             max_rejoin_downtime: Duration::from_secs(3 * 24 * 3600),
+            ..TombstonePolicy::default()
         };
         assert!(policy.validate().is_err());
+    }
+
+    fn policy(grace: u64, turn: u64, settle: u64) -> TombstonePolicy {
+        TombstonePolicy {
+            gc_grace: Duration::from_secs(grace),
+            max_rejoin_downtime: Duration::ZERO,
+            repair_turn: Duration::from_secs(turn),
+            write_settle: Duration::from_secs(settle),
+        }
+    }
+
+    /// The invariant weighs the turn of rounds over every peer the node is
+    /// configured for, not one interval and not a constant.
+    #[test]
+    fn the_invariant_takes_a_whole_turn_of_rounds() {
+        assert!(policy(80, 10, 60).validate().is_ok());
+        let error = policy(80, 20, 60).validate().unwrap_err();
+        assert!(error.contains("S4_ANTI_ENTROPY_INTERVAL_SECS"), "{error}");
+        // Ten nodes, an hour between rounds: a turn takes nine hours, and a
+        // grace of 4000 s covers less than one of them.
+        assert!(policy(4000, 9 * 3600, 60).validate().is_err());
+    }
+
+    /// A write still on its way to a replica must find the tombstone it lost
+    /// to: a grace shorter than the replica write timeout is refused.
+    #[test]
+    fn the_invariant_takes_the_replica_write_timeout() {
+        let error = policy(40, 10, 60).validate().unwrap_err();
+        assert!(error.contains("replica write timeout"), "{error}");
+        assert!(policy(75, 10, 60).validate().is_ok());
+    }
+
+    /// Terms that add up past what a duration holds are a configuration
+    /// error, not a panic.
+    #[test]
+    fn terms_past_any_duration_are_an_error() {
+        let error = policy(u64::MAX, u64::MAX, 60).validate().unwrap_err();
+        assert!(error.contains("add up past any grace period"), "{error}");
     }
 
     #[test]
@@ -208,150 +297,112 @@ mod tests {
             interval: Duration::ZERO,
             ..Default::default()
         };
-        assert!(config.validate().is_err());
+        let error = config.validate().unwrap_err();
+        assert!(error.contains("S4_TOMBSTONE_GC_INTERVAL_SECS"), "{error}");
     }
 
     #[test]
-    fn can_purge_young_tombstone_returns_false() {
-        let frontier = RepairFrontier::new();
-        let now = 1000;
-        let tombstone_hlc_wall = 999; // 1ms old
-        let gc_grace = Duration::from_secs(7 * 24 * 3600);
-        let key_range = KeyRange::new(0, 1000);
-
+    fn a_young_tombstone_stays_whatever_the_cuts() {
+        let cuts = frontier(&[(2, 5000), (3, 5000)]);
+        let grace = Duration::from_secs(7 * 24 * 3600);
         assert!(!can_purge_tombstone(
-            tombstone_hlc_wall,
-            0,
-            now,
-            gc_grace,
-            &frontier,
-            &key_range,
-            &[NodeId(1)],
-        ));
-    }
-
-    #[test]
-    fn can_purge_old_tombstone_without_frontier_returns_false() {
-        let frontier = RepairFrontier::new();
-        let gc_grace = Duration::from_secs(1);
-        let tombstone_hlc_wall = 1000;
-        let now = tombstone_hlc_wall + 2000; // 2s old, gc_grace=1s
-        let key_range = KeyRange::new(0, 1000);
-
-        assert!(!can_purge_tombstone(
-            tombstone_hlc_wall,
-            0,
-            now,
-            gc_grace,
-            &frontier,
-            &key_range,
-            &[NodeId(1)],
-        ));
-    }
-
-    #[test]
-    fn can_purge_old_tombstone_with_frontier_returns_true() {
-        let mut frontier = RepairFrontier::new();
-        let key_range = KeyRange::new(0, 1000);
-        let n1 = NodeId(1);
-        let n2 = NodeId(2);
-        let n3 = NodeId(3);
-
-        let tombstone_hlc_wall = 1000;
-        let tombstone_hlc_logical = 0;
-
-        // All replicas confirmed past the tombstone
-        let past_tombstone = HlcTimestamp {
-            wall_time: 2000,
-            logical: 0,
-            node_id: 0,
-        };
-        frontier.advance(&key_range, n1, past_tombstone);
-        frontier.advance(&key_range, n2, past_tombstone);
-        frontier.advance(&key_range, n3, past_tombstone);
-
-        let gc_grace = Duration::from_secs(1);
-        let now = tombstone_hlc_wall + 2000;
-
-        assert!(can_purge_tombstone(
-            tombstone_hlc_wall,
-            tombstone_hlc_logical,
-            now,
-            gc_grace,
-            &frontier,
-            &key_range,
-            &[n1, n2, n3],
-        ));
-    }
-
-    #[test]
-    fn can_purge_fails_when_one_replica_not_synced() {
-        let mut frontier = RepairFrontier::new();
-        let key_range = KeyRange::new(0, 1000);
-        let n1 = NodeId(1);
-        let n2 = NodeId(2);
-        let n3 = NodeId(3);
-
-        let tombstone_hlc_wall = 1000;
-
-        let past_tombstone = HlcTimestamp {
-            wall_time: 2000,
-            logical: 0,
-            node_id: 0,
-        };
-        frontier.advance(&key_range, n1, past_tombstone);
-        frontier.advance(&key_range, n2, past_tombstone);
-        // n3 NOT advanced — simulates an offline or lagging replica
-
-        let gc_grace = Duration::from_secs(1);
-        let now = tombstone_hlc_wall + 2000;
-
-        assert!(!can_purge_tombstone(
-            tombstone_hlc_wall,
-            0,
-            now,
-            gc_grace,
-            &frontier,
-            &key_range,
-            &[n1, n2, n3],
-        ));
-    }
-
-    #[test]
-    fn can_purge_with_empty_replicas_returns_false() {
-        let frontier = RepairFrontier::new();
-        let key_range = KeyRange::new(0, 1000);
-        let gc_grace = Duration::from_secs(1);
-
-        assert!(!can_purge_tombstone(
+            ts(999),
             1000,
-            0,
-            3000,
-            gc_grace,
-            &frontier,
-            &key_range,
-            &[]
+            grace,
+            &cuts,
+            &[NodeId(2), NodeId(3)]
         ));
+    }
+
+    #[test]
+    fn an_old_tombstone_without_cuts_stays() {
+        let grace = Duration::from_secs(1);
+        let none = RepairFrontier::new();
+        assert!(!can_purge_tombstone(
+            ts(1000),
+            3000,
+            grace,
+            &none,
+            &[NodeId(2)]
+        ));
+    }
+
+    #[test]
+    fn an_old_tombstone_goes_once_every_other_replica_is_past_it() {
+        let grace = Duration::from_secs(1);
+        let both = frontier(&[(2, 2000), (3, 2000)]);
+        assert!(can_purge_tombstone(
+            ts(1000),
+            3000,
+            grace,
+            &both,
+            &[NodeId(2), NodeId(3)]
+        ));
+    }
+
+    /// A replica without a cut — down, or not reached by a complete round —
+    /// holds the tombstones of its keys.
+    #[test]
+    fn a_replica_without_a_cut_holds_the_tombstone() {
+        let grace = Duration::from_secs(1);
+        let one = frontier(&[(2, 2000)]);
+        assert!(!can_purge_tombstone(
+            ts(1000),
+            3000,
+            grace,
+            &one,
+            &[NodeId(2), NodeId(3)]
+        ));
+    }
+
+    /// The cut has to be past the tombstone, not at it.
+    #[test]
+    fn a_cut_at_the_tombstone_is_not_past_it() {
+        let grace = Duration::from_secs(1);
+        let at = frontier(&[(2, 1000)]);
+        assert!(!can_purge_tombstone(
+            ts(1000),
+            3000,
+            grace,
+            &at,
+            &[NodeId(2)]
+        ));
+        let tombstone = HlcTimestamp::from_record(1000, 3, 9);
+        let same_wall = frontier(&[(2, 1000)]);
+        assert!(!can_purge_tombstone(
+            tombstone,
+            3000,
+            grace,
+            &same_wall,
+            &[NodeId(2)]
+        ));
+    }
+
+    /// A key no other node replicates has nobody to wait for.
+    #[test]
+    fn a_key_with_no_other_replica_goes_by_age_alone() {
+        let grace = Duration::from_secs(1);
+        let none = RepairFrontier::new();
+        assert!(can_purge_tombstone(ts(1000), 3000, grace, &none, &[]));
+        assert!(!can_purge_tombstone(ts(1000), 1500, grace, &none, &[]));
     }
 
     #[test]
     fn policy_boundary_gc_grace_equals_minimum_is_invalid() {
-        let max_rejoin = Duration::from_secs(100);
-        let policy = TombstonePolicy {
-            gc_grace: max_rejoin + MAX_REPAIR_INTERVAL + MAX_CLOCK_SKEW,
-            max_rejoin_downtime: max_rejoin,
-        };
+        let mut at = policy(0, 600, 60);
+        at.max_rejoin_downtime = Duration::from_secs(100);
+        at.gc_grace = Duration::from_secs(100 + 600 + 60) + MAX_CLOCK_SKEW;
         // Exactly equal is not valid (must be strictly greater)
-        assert!(policy.validate().is_err());
+        assert!(at.validate().is_err());
+        at.gc_grace += Duration::from_millis(1);
+        assert!(at.validate().is_ok());
     }
 
     #[test]
-    fn policy_boundary_gc_grace_just_above_minimum_is_valid() {
-        let max_rejoin = Duration::from_secs(100);
-        let policy = TombstonePolicy {
-            gc_grace: max_rejoin + MAX_REPAIR_INTERVAL + MAX_CLOCK_SKEW + Duration::from_secs(1),
-            max_rejoin_downtime: max_rejoin,
-        };
-        assert!(policy.validate().is_ok());
+    fn the_arrival_window_is_the_write_timeout_and_the_clock_skew() {
+        assert_eq!(
+            arrival_window(Duration::from_secs(60)),
+            Duration::from_millis(60_500)
+        );
     }
 }

@@ -210,8 +210,8 @@ pub(crate) struct Listed {
 pub(crate) struct Page {
     /// The objects, by key; delete markers are not among them.
     pub(crate) objects: Vec<Listed>,
-    /// The last key the page covered, delete markers included: where the next
-    /// page starts.
+    /// The last key the page covered, delete markers and tombstones
+    /// included: where the next page starts.
     pub(crate) last_key: Option<String>,
     /// Whether keys may follow this page.
     pub(crate) more: bool,
@@ -231,11 +231,16 @@ pub(crate) async fn page(
     if let Some(ref list_coord) = state.list_coordinator {
         let start = (!after.is_empty()).then_some(after);
         let listed = list_coord
-            .list(bucket, prefix, PAGE, start)
+            .list_answered(bucket, prefix, PAGE, start)
             .await
             .map_err(UsageError::Cluster)?;
         return Ok(Page {
-            last_key: listed.entries.last().map(|entry| entry.key.clone()),
+            // A page thinned out by tombstones ends past its last object.
+            last_key: listed
+                .next_continuation_token
+                .clone()
+                .filter(|_| listed.is_truncated)
+                .or_else(|| listed.entries.last().map(|entry| entry.key.clone())),
             more: listed.is_truncated,
             complete: listed.nodes_responded == listed.nodes_queried,
             objects: listed

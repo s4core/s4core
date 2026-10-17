@@ -843,6 +843,8 @@ pub struct EcOperationsService {
     heat: EcHeatTracker,
     config: EcOperationsConfig,
     read_runtime: OnceLock<EcObjectReadRuntimeDeps>,
+    /// Startup generation; a growing pool cannot invent a missing EC roster.
+    pool_generation: OnceLock<s4_cluster::pool_generation::PoolGenerationRecord>,
     /// Cluster-wide catalog view, used by the tiering surface only.
     ///
     /// A node's local index holds the objects replicated to it, which in a
@@ -1216,6 +1218,7 @@ impl EcOperationsService {
             heat,
             config,
             read_runtime: OnceLock::new(),
+            pool_generation: OnceLock::new(),
             catalog: OnceLock::new(),
             anti_entropy: OnceLock::new(),
             membership: Arc::new(OnceLock::new()),
@@ -1544,6 +1547,22 @@ impl EcOperationsService {
             .map_err(|error| RosterRejection::PoolState(ClusterError::Config(error.to_string())))
     }
 
+    /// Supplies durable pool membership before adopting erasure sets. Reads
+    /// use the current generation's router; without a roster during growth,
+    /// this node waits for the old owners rather than assuming a single set.
+    pub fn configure_pool_generation(
+        &self,
+        record: s4_cluster::pool_generation::PoolGenerationRecord,
+    ) {
+        let _ = self.pool_generation.set(record);
+    }
+
+    fn waits_for_old_roster(&self) -> bool {
+        self.pool_generation
+            .get()
+            .is_some_and(|g| g.proposed.is_some() && !g.current.nodes.contains(&self.local_node_id))
+    }
+
     /// Read the pool's roster from the cluster, falling back to the local copy.
     ///
     /// The local copy is a cache, and answering from it is right whenever the
@@ -1559,6 +1578,11 @@ impl EcOperationsService {
                 .await
                 .map_err(cluster_storage_error)
                 .map_err(RosterRejection::Transient)?;
+            if record.is_none() && self.waits_for_old_roster() {
+                return Err(RosterRejection::Transient(ClusterError::Unavailable(
+                    "EC erasure set roster is unknown during pool growth: waiting for the old owners; no local roster cache is available".into(),
+                )));
+            }
             Ok(record.unwrap_or_else(|| EcErasureSetRoster::empty(pool_id)))
         };
 
@@ -1590,7 +1614,18 @@ impl EcOperationsService {
                 }
                 Ok(roster)
             }
-            Err(ClusterError::ObjectNotFound { .. }) => cached().await,
+            // A read quorum answered that no roster was ever published: the
+            // pool has its inherited set alone. In a growing pool reads go to
+            // the old owners until their range cuts over, so this is their
+            // answer too, and a node that joins the growth takes it rather
+            // than waiting for a roster that does not exist.
+            Err(ClusterError::ObjectNotFound { .. }) => Ok(self
+                .metadata
+                .get_erasure_set_roster()
+                .await
+                .map_err(cluster_storage_error)
+                .map_err(RosterRejection::Transient)?
+                .unwrap_or_else(|| EcErasureSetRoster::empty(pool_id))),
             Err(error) => {
                 tracing::warn!(
                     error = %error,
@@ -2128,6 +2163,20 @@ impl EcOperationsService {
                 Ok(())
             }
             Err(RosterRejection::Transient(error)) => {
+                if self.read_runtime.get().is_some()
+                    && self.waits_for_old_roster()
+                    && self
+                        .metadata
+                        .get_erasure_set_roster()
+                        .await
+                        .map_err(cluster_storage_error)?
+                        .is_none()
+                {
+                    // Before wiring the runtime, keep the bootstrap moving so
+                    // the old owners can be asked. Afterwards refuse service
+                    // until their roster is known.
+                    return Err(error);
+                }
                 tracing::warn!(
                     pool = %self.pool_name,
                     error = %error,
@@ -3669,16 +3718,21 @@ impl EcOperationsService {
         object: &EcObjectVersionKey,
         ports: &EcClusterReadPorts,
     ) -> Result<EcObjectReadPlan, EcObjectReadError> {
-        if self
+        if let Some(tombstone) = self
             .metadata
             .get_manifest(object)
             .await
             .map_err(ec_metadata_internal)?
-            .as_ref()
-            .is_some_and(manifest_is_tombstone)
+            .filter(manifest_is_tombstone)
         {
-            self.metadata.delete_object_layout(object).await.map_err(ec_metadata_internal)?;
-            return Ok(EcObjectReadPlan::Deleted);
+            // A tombstone closes the versions before it, not a write made
+            // since: the key written again after its delete is an object, and
+            // the tombstone this node kept is history.
+            if !self.hot_replicated_newer_than(object, tombstone.hlc, ports).await? {
+                self.metadata.delete_object_layout(object).await.map_err(ec_metadata_internal)?;
+                return Ok(EcObjectReadPlan::Deleted);
+            }
+            self.metadata.delete_manifest(object).await.map_err(ec_metadata_internal)?;
         }
 
         match self.metadata.get_object_layout(object).await.map_err(ec_metadata_internal)? {
@@ -3759,62 +3813,92 @@ impl EcOperationsService {
                 Ok(EcObjectReadPlan::EcMetadata)
             }
             EcManifestReadResult::Tombstone(manifest) => {
+                // Written again since the delete the tombstone records: the
+                // object is read as one with no manifest, which it is.
+                if self.hot_replicated_newer_than(object, manifest.hlc, ports).await? {
+                    self.metadata.delete_manifest(object).await.map_err(ec_metadata_internal)?;
+                    return self.select_read_plan_without_manifest(object, ports).await;
+                }
                 self.metadata.put_manifest(&manifest).await.map_err(ec_metadata_internal)?;
                 self.metadata.delete_object_layout(object).await.map_err(ec_metadata_internal)?;
                 Ok(EcObjectReadPlan::Deleted)
             }
-            // No manifest is the answer for two very different objects: one the
-            // pool deliberately placed as replicated-small, and one the hot
-            // path is simply still holding. The placement record tells them
-            // apart, and a node that has never resolved this object has to ask
-            // the pool for it — once. Caching what comes back is what makes
-            // every node, and not only the one that took the write, able to say
-            // the object was placed deliberately.
             EcManifestReadResult::Absent => {
-                // An object this node has already looked for and not found a
-                // record for does not get looked for again until the memory
-                // expires: on a pool where most small objects are ordinary hot
-                // ones, that is the difference between one resolve and one per
-                // read (decision EC2-201).
-                if self.small_placement_miss_is_remembered(object) {
-                    self.metadata
-                        .delete_object_layout(object)
-                        .await
-                        .map_err(ec_metadata_internal)?;
-                    return Ok(EcObjectReadPlan::HotReplicated);
-                }
-                if !self.object_is_small_enough_for_replicated_small(object, ports).await? {
-                    self.metadata
-                        .delete_object_layout(object)
-                        .await
-                        .map_err(ec_metadata_internal)?;
-                    return Ok(EcObjectReadPlan::HotReplicated);
-                }
-                match read_replicated_small_placement(ports, object)
-                    .await
-                    .map_err(map_ec_read_error)?
-                {
-                    Some(placement) => {
-                        self.forget_small_placement_miss(object);
-                        self.metadata
-                            .cache_object_layout(
-                                object,
-                                &ObjectDataLayout::ReplicatedSmall(placement),
-                            )
-                            .await
-                            .map_err(ec_metadata_internal)?;
-                        Ok(EcObjectReadPlan::EcMetadata)
-                    }
-                    None => {
-                        self.remember_small_placement_miss(object);
-                        self.metadata
-                            .delete_object_layout(object)
-                            .await
-                            .map_err(ec_metadata_internal)?;
-                        Ok(EcObjectReadPlan::HotReplicated)
-                    }
-                }
+                self.select_read_plan_without_manifest(object, ports).await
             }
+        }
+    }
+
+    /// The read plan of an object no manifest describes — none, or a tombstone
+    /// of a delete the object was written again after.
+    ///
+    /// No manifest is the answer for two very different objects: one the
+    /// pool deliberately placed as replicated-small, and one the hot path is
+    /// simply still holding. The placement record tells them apart, and a
+    /// node that has never resolved this object has to ask the pool for it —
+    /// once. Caching what comes back is what makes every node, and not only
+    /// the one that took the write, able to say the object was placed
+    /// deliberately.
+    async fn select_read_plan_without_manifest(
+        &self,
+        object: &EcObjectVersionKey,
+        ports: &EcClusterReadPorts,
+    ) -> Result<EcObjectReadPlan, EcObjectReadError> {
+        // An object this node has already looked for and not found a
+        // record for does not get looked for again until the memory
+        // expires: on a pool where most small objects are ordinary hot
+        // ones, that is the difference between one resolve and one per
+        // read (decision EC2-201).
+        if self.small_placement_miss_is_remembered(object) {
+            self.metadata.delete_object_layout(object).await.map_err(ec_metadata_internal)?;
+            return Ok(EcObjectReadPlan::HotReplicated);
+        }
+        if !self.object_is_small_enough_for_replicated_small(object, ports).await? {
+            self.metadata.delete_object_layout(object).await.map_err(ec_metadata_internal)?;
+            return Ok(EcObjectReadPlan::HotReplicated);
+        }
+        match read_replicated_small_placement(ports, object)
+            .await
+            .map_err(map_ec_read_error)?
+        {
+            Some(placement) => {
+                self.forget_small_placement_miss(object);
+                self.metadata
+                    .cache_object_layout(object, &ObjectDataLayout::ReplicatedSmall(placement))
+                    .await
+                    .map_err(ec_metadata_internal)?;
+                Ok(EcObjectReadPlan::EcMetadata)
+            }
+            None => {
+                self.remember_small_placement_miss(object);
+                self.metadata.delete_object_layout(object).await.map_err(ec_metadata_internal)?;
+                Ok(EcObjectReadPlan::HotReplicated)
+            }
+        }
+    }
+
+    /// Whether the object's hot copies hold a version written after `hlc` —
+    /// the version a tombstone or a placement was recorded for. An
+    /// erasure-coded namespace entry carries its source's HLC and is no newer
+    /// write; a hot object absent is none either.
+    async fn hot_replicated_newer_than(
+        &self,
+        object: &EcObjectVersionKey,
+        hlc: HlcTimestamp,
+        ports: &EcClusterReadPorts,
+    ) -> Result<bool, EcObjectReadError> {
+        if object.version_id.is_some() {
+            return Ok(false);
+        }
+        match ports.read_coordinator.head(&object.bucket, &object.key).await {
+            Ok(head) if head.erasure_coded => Ok(false),
+            Ok(head) => Ok(head.hlc > hlc),
+            Err(ClusterError::ObjectNotFound { .. }) => Ok(false),
+            Err(error) => Err(EcObjectReadError::Unavailable {
+                reason: format!(
+                    "hot replicated HEAD failed while checking an EC tombstone's freshness: {error}"
+                ),
+            }),
         }
     }
 
@@ -3936,6 +4020,16 @@ impl EcOperationsService {
         }
     }
 
+    /// Drops this node's cached layout of an object whose replicated-small
+    /// placement an overwrite superseded, so the next read resolves it again
+    /// rather than meet the stale placement first.
+    async fn forget_superseded_placement(
+        &self,
+        object: &EcObjectVersionKey,
+    ) -> Result<(), EcObjectReadError> {
+        self.metadata.delete_object_layout(object).await.map_err(ec_metadata_internal)
+    }
+
     async fn hot_replicated_is_current_or_newer(
         &self,
         object: &EcObjectVersionKey,
@@ -3968,6 +4062,29 @@ impl EcOperationsService {
         deps: &EcObjectReadRuntimeDeps,
         request: EcObjectReadRequest,
     ) -> Result<EcObjectReadResult, EcObjectReadError> {
+        let (bucket, key) = (request.bucket.clone(), request.key.clone());
+        match self.try_read_hot_replicated(deps, request).await? {
+            Some(result) => Ok(result),
+            None => Err(EcObjectReadError::from_cluster(
+                ClusterError::ErasureCodedOnly {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                    replicas: 0,
+                },
+                bucket,
+                key,
+            )),
+        }
+    }
+
+    /// [`Self::read_hot_replicated`], `None` when every replica that answered
+    /// holds the object as an erasure-coded entry: it was moved into its set
+    /// since the plan was made, and its bytes are read through the set.
+    async fn try_read_hot_replicated(
+        &self,
+        deps: &EcObjectReadRuntimeDeps,
+        request: EcObjectReadRequest,
+    ) -> Result<Option<EcObjectReadResult>, EcObjectReadError> {
         if request.version_id.is_some() {
             return Err(EcObjectReadError::Unavailable {
                 reason: "version-specific hot replicated EC reads require a version-aware cluster reader"
@@ -3976,11 +4093,18 @@ impl EcOperationsService {
         }
 
         let range = request.range.map(|range| (range.start, range.end));
-        let stream = deps
-            .read_coordinator
-            .read_stream(&request.bucket, &request.key, range)
-            .await
-            .map_err(|error| EcObjectReadError::from_cluster(error, request.bucket, request.key))?;
+        let stream =
+            match deps.read_coordinator.read_stream(&request.bucket, &request.key, range).await {
+                Ok(stream) => stream,
+                Err(ClusterError::ErasureCodedOnly { .. }) => return Ok(None),
+                Err(error) => {
+                    return Err(EcObjectReadError::from_cluster(
+                        error,
+                        request.bucket,
+                        request.key,
+                    ))
+                }
+            };
         let mut body = Vec::with_capacity(stream.content_length.min(usize::MAX as u64) as usize);
         let mut reader = stream.body;
         reader
@@ -3990,7 +4114,7 @@ impl EcOperationsService {
                 reason: format!("hot replicated read stream failed: {error}"),
             })?;
 
-        Ok(EcObjectReadResult {
+        Ok(Some(EcObjectReadResult {
             body: Bytes::from(body),
             head: hot_head_result(
                 stream.etag,
@@ -4003,7 +4127,7 @@ impl EcOperationsService {
             content_length: stream.content_length,
             content_range: stream.content_range,
             repair_enqueued: false,
-        })
+        }))
     }
 
     async fn head_hot_replicated(
@@ -5852,7 +5976,11 @@ impl EcClusterReadPorts {
                 Ok(Ok(())) => {
                     acks = acks.saturating_add(1);
                     if acks >= required {
-                        set.abort_all();
+                        // The writes still in flight go on: a node left with
+                        // the earlier state would split the set once a node
+                        // that acknowledged is down, and no state would reach
+                        // the quorum a read needs until it is back.
+                        set.detach_all();
                         return Ok(acks);
                     }
                 }
@@ -5973,7 +6101,9 @@ impl EcClusterReadPorts {
                     let acks = acks_by_set.entry(set_id).or_insert(0);
                     *acks = acks.saturating_add(1);
                     if self.every_set_reached(&acks_by_set, required) {
-                        set.abort_all();
+                        // As a manifest write does: the deletes in flight go
+                        // on, so that every node that answers stops holding it.
+                        set.detach_all();
                         return Ok(());
                     }
                 }
@@ -6028,6 +6158,51 @@ impl EcClusterReadPorts {
         self.metadata.put_local_shard(&key, &local).await?;
         Ok(())
     }
+}
+
+/// How many fan-outs a manifest read makes before it answers that no set
+/// reached a verdict.
+const MANIFEST_READ_ATTEMPTS: u32 = 4;
+
+/// The pause before the second fan-out of a manifest read; it doubles before
+/// each further one (50, 100 and 200 ms).
+const MANIFEST_READ_BACKOFF: Duration = Duration::from_millis(50);
+
+/// Runs `read` until it reaches a verdict or fails (`Err`), at most
+/// `attempts` times, pausing `backoff`, then twice as long, between them. A
+/// read that never reached one is unavailable, with what the nodes answered
+/// the last time (`Ok(Err)` of `read`).
+async fn read_until_decided<F, Fut>(
+    attempts: u32,
+    backoff: Duration,
+    mut read: F,
+) -> Result<EcManifestReadResult, EcReadError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Result<EcManifestReadResult, String>, EcReadError>>,
+{
+    let mut pause = backoff;
+    let mut answers = String::new();
+    for attempt in 1..=attempts.max(1) {
+        match read().await? {
+            Ok(result) => return Ok(result),
+            Err(last) => answers = last,
+        }
+        if attempt < attempts {
+            tracing::debug!(
+                attempt,
+                "EC manifest quorum read reached no verdict; asking again"
+            );
+            tokio::time::sleep(pause).await;
+            pause = pause.saturating_mul(2);
+        }
+    }
+    tracing::warn!(attempts, %answers, "EC manifest quorum read reached no verdict");
+    Err(EcReadError::Unavailable {
+        reason: format!(
+            "manifest quorum read reached no verdict in {attempts} attempt(s): {answers}"
+        ),
+    })
 }
 
 #[async_trait]
@@ -6142,10 +6317,31 @@ impl EcReadMetadataCoordinator for EcClusterReadPorts {
     /// Quorum counting is per set, not pool-wide: a manifest lives in exactly
     /// one set, so copies found in two sets are two different findings and must
     /// never be added together into a quorum neither set reached.
+    ///
+    /// A set without a verdict is asked again, after a short pause, a few
+    /// times ([`read_until_decided`]): a manifest written or removed at that
+    /// moment is on some nodes and not yet on others, and with one node of the
+    /// set down — restarting — neither the manifest nor its absence reaches
+    /// `required` until the write ends, milliseconds later.
     async fn quorum_read_manifest(
         &self,
         object: &EcObjectVersionKey,
     ) -> Result<EcManifestReadResult, EcReadError> {
+        read_until_decided(MANIFEST_READ_ATTEMPTS, MANIFEST_READ_BACKOFF, || {
+            self.quorum_read_manifest_once(object)
+        })
+        .await
+    }
+}
+
+impl EcClusterReadPorts {
+    /// One fan-out of [`EcReadMetadataCoordinator::quorum_read_manifest`]:
+    /// `Ok(Err(answers))` when no set reached a verdict, with what each node
+    /// answered.
+    async fn quorum_read_manifest_once(
+        &self,
+        object: &EcObjectVersionKey,
+    ) -> Result<Result<EcManifestReadResult, String>, EcReadError> {
         let required = self.erasure_set.profile.manifest_quorum();
         for (set_id, nodes) in &self.pool_metadata_nodes {
             if usize::from(required) > nodes.len() {
@@ -6177,6 +6373,7 @@ impl EcReadMetadataCoordinator for EcClusterReadPorts {
                 set.spawn(async move {
                     (
                         set_id,
+                        node_id,
                         read_manifest_from_node(&ports, node_id, key, object, operation_id).await,
                     )
                 });
@@ -6188,11 +6385,17 @@ impl EcReadMetadataCoordinator for EcClusterReadPorts {
         // Sets that have answered for good, either way. Once every set is in
         // here nothing still in flight can change the outcome.
         let mut decided: HashSet<u64> = HashSet::new();
+        // What each node answered, for the report of a read without a verdict.
+        let mut answers: Vec<String> = Vec::new();
         while let Some(result) = set.join_next().await {
             match result {
-                Ok((set_id, Ok(ManifestNodeRead::Present(manifest)))) => {
+                Ok((set_id, node_id, Ok(ManifestNodeRead::Present(manifest)))) => {
                     let manifest = *manifest;
                     let hash = manifest.serialized_sha256()?;
+                    answers.push(format!(
+                        "set {set_id} node {node_id}: {:?} {:02x}{:02x}{:02x}{:02x} hlc {:?}",
+                        manifest.state, hash[0], hash[1], hash[2], hash[3], manifest.hlc
+                    ));
                     let count = by_hash
                         .entry((set_id, hash))
                         .and_modify(|(_, count)| *count = count.saturating_add(1))
@@ -6202,7 +6405,8 @@ impl EcReadMetadataCoordinator for EcClusterReadPorts {
                         decided.insert(set_id);
                     }
                 }
-                Ok((set_id, Ok(ManifestNodeRead::Absent))) => {
+                Ok((set_id, node_id, Ok(ManifestNodeRead::Absent))) => {
+                    answers.push(format!("set {set_id} node {node_id}: absent"));
                     let absent = absent_by_set.entry(set_id).or_insert(0);
                     *absent = absent.saturating_add(1);
                     if *absent >= required {
@@ -6210,10 +6414,11 @@ impl EcReadMetadataCoordinator for EcClusterReadPorts {
                     }
                     if self.every_set_reports_absent(&absent_by_set, required) {
                         set.abort_all();
-                        return Ok(EcManifestReadResult::Absent);
+                        return Ok(Ok(EcManifestReadResult::Absent));
                     }
                 }
-                Ok((_, Err(error))) => {
+                Ok((set_id, node_id, Err(error))) => {
+                    answers.push(format!("set {set_id} node {node_id}: failed: {error}"));
                     tracing::warn!(error = %error, "EC read manifest quorum candidate failed");
                 }
                 Err(error) => {
@@ -6240,15 +6445,16 @@ impl EcReadMetadataCoordinator for EcClusterReadPorts {
         }
 
         if let Some(manifest) = winner {
-            return Ok(manifest.into_read_result());
+            return Ok(Ok(manifest.into_read_result()));
         }
         if self.every_set_reports_absent(&absent_by_set, required) {
-            return Ok(EcManifestReadResult::Absent);
+            return Ok(Ok(EcManifestReadResult::Absent));
         }
 
-        Err(EcReadError::Unavailable {
-            reason: format!("manifest quorum read did not reach {required} matching response(s)"),
-        })
+        Ok(Err(format!(
+            "{required} matching answers needed; {}",
+            answers.join("; ")
+        )))
     }
 }
 
@@ -6343,9 +6549,11 @@ impl EcReplicatedSmallDeleter for EcClusterReadPorts {
                         .to_string(),
             });
         }
+        // Never raised above a newer version: one is a client's write made
+        // after the object was deleted, and it stays.
         let result = self
             .write_coordinator
-            .delete(&request.object.bucket, &request.object.key)
+            .delete_once(&request.object.bucket, &request.object.key)
             .await
             .map_err(|error| {
                 EcGcError::Metadata(crate::ec_metadata::EcMetadataError::QuorumRead(
@@ -6400,6 +6608,12 @@ impl EcReplicatedSmallReader for EcClusterReadPorts {
             .read(&request.object.bucket, &request.object.key)
             .await
             .map_err(cluster_read_to_ec_error)?;
+        if result.hlc > request.placement.hlc {
+            return Err(EcReadError::ReplicatedSmallSuperseded {
+                placement_hlc: request.placement.hlc,
+                current_hlc: result.hlc,
+            });
+        }
         if result.size != request.placement.size {
             return Err(EcReadError::ReplicatedSmallVerification {
                 reason: format!(
@@ -6473,6 +6687,12 @@ impl EcReplicatedSmallReader for EcClusterReadPorts {
             .head(&request.object.bucket, &request.object.key)
             .await
             .map_err(cluster_read_to_ec_error)?;
+        if !result.erasure_coded && result.hlc > request.placement.hlc {
+            return Err(EcReadError::ReplicatedSmallSuperseded {
+                placement_hlc: request.placement.hlc,
+                current_hlc: result.hlc,
+            });
+        }
         if result.size != request.placement.size {
             return Err(EcReadError::ReplicatedSmallVerification {
                 reason: format!(
@@ -7451,9 +7671,13 @@ async fn write_replicated_small_placement(
         return 0;
     };
     let key = replicated_small_object_key(object);
+    // One operation per version of the object: a replica takes a repeated
+    // operation for a retry and keeps what it has, so an id derived from the
+    // key alone left an overwrite's placement out wherever the first write's
+    // was.
     let operation_id = derive_storage_operation_id(
         deterministic_object_uuid(object),
-        b"ec-small-placement-write",
+        &small_placement_write_kind(placement.hlc),
         0,
         0,
         EcPlacementState::EcTranscodeQueued,
@@ -7479,6 +7703,15 @@ async fn write_replicated_small_placement(
         }
     }
     acks
+}
+
+/// The operation kind of the write of a placement recorded for version `hlc`.
+fn small_placement_write_kind(hlc: HlcTimestamp) -> Vec<u8> {
+    let mut kind = b"ec-small-placement-write".to_vec();
+    kind.extend_from_slice(&hlc.wall_time.to_be_bytes());
+    kind.extend_from_slice(&hlc.logical.to_be_bytes());
+    kind.extend_from_slice(&hlc.node_id.to_be_bytes());
+    kind
 }
 
 /// Take a small object's placement back after its delete was confirmed.
@@ -7597,10 +7830,13 @@ fn placement_fallback_nodes(replicas: &[NodeId], pool_nodes: Vec<NodeId>) -> Vec
     pool_nodes.into_iter().filter(|node_id| !replicas.contains(node_id)).collect()
 }
 
-/// Ask `nodes` for this object's placement record, first decodable answer wins.
+/// Ask `nodes` for this object's placement record; the newest one answered
+/// wins.
 ///
-/// The record is written once and never rewritten, so two copies cannot
-/// disagree and there is nothing to reconcile between them.
+/// Every version of the object writes its own record, which replaces the one
+/// before on a replica that takes it; a replica the overwrite missed still
+/// holds the record of the version before, so the copies are weighed by the
+/// version they describe.
 async fn read_small_placement_from_nodes(
     ports: &EcClusterReadPorts,
     object: &EcObjectVersionKey,
@@ -7625,16 +7861,16 @@ async fn read_small_placement_from_nodes(
             read_hidden_object_from_node(&ports, node_id, key, operation_id).await
         });
     }
-    let mut found = None;
+    let mut found: Option<ReplicatedSmallObjectPlacement> = None;
     while let Some(result) = reads.join_next().await {
         if let Ok(Ok(Some(read))) = result {
             if let Ok(placement) = decode_replicated_small_placement(&read.data) {
-                found = Some(placement);
-                break;
+                if found.as_ref().is_none_or(|newest| placement.hlc > newest.hlc) {
+                    found = Some(placement);
+                }
             }
         }
     }
-    reads.shutdown().await;
     found
 }
 
@@ -7966,6 +8202,8 @@ async fn write_remote_hidden_object(
 ) -> Result<(), EcReadError> {
     let node_id = write.node_id;
     let request = proto::WriteBlobRequest {
+        verify_content: false,
+        placement_generation: 0,
         bucket: SYSTEM_BUCKET.to_string(),
         key: write.key,
         content_hash: sha256(&write.data).to_vec(),
@@ -7977,6 +8215,10 @@ async fn write_remote_hidden_object(
         coordinator_id: local_node_id.to_bytes().to_vec(),
         operation_id: write.operation_id.to_be_bytes().to_vec(),
         topology_epoch,
+        etag: String::new(),
+        bucket_metadata_stage: 0,
+        repair_copy: false,
+        iam_lease: None,
     };
     let response =
         rpc_client
@@ -8046,6 +8288,7 @@ async fn delete_remote_hidden_object(
     operation_id: u128,
 ) -> Result<(), EcReadError> {
     let request = proto::DeleteBlobRequest {
+        placement_generation: 0,
         bucket: SYSTEM_BUCKET.to_string(),
         key,
         hlc: Some(hlc.to_proto()),
@@ -8054,6 +8297,9 @@ async fn delete_remote_hidden_object(
         topology_epoch,
         version_id: None,
         expected_source_hlc: None,
+        bucket_metadata_stage: 0,
+        repair_copy: false,
+        iam_lease: None,
     };
     let response =
         rpc_client
@@ -8467,6 +8713,13 @@ fn map_ec_read_error(error: EcReadError) -> EcObjectReadError {
         EcReadError::Unavailable { reason } | EcReadError::ShardIo { reason } => {
             EcObjectReadError::Unavailable { reason }
         }
+        // Taken by the read and HEAD of the runtime before it gets here; any
+        // other caller retries, as for any read that met a moving object.
+        superseded @ EcReadError::ReplicatedSmallSuperseded { .. } => {
+            EcObjectReadError::Unavailable {
+                reason: superseded.to_string(),
+            }
+        }
         EcReadError::ManifestMismatch { reason }
         | EcReadError::InvalidManifest { reason }
         | EcReadError::ChunkVerification { reason }
@@ -8520,6 +8773,9 @@ fn ec_read_to_repair_error(error: EcReadError) -> EcRepairError {
         EcReadError::ShardIo { reason } | EcReadError::Unavailable { reason } => {
             EcRepairError::ShardRead { reason }
         }
+        superseded @ EcReadError::ReplicatedSmallSuperseded { .. } => EcRepairError::ShardRead {
+            reason: superseded.to_string(),
+        },
         EcReadError::Metadata(error) => EcRepairError::Metadata(error),
         EcReadError::Codec(error) => EcRepairError::Codec(error),
         EcReadError::Cpu(error) => EcRepairError::Cpu(error),
@@ -8671,17 +8927,15 @@ pub struct EcTieringServiceEnvironment {
 #[async_trait]
 impl EcTieringEnvironment for EcTieringServiceEnvironment {
     async fn list_buckets(&self) -> Result<Vec<String>, ClusterError> {
-        let page = self
+        let markers = self
             .catalog
-            .list(
+            .list_up_to(
                 SYSTEM_BUCKET,
                 s4_core::types::BUCKET_MARKER_KEY_PREFIX,
                 MAX_TIERING_BUCKETS,
-                None,
             )
             .await?;
-        let mut buckets = page
-            .entries
+        let mut buckets = markers
             .iter()
             .filter_map(|entry| {
                 entry
@@ -9905,8 +10159,7 @@ impl EcObjectRuntime for EcOperationsService {
         // would grow by one row for every object ever read and then removed,
         // and nothing else would ever collect them.
         //
-        // One narrow case survives: the cold-EC delete fallback asks the read
-        // path for metadata first, so a signal for this object may still be
+        // A concurrent read may have left a signal for this object
         // sitting in the tracker's batch and will recreate the row on the next
         // flush. That leaves a single stale row for an object that no longer
         // exists, which the tiering scanner drops when it cannot resolve it.
@@ -9947,8 +10200,24 @@ impl EcObjectRuntime for EcOperationsService {
         // a node that does not tier must not pay for two allocations per read.
         let heat_key = self.heat.is_enabled().then(|| object.clone());
 
-        let result = match self.select_read_plan(&object, &ports).await? {
-            EcObjectReadPlan::HotReplicated => self.read_hot_replicated(deps, request).await,
+        let mut plan = self.select_read_plan(&object, &ports).await?;
+        // Hot copies the plan found may have been moved into the object's set
+        // since: their bytes are then read through the set.
+        let mut hot = None;
+        if matches!(plan, EcObjectReadPlan::HotReplicated) {
+            match self.try_read_hot_replicated(deps, request.clone()).await {
+                Ok(None) => plan = EcObjectReadPlan::EcMetadata,
+                Ok(Some(result)) => hot = Some(Ok(result)),
+                Err(error) => hot = Some(Err(error)),
+            }
+        }
+        let result = match plan {
+            // Always read above: the plan stays hot only when it was.
+            EcObjectReadPlan::HotReplicated => hot.unwrap_or_else(|| {
+                Err(EcObjectReadError::Unavailable {
+                    reason: "hot replicated read did not run".into(),
+                })
+            }),
             EcObjectReadPlan::Deleted => Err(EcObjectReadError::Deleted {
                 bucket: object.bucket,
                 key: object.key,
@@ -9969,6 +10238,10 @@ impl EcObjectRuntime for EcOperationsService {
                     .await
                 {
                     Ok(result) => Ok(ec_read_result_to_object_result(result)),
+                    Err(EcReadError::ReplicatedSmallSuperseded { .. }) => {
+                        self.forget_superseded_placement(&confirm).await?;
+                        self.read_hot_replicated(deps, request).await
+                    }
                     Err(error) => Err(self.explain_missing_object(&confirm, &ports, error).await),
                 }
             }
@@ -10009,6 +10282,10 @@ impl EcObjectRuntime for EcOperationsService {
                 let confirm = object.clone();
                 match self.ec_reader().head(object, &ports, &ports).await {
                     Ok(head) => Ok(ec_head_to_object_head(head)),
+                    Err(EcReadError::ReplicatedSmallSuperseded { .. }) => {
+                        self.forget_superseded_placement(&confirm).await?;
+                        self.head_hot_replicated(deps, request).await
+                    }
                     Err(error) => Err(self.explain_missing_object(&confirm, &ports, error).await),
                 }
             }
@@ -11391,9 +11668,6 @@ impl EcAdminService for EcOperationsService {
             let page = catalog
                 .list(&request.bucket, &prefix, page_size, continuation.as_deref())
                 .await?;
-            if page.entries.is_empty() {
-                break;
-            }
 
             for entry in &page.entries {
                 report.scanned += 1;
@@ -12626,6 +12900,12 @@ fn cluster_gc_error(error: EcGcError) -> ClusterError {
         EcGcError::InvalidConfig { .. } | EcGcError::InvalidRequest { .. } => {
             ClusterError::Config(error.to_string())
         }
+        // The pool did not answer a metadata read with a quorum — nodes just
+        // back, or still down: the operation may be retried, and the client is
+        // told so rather than that storage failed.
+        EcGcError::Metadata(crate::ec_metadata::EcMetadataError::QuorumRead(reason)) => {
+            ClusterError::Unavailable(reason)
+        }
         EcGcError::TombstoneNotConfirmed { .. }
         | EcGcError::PackedRepack { .. }
         | EcGcError::Metadata(_) => ClusterError::Storage(error.to_string()),
@@ -12895,6 +13175,51 @@ fn seconds_to_nanos(seconds: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A manifest read with no verdict asks again until it reaches one: a
+    /// manifest written while a node of its set restarts settles after its
+    /// write ends.
+    #[tokio::test]
+    async fn a_manifest_read_without_a_verdict_asks_again_until_it_has_one() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let read = read_until_decided(4, Duration::from_millis(1), || async {
+            match calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) {
+                0 | 1 => Ok(Err("split".to_string())),
+                _ => Ok(Ok(EcManifestReadResult::Absent)),
+            }
+        })
+        .await;
+        assert!(matches!(read, Ok(EcManifestReadResult::Absent)), "{read:?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// A read that never reaches a verdict is unavailable after every
+    /// attempt; one that fails is not asked again.
+    #[tokio::test]
+    async fn a_manifest_read_gives_up_after_its_attempts_and_does_not_repeat_a_failure() {
+        let calls = std::sync::atomic::AtomicU32::new(0);
+        let read = read_until_decided(4, Duration::from_millis(1), || async {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Err("split".to_string()))
+        })
+        .await;
+        assert!(
+            matches!(read, Err(EcReadError::Unavailable { .. })),
+            "{read:?}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 4);
+
+        let failed = std::sync::atomic::AtomicU32::new(0);
+        let read = read_until_decided(4, Duration::from_millis(1), || async {
+            failed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(EcReadError::Unavailable {
+                reason: "the set has fewer nodes than its quorum".into(),
+            })
+        })
+        .await;
+        assert!(read.is_err());
+        assert_eq!(failed.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
     use std::collections::{HashMap, HashSet};
 
     use s4_cluster::{EcObjectRuntime, PoolId};
@@ -14123,6 +14448,28 @@ mod tests {
         // And an owner outside this node's view of the pool does not conjure
         // one: the fallback is the pool minus the owners, never the other way.
         assert_eq!(placement_fallback_nodes(&[NodeId(9)], pool.clone()), pool);
+    }
+
+    /// Each version of an object writes its placement as an operation of its
+    /// own: a replica takes a repeated operation for a retry and keeps what it
+    /// holds, so an overwrite that reused the first write's id never replaced
+    /// its record. A retry of one version stays one operation.
+    #[test]
+    fn every_version_writes_its_placement_as_its_own_operation() {
+        let object = EcObjectVersionKey::new("bucket".to_string(), "key".to_string(), None);
+        let id = |hlc: HlcTimestamp| {
+            derive_storage_operation_id(
+                deterministic_object_uuid(&object),
+                &small_placement_write_kind(hlc),
+                0,
+                0,
+                EcPlacementState::EcTranscodeQueued,
+            )
+        };
+        let first = HlcTimestamp::from_record(100, 0, 7);
+        let overwrite = HlcTimestamp::from_record(101, 0, 7);
+        assert_ne!(id(first), id(overwrite));
+        assert_eq!(id(first), id(first));
     }
 
     /// An owner that answers the batch call, one that does not, and a count of
@@ -18095,6 +18442,108 @@ mod tests {
             3,
         );
         EcOperationsService::open(dir, "ec", registry, builder, NodeId(1)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn pool_growth_keeps_the_inherited_set_available_on_old_owners_without_a_roster() {
+        use s4_cluster::pool_generation::PoolGenerationRecord;
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_with_labels(dir.path(), HashMap::new());
+        let record = PoolGenerationRecord::initial(PoolId(9), vec![NodeId(1)])
+            .unwrap()
+            .configure(vec![NodeId(1), NodeId(2)])
+            .unwrap();
+        service.configure_pool_generation(record);
+        assert!(service.read_erasure_set_roster().await.unwrap().sets.is_empty());
+    }
+
+    /// A node joining a growing pool asks the old owners for the roster, and
+    /// a read quorum answering that none was ever published is an answer: the
+    /// pool has its inherited set alone. Before, the node waited for a roster
+    /// that did not exist and refused to start, so no pool with one set could
+    /// grow (scenario 61, group G; scenario 45).
+    #[tokio::test]
+    async fn pool_growth_takes_the_quorum_answer_that_no_roster_was_published() {
+        use s4_cluster::pool_generation::PoolGenerationRecord;
+        use s4_cluster::{
+            ClusterConfig, GossipHandle, HintedHandoffConfig, HintedHandoffManager, HybridClock,
+            NodeClient, NodeClientConfig, PlacementRouter, QuorumReadCoordinator,
+            QuorumWriteCoordinator, ReadRepairService, ReadTimeouts, WriteTimeouts,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let service = Arc::new(service_with_labels(&dir.path().join("ec"), HashMap::new()));
+        let engine = s4_core::storage::BitcaskStorageEngine::open(
+            dir.path().join("volumes"),
+            dir.path().join("metadata_db"),
+            10 * 1024 * 1024,
+            4096,
+            false,
+            s4_core::storage::IndexOptions {
+                version_digests: true,
+            },
+        )
+        .await
+        .unwrap();
+        let storage: Arc<dyn StorageEngine> = Arc::new(engine);
+        let gossip = Arc::new(GossipHandle::new_for_testing(HashMap::new()));
+        let rpc_client = Arc::new(NodeClient::new(gossip, NodeClientConfig::default()));
+        let router = Arc::new(PlacementRouter::single_node(NodeId(1)));
+        let clock = Arc::new(HybridClock::new(NodeId(1)));
+        let config = ClusterConfig::default();
+        let write = Arc::new(QuorumWriteCoordinator::new(
+            NodeId(1),
+            storage.clone(),
+            rpc_client.clone(),
+            router.clone(),
+            clock.clone(),
+            Arc::new(HintedHandoffManager::new(
+                HintedHandoffConfig::new(dir.path().join("hints")),
+                rpc_client.clone(),
+            )),
+            &config,
+            WriteTimeouts::default(),
+        ));
+        let read = Arc::new(QuorumReadCoordinator::new(
+            NodeId(1),
+            storage.clone(),
+            rpc_client.clone(),
+            router,
+            clock,
+            Arc::new(ReadRepairService::start_with_capacity(
+                rpc_client.clone(),
+                16,
+            )),
+            &config,
+            ReadTimeouts::default(),
+        ));
+        service.configure_read_runtime(read, write, storage, rpc_client, config.epoch);
+        let joining = PoolGenerationRecord::initial(PoolId(9), vec![NodeId(2)])
+            .unwrap()
+            .configure(vec![NodeId(2), NodeId(1)])
+            .unwrap();
+        service.configure_pool_generation(joining);
+        assert!(service.waits_for_old_roster());
+        let roster = service.read_erasure_set_roster().await.unwrap();
+        assert_eq!(roster, EcErasureSetRoster::empty(9));
+    }
+
+    #[tokio::test]
+    async fn pool_growth_without_a_roster_cache_waits_instead_of_inventing_an_empty_roster() {
+        use s4_cluster::pool_generation::PoolGenerationRecord;
+        let dir = tempfile::tempdir().unwrap();
+        let service = service_with_labels(dir.path(), HashMap::new());
+        assert!(service.read_erasure_set_roster().await.unwrap().sets.is_empty());
+        let generation = PoolGenerationRecord::initial(PoolId(9), vec![NodeId(2)])
+            .unwrap()
+            .configure(vec![NodeId(2), NodeId(1)])
+            .unwrap();
+        service.configure_pool_generation(generation);
+        let error = service.read_erasure_set_roster().await.err().unwrap().into_cluster_error();
+        assert!(matches!(error, ClusterError::Unavailable(_)), "{error}");
+        assert!(error.to_string().contains("waiting for the old owners"));
+        let cached = EcErasureSetRoster::empty(9);
+        service.metadata.put_erasure_set_roster(&cached).await.unwrap();
+        assert_eq!(service.read_erasure_set_roster().await.unwrap(), cached);
     }
 
     /// EC2-ZONE-03-001, the operator's path: a repair queued through the admin

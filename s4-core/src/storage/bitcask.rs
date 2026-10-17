@@ -43,13 +43,13 @@
 
 use crate::error::StorageError;
 use crate::storage::engine::{
-    is_force_physical_write, DeleteMarkerEntry, DeleteResult, ListVersionsResult, ObjectVersion,
-    FORCE_PHYSICAL_WRITE_METADATA_KEY,
+    is_force_physical_write, DeleteMarkerEntry, DeleteResult, KeyVersion, ListVersionsResult,
+    ObjectVersion, PutOutcome, FORCE_PHYSICAL_WRITE_METADATA_KEY, REPAIRED_ETAG_METADATA_KEY,
 };
 use crate::storage::journal::JournalEventType;
 use crate::storage::{
-    generate_version_id, BatchAction, BatchOp, Deduplicator, IndexDb, KeyspaceId, MetadataJournal,
-    VersionList, VolumeReader, VolumeWriter, NULL_VERSION_ID,
+    generate_version_id, BatchAction, BatchOp, Deduplicator, IndexDb, IndexOptions, KeyspaceId,
+    MetadataJournal, VersionList, VolumeReader, VolumeWriter, NULL_VERSION_ID,
 };
 use crate::types::composite::{
     BlobId, BlobLocation, BlobRefEntry, CompositeManifest, ManifestSegmentRef, MultipartPartRecord,
@@ -184,11 +184,11 @@ pub struct BitcaskStorageEngine {
     /// Volume writer (protected by RwLock for concurrent access)
     volume_writer: Arc<RwLock<VolumeWriter>>,
     /// Index database
-    index_db: Arc<IndexDb>,
+    pub(super) index_db: Arc<IndexDb>,
     /// Disk-backed deduplicator (fjall keyspace, no locking required).
     deduplicator: Deduplicator,
     /// Metadata journal for ordered mutation logging (Phase 5).
-    journal: MetadataJournal,
+    pub(super) journal: Arc<MetadataJournal>,
     /// Threshold for inline storage (default: 4KB).
     ///
     /// Phase 5: No longer used for new writes (all objects go to volumes).
@@ -218,6 +218,31 @@ impl BitcaskStorageEngine {
         inline_threshold: usize,
         strict_sync: bool,
     ) -> Result<Self, StorageError> {
+        Self::open(
+            volumes_dir,
+            metadata_path,
+            max_volume_size,
+            inline_threshold,
+            strict_sync,
+            IndexOptions::default(),
+        )
+        .await
+    }
+
+    /// Opens a Bitcask storage engine whose index is opened with `index_options`
+    /// ([`IndexDb::open`]); [`new`](Self::new) takes the defaults.
+    ///
+    /// A cluster node keeps version digests: they are settled, rebuilt if
+    /// needed, before this returns, and before the automatic recovery below,
+    /// whose writes then keep them.
+    pub async fn open(
+        volumes_dir: impl Into<PathBuf>,
+        metadata_path: impl Into<PathBuf>,
+        max_volume_size: u64,
+        inline_threshold: usize,
+        strict_sync: bool,
+        index_options: IndexOptions,
+    ) -> Result<Self, StorageError> {
         let volumes_dir = volumes_dir.into();
         let metadata_path = metadata_path.into();
 
@@ -226,7 +251,7 @@ impl BitcaskStorageEngine {
         let volume_writer = Arc::new(RwLock::new(volume_writer));
 
         // Create index database
-        let index_db = Arc::new(IndexDb::new(&metadata_path)?);
+        let index_db = Arc::new(IndexDb::open(&metadata_path, index_options)?);
 
         // Create disk-backed deduplicator using the fjall dedup keyspace (per-PG scoped in Phase 6).
         // If the keyspace is empty (first startup after Phase 4 migration),
@@ -244,15 +269,18 @@ impl BitcaskStorageEngine {
         }
 
         // Initialize metadata journal (Phase 5, PG-aware in Phase 6).
-        let journal = MetadataJournal::new(
+        let journal = Arc::new(MetadataJournal::new(
             index_db.journal_keyspace(),
             crate::storage::placement::PlacementGroupId::LOCAL,
-        )?;
+        )?);
 
-        // Auto-detect metadata loss and trigger recovery.
-        // If objects keyspace is empty but volume files exist, the metadata
-        // database was deleted or corrupted — run automatic recovery.
-        if index_db.is_objects_empty()? {
+        // Auto-detect metadata loss and trigger recovery: no record at all —
+        // no object, bucket marker or IAM record — while volume files exist
+        // means the metadata database was deleted or corrupted. Every object
+        // deleted is no loss: the buckets and IAM records are still there,
+        // and a recovery from the journal would put back records that
+        // compaction has moved since.
+        if index_db.has_no_records()? {
             let has_volumes = {
                 let mut found = false;
                 if let Ok(mut entries) = tokio::fs::read_dir(&volumes_dir).await {
@@ -282,6 +310,12 @@ impl BitcaskStorageEngine {
                     "Automatic recovery complete: {} records restored",
                     recovered
                 );
+                // The restored records kept their digests on the way in, but
+                // a digest whose record was lost and not restored would stay.
+                if index_db.keeps_version_digests() {
+                    let records = index_db.rebuild_version_digests().await?;
+                    tracing::info!("Version digests rebuilt after the recovery: {records} records");
+                }
             }
         }
 
@@ -296,7 +330,7 @@ impl BitcaskStorageEngine {
             let all_records = index_db.list_objects("", usize::MAX).await?;
             let mut count = 0u64;
             for (_, record) in &all_records {
-                if record.file_id == u32::MAX {
+                if record.file_id == u32::MAX && !record.is_delete_marker {
                     count += 1;
                 }
             }
@@ -485,6 +519,12 @@ impl BitcaskStorageEngine {
         &self.journal
     }
 
+    /// The metadata journal, shared: the compactor journals the records it
+    /// moves through the same sequence as every other mutation.
+    pub fn journal_handle(&self) -> Arc<MetadataJournal> {
+        self.journal.clone()
+    }
+
     // ========================================================================
     // Compaction support — internal accessors for s4-compactor
     // ========================================================================
@@ -591,6 +631,39 @@ impl BitcaskStorageEngine {
             .store(orphaned_count, Ordering::Relaxed);
 
         Ok(orphaned_count)
+    }
+
+    /// Removes every tombstone from the index and returns how many there were.
+    ///
+    /// The rollback step for a data directory that is about to be opened by a
+    /// release from before tombstones: such a release reads a tombstone as a
+    /// delete marker and answers a read of the key with an error instead of
+    /// "not found". Run on a stopped node; the key of each tombstone is left
+    /// absent, as a delete left it before tombstones existed. Versioned delete
+    /// markers are not tombstones and stay.
+    pub async fn purge_tombstones(&self) -> Result<u64, StorageError> {
+        const BATCH: usize = 1000;
+        let keys = self.index_db.tombstone_keys().await?;
+        for chunk in keys.chunks(BATCH) {
+            let mut ops = Vec::with_capacity(chunk.len() * 2);
+            for full_key in chunk {
+                let (keyspace, stripped_key) = self.index_db.route_key_id(full_key);
+                ops.push(BatchOp {
+                    keyspace,
+                    action: BatchAction::Delete(stripped_key.as_bytes().to_vec()),
+                });
+                let (bucket, key) = full_key.split_once('/').unwrap_or((full_key.as_str(), ""));
+                ops.push(
+                    self.journal.make_journal_entry_op(JournalEventType::ObjectDelete {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                        version_id: None,
+                    })?,
+                );
+            }
+            self.index_db.batch_write(ops).await?;
+        }
+        Ok(keys.len() as u64)
     }
 
     // ========================================================================
@@ -880,6 +953,7 @@ impl BitcaskStorageEngine {
         // Extract cluster HLC fields from metadata (passed by coordinator/replica
         // to achieve atomic HLC stamping in the same batch as the object write).
         // These reserved keys are stripped before persisting user-visible metadata.
+        let mut repaired_etag = None;
         for (k, v) in metadata {
             match k.as_str() {
                 "_s4_hlc_wall" => {
@@ -903,11 +977,21 @@ impl BitcaskStorageEngine {
                     }
                 }
                 FORCE_PHYSICAL_WRITE_METADATA_KEY => {}
+                REPAIRED_ETAG_METADATA_KEY => repaired_etag = Some(v),
                 _ => {
                     record.metadata.insert(k.clone(), v.clone());
                 }
             }
         }
+        // A copy repaired onto this replica keeps the ETag of its version;
+        // only a replicated write, which carries an HLC, may say what it is.
+        let etag = match repaired_etag {
+            Some(repaired) if record.hlc_timestamp > 0 && !repaired.is_empty() => {
+                record.etag = repaired.clone();
+                repaired.clone()
+            }
+            _ => etag,
+        };
 
         Ok((record, etag, dedup_op))
     }
@@ -1529,16 +1613,6 @@ impl BitcaskStorageEngine {
         let part_value = bincode::serialize(&part_record)
             .map_err(|e| StorageError::Serialization(e.to_string()))?;
 
-        // Create or update BlobRefEntry (increment staged ref count)
-        let blob_ref = self.get_or_create_blob_ref(&blob_id, final_vol, final_off)?;
-        let updated_ref = BlobRefEntry {
-            location: blob_ref.location,
-            ref_count_committed: blob_ref.ref_count_committed,
-            ref_count_staged: blob_ref.ref_count_staged + 1,
-        };
-        let blob_ref_value = bincode::serialize(&updated_ref)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-
         let dedup_op = self.deduplicator.make_register_op(content_hash, final_vol, final_off);
 
         // Check if this part_number was already uploaded (overwrite case).
@@ -1548,19 +1622,15 @@ impl BitcaskStorageEngine {
                 keyspace: KeyspaceId::MultipartParts,
                 action: BatchAction::Put(part_key.as_bytes().to_vec(), part_value),
             },
-            BatchOp {
-                keyspace: KeyspaceId::BlobRefs,
-                action: BatchAction::Put(blob_id.as_bytes().to_vec(), blob_ref_value),
-            },
+            // Create or update BlobRefEntry (increment staged ref count)
+            blob_ref_op(&blob_id, 0, 1, Some((final_vol, final_off))),
             dedup_op,
         ];
 
         // Handle part overwrite: decrement old part's staged ref and dedup
         if let Some(old_part) = self.get_multipart_part(upload_id, part_number)? {
             if old_part.blob_id != blob_id {
-                if let Some(old_ref_op) = self.decrement_staged_ref_op(&old_part.blob_id)? {
-                    ops.push(old_ref_op);
-                }
+                ops.push(blob_ref_op(&old_part.blob_id, 0, -1, None));
                 ops.push(self.deduplicator.make_unregister_op(&old_part.physical_hash));
             }
         }
@@ -1613,28 +1683,62 @@ impl BitcaskStorageEngine {
         Ok(parts)
     }
 
-    // -- BlobRef helpers ------------------------------------------------------
-
-    /// Gets or creates a BlobRefEntry for a blob.
-    fn get_or_create_blob_ref(
+    /// A page of the multipart upload sessions this node holds, in upload ID
+    /// order: those after `after` when given, at most `limit` of them.
+    ///
+    /// The move of a grown pool walks them this way to hand open uploads to
+    /// their new replicas; a page is read on its own.
+    pub fn list_multipart_sessions_after(
         &self,
-        blob_id: &BlobId,
-        volume_id: u32,
-        offset: u64,
-    ) -> Result<BlobRefEntry, StorageError> {
-        let ks = self.index_db.blob_refs_keyspace();
-        match ks.get(blob_id.as_bytes()) {
-            Ok(Some(value)) => {
-                bincode::deserialize(&value).map_err(|e| StorageError::Serialization(e.to_string()))
-            }
-            Ok(None) => Ok(BlobRefEntry {
-                location: BlobLocation { volume_id, offset },
-                ref_count_committed: 0,
-                ref_count_staged: 0,
-            }),
-            Err(e) => Err(StorageError::Database(e.to_string())),
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<MultipartUploadSession>, StorageError> {
+        let ks = self.index_db.multipart_sessions_keyspace();
+        let start = match after {
+            Some(after) => std::ops::Bound::Excluded(after.as_bytes().to_vec()),
+            None => std::ops::Bound::Unbounded,
+        };
+        let mut sessions = Vec::new();
+        for guard in ks.range::<Vec<u8>, _>((start, std::ops::Bound::Unbounded)).take(limit) {
+            let (_, value) =
+                guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
+            sessions.push(
+                bincode::deserialize(&value)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?,
+            );
         }
+        Ok(sessions)
     }
+
+    /// The bytes of one uploaded part, with its record, checked against the
+    /// record's CRC32 and SHA-256 before they are returned: a part that rotted
+    /// on this node is an error, never a copy for another replica.
+    pub async fn read_multipart_part(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+    ) -> Result<(MultipartPartRecord, Vec<u8>), StorageError> {
+        let record = self.get_multipart_part(upload_id, part_number)?.ok_or_else(|| {
+            StorageError::InvalidData(format!(
+                "Multipart part {part_number} is missing locally for upload {upload_id}"
+            ))
+        })?;
+        let location = self.resolve_blob_location(&record.blob_id)?;
+        let reader = VolumeReader::new(&self.volumes_dir);
+        let (_header, _key, data) = reader.read_blob(location.volume_id, location.offset).await?;
+        let sha256: [u8; 32] = sha2::Sha256::digest(&data).into();
+        if data.len() as u64 != record.size
+            || crc32fast::hash(&data) != record.crc32
+            || sha256 != record.physical_hash
+        {
+            return Err(StorageError::ChecksumMismatch {
+                key: format!("{upload_id}#{part_number}"),
+            });
+        }
+        Ok((record, data))
+    }
+
+    // -- BlobRef helpers ------------------------------------------------------
 
     /// Reads an existing BlobRefEntry. Multipart completion must never create
     /// placeholder refs for selected parts; missing refs indicate local
@@ -1650,47 +1754,30 @@ impl BitcaskStorageEngine {
         bincode::deserialize(&value).map_err(|e| StorageError::Serialization(e.to_string()))
     }
 
-    /// Creates a batch op to decrement staged ref count for a blob.
-    /// Returns None if the blob ref doesn't exist.
-    fn decrement_staged_ref_op(&self, blob_id: &BlobId) -> Result<Option<BatchOp>, StorageError> {
-        let ks = self.index_db.blob_refs_keyspace();
-        match ks.get(blob_id.as_bytes()) {
-            Ok(Some(value)) => {
-                let mut entry: BlobRefEntry = bincode::deserialize(&value)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                entry.ref_count_staged = entry.ref_count_staged.saturating_sub(1);
-                let new_value = bincode::serialize(&entry)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                Ok(Some(BatchOp {
-                    keyspace: KeyspaceId::BlobRefs,
-                    action: BatchAction::Put(blob_id.as_bytes().to_vec(), new_value),
-                }))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(StorageError::Database(e.to_string())),
-        }
-    }
-
-    /// Creates a batch operation to decrement the committed ref count for a blob.
-    fn decrement_committed_ref_op(
+    /// The batch operations that release the data `record` holds, for a batch
+    /// that takes the record out of the index or replaces it.
+    ///
+    /// A composite object gives up its segment and manifest references, a
+    /// blob its dedup reference. An erasure-coded record, a delete marker, a
+    /// tombstone and a legacy inline object hold none.
+    pub(super) async fn data_release_ops(
         &self,
-        blob_id: &BlobId,
-    ) -> Result<Option<BatchOp>, StorageError> {
-        let ks = self.index_db.blob_refs_keyspace();
-        match ks.get(blob_id.as_bytes()) {
-            Ok(Some(value)) => {
-                let mut entry: BlobRefEntry = bincode::deserialize(&value)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                entry.ref_count_committed = entry.ref_count_committed.saturating_sub(1);
-                let new_value = bincode::serialize(&entry)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                Ok(Some(BatchOp {
-                    keyspace: KeyspaceId::BlobRefs,
-                    action: BatchAction::Put(blob_id.as_bytes().to_vec(), new_value),
-                }))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(StorageError::Database(e.to_string())),
+        record: &IndexRecord,
+    ) -> Result<Vec<BatchOp>, StorageError> {
+        if record.is_erasure_coded() {
+            // The blob reference was already released when the data moved to
+            // the pool. Releasing it a second time would decrement a count
+            // this record no longer holds, and take the blob away from
+            // whichever object still does.
+            Ok(Vec::new())
+        } else if record.is_composite() {
+            self.composite_delete_ref_ops(record).await
+        } else if record.file_id != u32::MAX {
+            Ok(vec![self
+                .deduplicator
+                .make_unregister_op(&record.content_hash)])
+        } else {
+            Ok(Vec::new())
         }
     }
 
@@ -1719,17 +1806,13 @@ impl BitcaskStorageEngine {
             };
             if let Some(manifest) = manifest {
                 for seg in &manifest.segments {
-                    if let Some(op) = self.decrement_committed_ref_op(&seg.blob_id)? {
-                        ops.push(op);
-                    }
+                    ops.push(blob_ref_op(&seg.blob_id, -1, 0, None));
                     // Also unregister segment from dedup keyspace so compactor
                     // sees dead blobs correctly (fixes orphaned dedup entries).
                     ops.push(self.deduplicator.make_unregister_op(&seg.physical_hash));
                 }
                 // Also decrement the manifest blob itself
-                if let Some(op) = self.decrement_committed_ref_op(&manifest_blob_id)? {
-                    ops.push(op);
-                }
+                ops.push(blob_ref_op(&manifest_blob_id, -1, 0, None));
             }
         }
         Ok(ops)
@@ -1871,6 +1954,8 @@ impl BitcaskStorageEngine {
                         record.operation_id = val;
                     }
                 }
+                // Instructions for `put_object`; a completion has its own ETag.
+                FORCE_PHYSICAL_WRITE_METADATA_KEY | REPAIRED_ETAG_METADATA_KEY => {}
                 _ => {
                     record.metadata.insert(k.clone(), v.clone());
                 }
@@ -1882,8 +1967,19 @@ impl BitcaskStorageEngine {
             part_count: selected_parts.len() as u32,
         });
 
-        // Build atomic batch with all operations:
+        // The last-writer-wins rule `put_object` applies: a completion that
+        // does not outrank what the key holds — a tombstone included — is not
+        // published. The upload ends as an abort would end it, so its parts do
+        // not stay staged; the manifest blob just written has no reference and
+        // goes with the next compaction.
         let full_key = self.make_key(bucket, key);
+        let existing = self.index_db.get(&full_key).await?;
+        if let Some(existing) = existing.as_ref().filter(|existing| existing.keeps_over(&record)) {
+            self.abort_multipart_native(upload_id).await?;
+            return Ok(existing.clone());
+        }
+
+        // Build atomic batch with all operations:
         let record_bytes =
             bincode::serialize(&record).map_err(|e| StorageError::Serialization(e.to_string()))?;
         let (keyspace, stripped_key) = self.index_db.route_key_id(&full_key);
@@ -1903,36 +1999,28 @@ impl BitcaskStorageEngine {
             })?,
         ];
 
-        // 3. Manifest blob ref (committed)
-        let manifest_ref = BlobRefEntry {
-            location: BlobLocation {
-                volume_id: manifest_vol,
-                offset: manifest_off,
-            },
-            ref_count_committed: 1,
-            ref_count_staged: 0,
-        };
-        let manifest_ref_value = bincode::serialize(&manifest_ref)
-            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-        ops.push(BatchOp {
-            keyspace: KeyspaceId::BlobRefs,
-            action: BatchAction::Put(manifest_blob_id.as_bytes().to_vec(), manifest_ref_value),
-        });
+        // The record this one replaces gives up its data in the same batch,
+        // as on every other write path. A blob it shares with the new object
+        // (a part of the same bytes) loses one reference and gains one.
+        if let Some(existing) = &existing {
+            ops.append(&mut self.data_release_ops(existing).await?);
+        }
 
-        // 4. Convert staged→committed refs for selected parts
+        // 3. Manifest blob ref (committed). An identical manifest written
+        // before (the same parts completed again under the same key) shares
+        // the blob id, and gains a reference rather than replacing its count.
+        ops.push(blob_ref_op(
+            &manifest_blob_id,
+            1,
+            0,
+            Some((manifest_vol, manifest_off)),
+        ));
+
+        // 4. Convert staged→committed refs for selected parts. Validated to
+        // exist above; two selected parts of the same bytes share one blob,
+        // which then gains two committed references.
         for part in selected_parts {
-            let blob_ref = self.get_existing_blob_ref(&part.blob_id)?;
-            let updated = BlobRefEntry {
-                location: blob_ref.location,
-                ref_count_committed: blob_ref.ref_count_committed + 1,
-                ref_count_staged: blob_ref.ref_count_staged.saturating_sub(1),
-            };
-            let value = bincode::serialize(&updated)
-                .map_err(|e| StorageError::Serialization(e.to_string()))?;
-            ops.push(BatchOp {
-                keyspace: KeyspaceId::BlobRefs,
-                action: BatchAction::Put(part.blob_id.as_bytes().to_vec(), value),
-            });
+            ops.push(blob_ref_op(&part.blob_id, 1, -1, None));
         }
 
         // 5. Delete session metadata
@@ -1953,9 +2041,7 @@ impl BitcaskStorageEngine {
             // 7. Decrement staged refs and unregister dedup for unselected parts
             let is_selected = selected_parts.iter().any(|sp| sp.part_number == part.part_number);
             if !is_selected {
-                if let Some(dec_op) = self.decrement_staged_ref_op(&part.blob_id)? {
-                    ops.push(dec_op);
-                }
+                ops.push(blob_ref_op(&part.blob_id, 0, -1, None));
                 // Unregister from dedup keyspace so compactor sees dead blobs.
                 ops.push(self.deduplicator.make_unregister_op(&part.physical_hash));
             }
@@ -1987,9 +2073,7 @@ impl BitcaskStorageEngine {
                 keyspace: KeyspaceId::MultipartParts,
                 action: BatchAction::Delete(part_key.as_bytes().to_vec()),
             });
-            if let Some(dec_op) = self.decrement_staged_ref_op(&part.blob_id)? {
-                ops.push(dec_op);
-            }
+            ops.push(blob_ref_op(&part.blob_id, 0, -1, None));
             // Unregister from dedup keyspace so compactor sees dead blobs.
             ops.push(self.deduplicator.make_unregister_op(&part.physical_hash));
         }
@@ -2042,6 +2126,40 @@ impl BitcaskStorageEngine {
     }
 }
 
+/// The batch operation that changes the reference counts of `blob_id` by
+/// `committed` and `staged`, creating its entry at `location` when it has
+/// none ([`BatchAction::AdjustBlobRef`]). It reads the counts inside the
+/// batch, under the lock that orders such reads, so concurrent batches and
+/// several changes in one batch all count.
+fn blob_ref_op(
+    blob_id: &BlobId,
+    committed: i64,
+    staged: i64,
+    location: Option<(u32, u64)>,
+) -> BatchOp {
+    BatchOp {
+        keyspace: KeyspaceId::BlobRefs,
+        action: BatchAction::AdjustBlobRef {
+            blob_id: blob_id.as_bytes().to_vec(),
+            committed,
+            staged,
+            location,
+        },
+    }
+}
+
+/// `bucket/key` entries of an index listing, as keys within `bucket`.
+fn strip_bucket(bucket: &str, entries: Vec<(String, IndexRecord)>) -> Vec<(String, IndexRecord)> {
+    let bucket_prefix = format!("{bucket}/");
+    entries
+        .into_iter()
+        .map(|(key, record)| match key.strip_prefix(&bucket_prefix) {
+            Some(key_in_bucket) => (key_in_bucket.to_string(), record),
+            None => (key, record),
+        })
+        .collect()
+}
+
 /// The error every local read path returns for an erasure-coded record.
 ///
 /// Such a record is a namespace entry: it describes the object but owns none of
@@ -2069,6 +2187,22 @@ impl StorageEngine for BitcaskStorageEngine {
         content_type: &str,
         metadata: &HashMap<String, String>,
     ) -> Result<String, StorageError> {
+        Ok(
+            match self.put_object_outcome(bucket, key, data, content_type, metadata).await? {
+                PutOutcome::Stored { etag } => etag,
+                PutOutcome::Superseded { by } => by.etag,
+            },
+        )
+    }
+
+    async fn put_object_outcome(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        content_type: &str,
+        metadata: &HashMap<String, String>,
+    ) -> Result<PutOutcome, StorageError> {
         let full_key = self.make_key(bucket, key);
 
         // Write object data and get dedup batch op
@@ -2077,27 +2211,15 @@ impl StorageEngine for BitcaskStorageEngine {
         let force_physical_write = is_force_physical_write(metadata);
         let existing = self.index_db.get(&full_key).await?;
 
-        // LWW guard: in cluster mode (HLC present), skip write if existing
-        // record has a newer HLC timestamp. This prevents a concurrent write
-        // with an older HLC from overwriting a version that arrived first.
-        if record.hlc_timestamp > 0 {
-            if let Some(existing) = &existing {
-                if existing.hlc_timestamp > 0 {
-                    let existing_ord = (
-                        existing.hlc_timestamp,
-                        existing.hlc_logical,
-                        existing.origin_node_id,
-                    );
-                    let new_ord = (
-                        record.hlc_timestamp,
-                        record.hlc_logical,
-                        record.origin_node_id,
-                    );
-                    if existing_ord >= new_ord {
-                        return Ok(existing.etag.clone());
-                    }
-                }
-            }
+        // LWW guard: in cluster mode (HLC present), skip the write if the
+        // existing record ranks at least as high (`VersionRank`). This keeps
+        // a concurrent write with an older HLC from overwriting a version that
+        // arrived first, and settles two versions of one HLC the same way on
+        // every replica.
+        if let Some(existing) = existing.as_ref().filter(|existing| existing.keeps_over(&record)) {
+            return Ok(PutOutcome::Superseded {
+                by: Box::new(existing.clone()),
+            });
         }
 
         // ATOMIC BATCH: object record + dedup registration + journal entry
@@ -2127,12 +2249,7 @@ impl StorageEngine for BitcaskStorageEngine {
         }
         if let Some(old) = &existing {
             if old.content_hash != record.content_hash {
-                if old.is_composite() {
-                    let mut ref_ops = self.composite_delete_ref_ops(old).await?;
-                    ops.append(&mut ref_ops);
-                } else if old.file_id != u32::MAX {
-                    ops.push(self.deduplicator.make_unregister_op(&old.content_hash));
-                }
+                ops.append(&mut self.data_release_ops(old).await?);
             }
         }
         ops.push(
@@ -2145,7 +2262,7 @@ impl StorageEngine for BitcaskStorageEngine {
         );
         self.index_db.batch_write(ops).await?;
 
-        Ok(etag)
+        Ok(PutOutcome::Stored { etag })
     }
 
     async fn get_object(
@@ -2155,14 +2272,15 @@ impl StorageEngine for BitcaskStorageEngine {
     ) -> Result<(Vec<u8>, IndexRecord), StorageError> {
         let full_key = self.make_key(bucket, key);
 
-        // Get metadata from index
-        let record =
-            self.index_db
-                .get(&full_key)
-                .await?
-                .ok_or_else(|| StorageError::ObjectNotFound {
-                    key: full_key.clone(),
-                })?;
+        // Get metadata from index; a tombstone is no object
+        let record = self
+            .index_db
+            .get(&full_key)
+            .await?
+            .filter(|record| !record.is_tombstone())
+            .ok_or_else(|| StorageError::ObjectNotFound {
+                key: full_key.clone(),
+            })?;
 
         if record.is_erasure_coded() {
             return Err(erasure_coded_data_is_remote(&full_key));
@@ -2199,20 +2317,8 @@ impl StorageEngine for BitcaskStorageEngine {
             action: BatchAction::Delete(stripped_key.as_bytes().to_vec()),
         }];
 
-        // Unregister from dedup if not inline; handle composite objects
         if let Some(record) = self.index_db.get(&full_key).await? {
-            if record.is_erasure_coded() {
-                // The blob reference was already released when the data moved to
-                // the pool. Releasing it a second time would decrement a count
-                // this record no longer holds, and take the blob away from
-                // whichever object still does.
-            } else if record.is_composite() {
-                // Composite object: decrement committed refs for all segments + manifest
-                let mut ref_ops = self.composite_delete_ref_ops(&record).await?;
-                ops.append(&mut ref_ops);
-            } else if record.file_id != u32::MAX {
-                ops.push(self.deduplicator.make_unregister_op(&record.content_hash));
-            }
+            ops.append(&mut self.data_release_ops(&record).await?);
         }
 
         // Journal entry
@@ -2253,15 +2359,7 @@ impl StorageEngine for BitcaskStorageEngine {
             keyspace,
             action: BatchAction::Delete(stripped_key.as_bytes().to_vec()),
         }];
-
-        if record.is_erasure_coded() {
-            // Data already released by the move to the pool; see `delete_object`.
-        } else if record.is_composite() {
-            let mut ref_ops = self.composite_delete_ref_ops(&record).await?;
-            ops.append(&mut ref_ops);
-        } else if record.file_id != u32::MAX {
-            ops.push(self.deduplicator.make_unregister_op(&record.content_hash));
-        }
+        ops.append(&mut self.data_release_ops(&record).await?);
 
         ops.push(
             self.journal.make_journal_entry_op(JournalEventType::ObjectDelete {
@@ -2273,6 +2371,155 @@ impl StorageEngine for BitcaskStorageEngine {
 
         self.index_db.batch_write(ops).await?;
         Ok(true)
+    }
+
+    async fn tombstone_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        hlc_timestamp: u64,
+        hlc_logical: u32,
+        origin_node_id: u128,
+    ) -> Result<bool, StorageError> {
+        if hlc_timestamp == 0 {
+            return Err(StorageError::InvalidOperation {
+                operation: "tombstone_object".to_string(),
+                reason: "a tombstone needs the HLC of its delete".to_string(),
+            });
+        }
+        let full_key = self.make_key(bucket, key);
+        let existing = self.index_db.get(&full_key).await?;
+
+        // The same last-writer-wins rule `put_object` applies: a record with an
+        // HLC is weighed against the delete, one stored without an HLC is not.
+        // At one HLC the delete outranks the object.
+        let tombstone = IndexRecord::new_tombstone(hlc_timestamp, hlc_logical, origin_node_id);
+        if existing.as_ref().is_some_and(|existing| existing.keeps_over(&tombstone)) {
+            return Ok(false);
+        }
+
+        let record_bytes = bincode::serialize(&tombstone)
+            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+        let (keyspace, stripped_key) = self.index_db.route_key_id(&full_key);
+        let mut ops = vec![BatchOp {
+            keyspace,
+            action: BatchAction::Put(stripped_key.as_bytes().to_vec(), record_bytes),
+        }];
+        if let Some(existing) = &existing {
+            ops.append(&mut self.data_release_ops(existing).await?);
+        }
+        // Journalled as the record it is, so that replay puts the tombstone
+        // back rather than leaving the key absent.
+        ops.push(
+            self.journal.make_journal_entry_op(JournalEventType::ObjectPut {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version_id: None,
+                record: tombstone,
+            })?,
+        );
+
+        self.index_db.batch_write(ops).await?;
+        Ok(true)
+    }
+
+    async fn gc_tombstones(
+        &self,
+        tombstones: &[crate::storage::TombstoneRef],
+    ) -> Result<u64, StorageError> {
+        let mut ops = Vec::with_capacity(tombstones.len() * 2);
+        let mut purged = 0u64;
+        let mut newest: Option<crate::storage::TombstoneHorizon> = None;
+        for tombstone in tombstones {
+            // The record as it stands now: a write or delete that reached the
+            // key since GC found the tombstone is never removed in its place.
+            let still_there = self.index_db.get(&tombstone.full_key).await?.is_some_and(|record| {
+                record.is_tombstone() && record.hlc_order() == Some(tombstone.hlc)
+            });
+            if !still_there {
+                continue;
+            }
+            // A tombstone holds no data, so there is nothing to release. The
+            // index removes the key's digest in the same batch.
+            let (keyspace, stripped_key) = self.index_db.route_key_id(&tombstone.full_key);
+            ops.push(BatchOp {
+                keyspace,
+                action: BatchAction::Delete(stripped_key.as_bytes().to_vec()),
+            });
+            let (bucket, key) =
+                tombstone.full_key.split_once('/').unwrap_or((tombstone.full_key.as_str(), ""));
+            ops.push(
+                self.journal.make_journal_entry_op(JournalEventType::ObjectDelete {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    version_id: None,
+                })?,
+            );
+            let (hlc_timestamp, hlc_logical, origin_node_id) = tombstone.hlc;
+            let horizon = crate::storage::TombstoneHorizon {
+                hlc_timestamp,
+                hlc_logical,
+                origin_node_id,
+            };
+            newest = Some(newest.map_or(horizon, |newest| newest.max(horizon)));
+            purged += 1;
+        }
+        if let Some(newest) = newest {
+            self.index_db.purge_tombstones(ops, newest).await?;
+        }
+        Ok(purged)
+    }
+
+    /// The later of the settled tombstone horizon and the tombstone purge
+    /// horizon: a delete up to either may have left nothing here, the first
+    /// because it came before tombstones, the second because GC removed it.
+    async fn tombstone_horizon(
+        &self,
+    ) -> Result<Option<crate::storage::TombstoneHorizon>, StorageError> {
+        if !self.index_db.keeps_version_digests() {
+            return Ok(None);
+        }
+        let Some(settled) = self.index_db.tombstone_horizon().await? else {
+            return Ok(None);
+        };
+        let purged = self.index_db.tombstone_purge_horizon().await?;
+        Ok(Some(purged.map_or(settled, |purged| settled.max(purged))))
+    }
+
+    async fn version_digests_in(
+        &self,
+        from: u64,
+        to: Option<u64>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<crate::storage::VersionDigestEntry>, StorageError> {
+        self.index_db.version_digests_in(from, to, after, limit).await
+    }
+
+    async fn key_version(&self, bucket: &str, key: &str) -> Result<KeyVersion, StorageError> {
+        Ok(
+            match self.index_db.get(&self.make_key(bucket, key)).await? {
+                Some(record) if record.is_tombstone() => KeyVersion::Tombstone(record),
+                Some(record) => KeyVersion::Live(record),
+                None => KeyVersion::Absent,
+            },
+        )
+    }
+
+    async fn list_objects_with_tombstones(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<Vec<(String, IndexRecord)>, StorageError> {
+        let bucket_prefix = format!("{bucket}/{prefix}");
+        let start_after = start_after.map(|start_after| format!("{bucket}/{start_after}"));
+        let results = self
+            .index_db
+            .list_after(&bucket_prefix, start_after.as_deref(), max_keys)
+            .await?;
+        Ok(strip_bucket(bucket, results))
     }
 
     async fn detach_object_data_if_hlc(
@@ -2458,10 +2705,15 @@ impl StorageEngine for BitcaskStorageEngine {
         }
 
         let full_key = self.make_key(bucket, key);
-        if self.index_db.get(&full_key).await?.is_some() {
+        if let Some(existing) = self.index_db.get(&full_key).await? {
             // Whatever the index holds is at least as new as the manifest we
-            // rebuilt this from, so it wins.
-            return Ok(false);
+            // rebuilt this from, so it wins — unless it is a tombstone older
+            // than the record: the key was deleted and written again since.
+            let deleted_before = existing.is_tombstone()
+                && record.hlc_order().is_some_and(|ord| existing.hlc_order() < Some(ord));
+            if !deleted_before {
+                return Ok(false);
+            }
         }
 
         let (keyspace, stripped_key) = self.index_db.route_key_id(&full_key);
@@ -2492,6 +2744,7 @@ impl StorageEngine for BitcaskStorageEngine {
         self.index_db
             .get(&full_key)
             .await?
+            .filter(|record| !record.is_tombstone())
             .ok_or(StorageError::ObjectNotFound { key: full_key })
     }
 
@@ -2502,19 +2755,8 @@ impl StorageEngine for BitcaskStorageEngine {
         max_keys: usize,
     ) -> Result<Vec<(String, IndexRecord)>, StorageError> {
         let bucket_prefix = format!("{}/{}", bucket, prefix);
-        let results = self.index_db.list(&bucket_prefix, max_keys).await?;
-
-        // Remove bucket prefix from keys in results
-        let results: Vec<(String, IndexRecord)> = results
-            .into_iter()
-            .map(|(key, record)| {
-                let key_without_bucket =
-                    key.strip_prefix(&format!("{}/", bucket)).unwrap_or(&key).to_string();
-                (key_without_bucket, record)
-            })
-            .collect();
-
-        Ok(results)
+        let results = self.index_db.list_live_after(&bucket_prefix, None, max_keys).await?;
+        Ok(strip_bucket(bucket, results))
     }
 
     async fn list_objects_after(
@@ -2528,20 +2770,9 @@ impl StorageEngine for BitcaskStorageEngine {
         let full_start_after = format!("{}/{}", bucket, start_after);
         let results = self
             .index_db
-            .list_after(&bucket_prefix, Some(&full_start_after), max_keys)
+            .list_live_after(&bucket_prefix, Some(&full_start_after), max_keys)
             .await?;
-
-        // Remove bucket prefix from keys in results
-        let results: Vec<(String, IndexRecord)> = results
-            .into_iter()
-            .map(|(key, record)| {
-                let key_without_bucket =
-                    key.strip_prefix(&format!("{}/", bucket)).unwrap_or(&key).to_string();
-                (key_without_bucket, record)
-            })
-            .collect();
-
-        Ok(results)
+        Ok(strip_bucket(bucket, results))
     }
 
     // ========================================================================
@@ -2978,11 +3209,16 @@ impl StorageEngine for BitcaskStorageEngine {
         let all_entries = self.index_db.list(&bucket_prefix, usize::MAX).await?;
 
         let mut unversioned_keys: Vec<String> = Vec::new();
-        for (full_key, _) in &all_entries {
+        for (full_key, record) in &all_entries {
             let key_part = full_key.strip_prefix(&format!("{}/", bucket)).unwrap_or(full_key);
 
             // Skip version record keys (contain #)
             if key_part.contains('#') {
+                continue;
+            }
+
+            // A tombstone is no object, and has no version to list
+            if record.is_tombstone() {
                 continue;
             }
 
@@ -3518,13 +3754,14 @@ impl StorageEngine for BitcaskStorageEngine {
         options: crate::storage::engine::ReadOptions,
     ) -> Result<crate::storage::engine::ObjectStream, StorageError> {
         let full_key = self.make_key(bucket, key);
-        let record =
-            self.index_db
-                .get(&full_key)
-                .await?
-                .ok_or_else(|| StorageError::ObjectNotFound {
-                    key: full_key.clone(),
-                })?;
+        let record = self
+            .index_db
+            .get(&full_key)
+            .await?
+            .filter(|record| !record.is_tombstone())
+            .ok_or_else(|| StorageError::ObjectNotFound {
+                key: full_key.clone(),
+            })?;
         self.open_record_stream(record, options).await
     }
 
@@ -3990,6 +4227,69 @@ impl BitcaskStorageEngine {
         Ok(())
     }
 
+    /// Opens exactly the migration snapshot, validating CRC/SHA even when
+    /// a completed multipart upload has no whole-object content hash.
+    /// The caller keeps the external read lock while consuming the stream.
+    pub async fn open_legacy_migration_stream(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected: &IndexRecord,
+    ) -> Result<crate::storage::engine::ObjectStream, StorageError> {
+        if self.index_db.get(&self.make_key(bucket, key)).await?.as_ref() != Some(expected) {
+            return Err(StorageError::InvalidOperation {
+                operation: "single-to-cluster migration".into(),
+                reason: "source snapshot changed before streaming".into(),
+            });
+        }
+        if expected.content_hash == [0; 32] {
+            let mut hasher = sha2::Sha256::new();
+            if expected.is_composite() {
+                let crate::types::composite::ObjectLayout::CompositeManifest {
+                    manifest_blob_id,
+                    ..
+                } = expected.effective_layout()
+                else {
+                    return Err(StorageError::InvalidData(
+                        "missing composite manifest".into(),
+                    ));
+                };
+                let manifest = self.load_composite_manifest(&manifest_blob_id).await?;
+                let mut size = 0u64;
+                for segment in &manifest.segments {
+                    let location = self.resolve_blob_location(&segment.blob_id)?;
+                    self.verify_blob_stream_and_feed_hash(
+                        location.volume_id,
+                        location.offset,
+                        Some(segment.size),
+                        Some(segment.crc32),
+                        Some(segment.physical_hash),
+                        &mut hasher,
+                    )
+                    .await?;
+                    size = size.saturating_add(segment.size);
+                }
+                if size != expected.size {
+                    return Err(StorageError::InvalidData(
+                        "migration composite size mismatch".into(),
+                    ));
+                }
+            } else if expected.file_id != u32::MAX {
+                self.verify_blob_stream_and_feed_hash(
+                    expected.file_id,
+                    expected.offset,
+                    Some(expected.size),
+                    None,
+                    None,
+                    &mut hasher,
+                )
+                .await?;
+            }
+        }
+        self.open_record_stream(expected.clone(), crate::storage::ReadOptions::default())
+            .await
+    }
+
     /// Opens a streaming reader for a given IndexRecord.
     ///
     /// Handles legacy inline objects, single-blob volume objects, and
@@ -4431,6 +4731,91 @@ mod tests {
             (second.file_id, second.offset)
         );
         assert!(!second.metadata.contains_key(FORCE_PHYSICAL_WRITE_METADATA_KEY));
+    }
+
+    /// A copy repaired onto a replica keeps the ETag of its version, given
+    /// with its HLC; without an HLC the key is no instruction. Either way it
+    /// never reaches the object's metadata.
+    #[tokio::test]
+    async fn a_repaired_copy_keeps_the_etag_it_is_given_only_with_an_hlc() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = BitcaskStorageEngine::new(
+            temp_dir.path().join("volumes"),
+            temp_dir.path().join("metadata"),
+            1024 * 1024,
+            4096,
+            false,
+        )
+        .await
+        .unwrap();
+        let multipart_etag = "\"9b2cf535f27731c974343645a3985328-2\"";
+        let with_hlc = HashMap::from([
+            (
+                REPAIRED_ETAG_METADATA_KEY.to_string(),
+                multipart_etag.to_string(),
+            ),
+            ("_s4_hlc_wall".to_string(), "10".to_string()),
+            ("_s4_hlc_logical".to_string(), "0".to_string()),
+            ("_s4_hlc_node_id".to_string(), "7".to_string()),
+        ]);
+        let etag = engine
+            .put_object("bucket", "repaired", b"two parts", "text/plain", &with_hlc)
+            .await
+            .unwrap();
+        assert_eq!(etag, multipart_etag);
+        let record = engine.head_object("bucket", "repaired").await.unwrap();
+        assert_eq!(record.etag, multipart_etag);
+        assert!(!record.metadata.contains_key(REPAIRED_ETAG_METADATA_KEY));
+
+        let without_hlc = HashMap::from([(
+            REPAIRED_ETAG_METADATA_KEY.to_string(),
+            multipart_etag.to_string(),
+        )]);
+        engine
+            .put_object("bucket", "plain", b"two parts", "text/plain", &without_hlc)
+            .await
+            .unwrap();
+        let record = engine.head_object("bucket", "plain").await.unwrap();
+        assert_ne!(record.etag, multipart_etag);
+        assert!(!record.metadata.contains_key(REPAIRED_ETAG_METADATA_KEY));
+    }
+
+    /// Two versions of one HLC: the one ranked higher (`VersionRank`) stays
+    /// whichever arrives first, and the same version again writes nothing.
+    /// Before, the first to arrive stayed, so replicas that took them in
+    /// another order never agreed.
+    #[tokio::test]
+    async fn versions_of_one_hlc_keep_the_one_ranked_higher() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = create_test_engine(&temp_dir).await;
+        let multipart_etag = "9b2cf535f27731c974343645a3985328-2";
+        let at_20 = |etag: Option<&str>| {
+            let mut metadata = HashMap::from([
+                ("_s4_hlc_wall".to_string(), "20".to_string()),
+                ("_s4_hlc_logical".to_string(), "0".to_string()),
+                ("_s4_hlc_node_id".to_string(), "7".to_string()),
+            ]);
+            if let Some(etag) = etag {
+                metadata.insert(REPAIRED_ETAG_METADATA_KEY.to_string(), etag.to_string());
+            }
+            metadata
+        };
+        for (first, second) in [(None, Some(multipart_etag)), (Some(multipart_etag), None)] {
+            let key = format!("first-{}", first.is_some());
+            for etag in [first, second] {
+                engine
+                    .put_object_outcome("bucket", &key, b"same bytes", "text/plain", &at_20(etag))
+                    .await
+                    .unwrap();
+            }
+            let record = engine.head_object("bucket", &key).await.unwrap();
+            assert_eq!(record.etag, multipart_etag, "{key}");
+            let again = engine
+                .put_object_outcome("bucket", &key, b"same bytes", "text/plain", &at_20(None))
+                .await
+                .unwrap();
+            assert!(matches!(again, PutOutcome::Superseded { .. }), "{key}");
+        }
     }
 
     /// Flip one byte of `needle` where it lies in a volume file, the way bit
@@ -5102,6 +5487,54 @@ mod tests {
         assert_eq!(data, b"shared-body");
     }
 
+    /// Overwriting a detached object must not release the blob a second time
+    /// either: the overwrite gives up what the old record holds, and a
+    /// namespace entry holds no reference.
+    #[tokio::test]
+    async fn overwriting_a_detached_record_releases_the_blob_only_once() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = BitcaskStorageEngine::new(
+            &temp_dir.path().join("volumes"),
+            &temp_dir.path().join("metadata_db"),
+            1024 * 1024,
+            4096,
+            false,
+        )
+        .await
+        .unwrap();
+
+        put_at_hlc(&engine, "bucket", "a.bin", b"shared-body", 10).await;
+        put_at_hlc(&engine, "bucket", "b.bin", b"shared-body", 20).await;
+        let content_hash = engine.head_object("bucket", "a.bin").await.unwrap().content_hash;
+        engine
+            .detach_object_data_if_hlc(
+                "bucket",
+                "a.bin",
+                10,
+                0,
+                1,
+                ObjectLayout::ErasureCoded {
+                    erasure_set_id: 1,
+                    topology_epoch: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        put_at_hlc(&engine, "bucket", "a.bin", b"another-body", 30).await;
+        assert_eq!(
+            engine
+                .deduplicator
+                .get_entry(&content_hash)
+                .unwrap()
+                .map(|entry| entry.ref_count),
+            Some(1),
+            "the surviving object must keep its reference to the shared blob"
+        );
+        let (data, _) = engine.get_object("bucket", "b.bin").await.unwrap();
+        assert_eq!(data, b"shared-body");
+    }
+
     /// Reconciliation writes an entry back, and never overwrites a live one.
     #[tokio::test]
     async fn restore_erasure_coded_entry_fills_a_gap_but_never_overwrites() {
@@ -5466,6 +5899,201 @@ mod tests {
         .unwrap()
     }
 
+    /// Writes of the same bytes under different keys at the same time each
+    /// count once in the shared dedup entry: a batch reads the count after
+    /// the batch before it committed, even when that batch is still waiting
+    /// for its fsync.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writes_of_the_same_bytes_all_count() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = Arc::new(create_test_engine(&temp_dir).await);
+        const WRITES: usize = 32;
+        let mut tasks = Vec::new();
+        for n in 0..WRITES {
+            let engine = engine.clone();
+            tasks.push(tokio::spawn(async move {
+                engine
+                    .put_object(
+                        "bucket",
+                        &format!("key-{n}"),
+                        b"shared body",
+                        "text/plain",
+                        &HashMap::new(),
+                    )
+                    .await
+                    .unwrap();
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let hash = engine.head_object("bucket", "key-0").await.unwrap().content_hash;
+        assert_eq!(
+            engine.deduplicator.get_entry(&hash).unwrap().map(|entry| entry.ref_count),
+            Some(WRITES as u32)
+        );
+    }
+
+    /// Uploads the parts `bodies` (numbered from 1) to a new upload of
+    /// `bucket/key` and completes it with all of them.
+    async fn complete_with_parts(
+        engine: &BitcaskStorageEngine,
+        upload_id: &str,
+        key: &str,
+        bodies: &[&[u8]],
+    ) -> Vec<MultipartPartRecord> {
+        engine
+            .create_multipart_session(upload_id, "bucket", key, "text/plain", &HashMap::new())
+            .await
+            .unwrap();
+        let mut parts = Vec::new();
+        for (index, body) in bodies.iter().enumerate() {
+            let part = engine
+                .upload_part_streaming(
+                    upload_id,
+                    index as u32 + 1,
+                    Box::new(std::io::Cursor::new(body.to_vec())),
+                    body.len() as u64,
+                )
+                .await
+                .unwrap();
+            parts.push(part.record);
+        }
+        engine.mark_session_completing(upload_id).await.unwrap();
+        engine
+            .complete_multipart_native(
+                "bucket",
+                key,
+                upload_id,
+                &parts,
+                "etag-2",
+                "text/plain",
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        parts
+    }
+
+    fn counts(engine: &BitcaskStorageEngine, blob_id: &BlobId) -> (u32, u32) {
+        let entry = engine.get_existing_blob_ref(blob_id).unwrap();
+        (entry.ref_count_committed, entry.ref_count_staged)
+    }
+
+    /// Two parts of the same bytes share one blob. Each is a reference of
+    /// its own: two staged while the upload is open, two committed once it is
+    /// complete, none once the object is deleted.
+    #[tokio::test]
+    async fn two_parts_of_the_same_bytes_count_twice() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = create_test_engine(&temp_dir).await;
+        let parts = complete_with_parts(&engine, "twins", "key.bin", &[b"same", b"same"]).await;
+        assert_eq!(parts[0].blob_id, parts[1].blob_id);
+        assert_eq!(counts(&engine, &parts[0].blob_id), (2, 0));
+
+        engine.delete_object("bucket", "key.bin").await.unwrap();
+        assert_eq!(counts(&engine, &parts[0].blob_id), (0, 0));
+    }
+
+    /// A multipart upload completed over an existing key releases what the
+    /// replaced record held: a plain object's dedup reference, a composite
+    /// object's manifest and segments. A segment the new object shares with
+    /// the old one keeps exactly the new object's reference.
+    #[tokio::test]
+    async fn a_completion_releases_the_record_it_replaces() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = create_test_engine(&temp_dir).await;
+        engine
+            .put_object(
+                "bucket",
+                "key.bin",
+                b"plain body",
+                "text/plain",
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let plain_hash = engine.head_object("bucket", "key.bin").await.unwrap().content_hash;
+
+        let first =
+            complete_with_parts(&engine, "first", "key.bin", &[b"shared", b"only-first"]).await;
+        assert!(
+            engine.deduplicator.get_entry(&plain_hash).unwrap().is_none(),
+            "the plain object's reference is released"
+        );
+        let first_manifest = engine
+            .head_object("bucket", "key.bin")
+            .await
+            .unwrap()
+            .composite_manifest_blob_id()
+            .unwrap();
+
+        let second =
+            complete_with_parts(&engine, "second", "key.bin", &[b"shared", b"only-second"]).await;
+        assert_eq!(first[0].blob_id, second[0].blob_id);
+        assert_eq!(
+            counts(&engine, &second[0].blob_id),
+            (1, 0),
+            "the shared segment"
+        );
+        assert_eq!(
+            counts(&engine, &first[1].blob_id),
+            (0, 0),
+            "the replaced segment"
+        );
+        assert_eq!(
+            counts(&engine, &first_manifest),
+            (0, 0),
+            "the replaced manifest"
+        );
+        assert_eq!(counts(&engine, &second[1].blob_id), (1, 0));
+    }
+
+    /// Uploads of the same bytes into different uploads at the same time
+    /// share one blob, and every one of them counts: the counts are read and
+    /// written inside the batch, under the lock that orders such batches.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_uploads_of_the_same_bytes_all_count() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = Arc::new(create_test_engine(&temp_dir).await);
+        const UPLOADS: u32 = 24;
+        for n in 0..UPLOADS {
+            engine
+                .create_multipart_session(
+                    &format!("upload-{n}"),
+                    "bucket",
+                    &format!("key-{n}"),
+                    "text/plain",
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap();
+        }
+        let mut tasks = Vec::new();
+        for n in 0..UPLOADS {
+            let engine = engine.clone();
+            tasks.push(tokio::spawn(async move {
+                engine
+                    .upload_part_streaming(
+                        &format!("upload-{n}"),
+                        1,
+                        Box::new(std::io::Cursor::new(b"the same bytes".to_vec())),
+                        14,
+                    )
+                    .await
+                    .unwrap()
+                    .record
+                    .blob_id
+            }));
+        }
+        let mut blob_ids = Vec::new();
+        for task in tasks {
+            blob_ids.push(task.await.unwrap());
+        }
+        assert!(blob_ids.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(counts(&engine, &blob_ids[0]), (0, UPLOADS));
+    }
+
     #[tokio::test]
     async fn test_native_multipart_session_lifecycle() {
         let temp_dir = TempDir::new().unwrap();
@@ -5579,6 +6207,59 @@ mod tests {
         assert_eq!(parts[0].size, 1024);
         assert_eq!(parts[1].size, 2048);
         assert_eq!(parts[2].size, 512);
+    }
+
+    /// Sessions are listed a page at a time in upload ID order, and a part is
+    /// read back only while its bytes match the CRC32 and SHA-256 of its
+    /// record: one rotted on disk is an error.
+    #[tokio::test]
+    async fn multipart_sessions_page_and_parts_read_back_only_while_intact() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = create_test_engine(&temp_dir).await;
+        for upload_id in ["upload-c", "upload-a", "upload-b"] {
+            engine
+                .create_multipart_session(
+                    upload_id,
+                    "bucket",
+                    upload_id,
+                    "text/plain",
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap();
+        }
+        let first = engine.list_multipart_sessions_after(None, 2).unwrap();
+        let ids: Vec<_> = first.iter().map(|s| s.upload_id.as_str()).collect();
+        assert_eq!(ids, ["upload-a", "upload-b"]);
+        let rest = engine.list_multipart_sessions_after(Some("upload-b"), 2).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].upload_id, "upload-c");
+        assert!(engine.list_multipart_sessions_after(Some("upload-c"), 2).unwrap().is_empty());
+
+        let body = b"part body that is read back".to_vec();
+        let uploaded = engine
+            .upload_part_streaming(
+                "upload-a",
+                1,
+                Box::new(std::io::Cursor::new(body.clone())),
+                body.len() as u64,
+            )
+            .await
+            .unwrap();
+        let (record, data) = engine.read_multipart_part("upload-a", 1).await.unwrap();
+        assert_eq!(data, body);
+        assert_eq!(record.physical_hash, uploaded.record.physical_hash);
+        assert!(engine.read_multipart_part("upload-a", 2).await.is_err());
+
+        // The part is the last blob written: its last byte is the volume's.
+        let volume = temp_dir.path().join("volumes").join("volume_000000.dat");
+        let mut bytes = std::fs::read(&volume).unwrap();
+        *bytes.last_mut().unwrap() ^= 0xff;
+        std::fs::write(&volume, bytes).unwrap();
+        assert!(matches!(
+            engine.read_multipart_part("upload-a", 1).await,
+            Err(StorageError::ChecksumMismatch { .. })
+        ));
     }
 
     #[tokio::test]
@@ -5833,6 +6514,81 @@ mod tests {
         assert!(engine.head_object("bucket", "key.bin").await.is_err());
     }
 
+    /// A completion carries the HLC of its commit, and last-writer-wins
+    /// weighs it like any write: older than the tombstone the key holds, it
+    /// is not published, and the upload ends without leaving its parts
+    /// staged; newer, it replaces the tombstone.
+    #[tokio::test]
+    async fn a_completion_older_than_the_tombstone_is_not_published() {
+        let temp_dir = TempDir::new().unwrap();
+        let engine = create_test_engine(&temp_dir).await;
+        engine.tombstone_object("bucket", "key.bin", 20, 0, 7).await.unwrap();
+
+        let complete_at = |upload_id: &'static str, wall: u64| {
+            let engine = &engine;
+            async move {
+                let metadata = HashMap::new();
+                engine
+                    .create_multipart_session(
+                        upload_id,
+                        "bucket",
+                        "key.bin",
+                        "text/plain",
+                        &metadata,
+                    )
+                    .await
+                    .unwrap();
+                let body = vec![wall as u8; 64];
+                let part = engine
+                    .upload_part_streaming(upload_id, 1, Box::new(std::io::Cursor::new(body)), 64)
+                    .await
+                    .unwrap()
+                    .record;
+                engine.mark_session_completing(upload_id).await.unwrap();
+                let mut metadata = HashMap::new();
+                metadata.insert("_s4_hlc_wall".to_string(), wall.to_string());
+                metadata.insert("_s4_hlc_logical".to_string(), "0".to_string());
+                metadata.insert("_s4_hlc_node_id".to_string(), "1".to_string());
+                let record = engine
+                    .complete_multipart_native(
+                        "bucket",
+                        "key.bin",
+                        upload_id,
+                        std::slice::from_ref(&part),
+                        "etag-1",
+                        "text/plain",
+                        &metadata,
+                    )
+                    .await
+                    .unwrap();
+                (record, part)
+            }
+        };
+
+        let (answered, part) = complete_at("older", 10).await;
+        assert!(
+            answered.is_tombstone(),
+            "the record the key keeps is the answer"
+        );
+        assert!(matches!(
+            engine.key_version("bucket", "key.bin").await.unwrap(),
+            KeyVersion::Tombstone(record) if record.hlc_timestamp == 20
+        ));
+        assert!(engine.get_multipart_session("older").await.is_err());
+        assert!(engine.list_multipart_parts("older").unwrap().is_empty());
+        assert_eq!(
+            engine.get_existing_blob_ref(&part.blob_id).unwrap().ref_count_staged,
+            0
+        );
+
+        let (published, _) = complete_at("newer", 30).await;
+        assert_eq!(published.hlc_timestamp, 30);
+        assert!(matches!(
+            engine.key_version("bucket", "key.bin").await.unwrap(),
+            KeyVersion::Live(record) if record.hlc_timestamp == 30
+        ));
+    }
+
     #[tokio::test]
     async fn test_native_multipart_head_object() {
         let temp_dir = TempDir::new().unwrap();
@@ -5877,5 +6633,426 @@ mod tests {
             record.metadata.get("custom-key"),
             Some(&"custom-value".to_string())
         );
+    }
+
+    // ---- Tombstones: the delete of a replicated key, kept as a version ----
+
+    mod tombstones {
+        use super::*;
+
+        /// The HLC triple of what the index holds for `key`, and whether it
+        /// is a tombstone; `None` when it holds nothing.
+        async fn version_of(engine: &BitcaskStorageEngine, key: &str) -> Option<(bool, u64)> {
+            match engine.key_version("bucket", key).await.unwrap() {
+                KeyVersion::Live(record) => Some((false, record.hlc_timestamp)),
+                KeyVersion::Tombstone(record) => Some((true, record.hlc_timestamp)),
+                KeyVersion::Absent => None,
+            }
+        }
+
+        const LIVE: bool = false;
+        const TOMBSTONE: bool = true;
+
+        async fn tombstone(engine: &BitcaskStorageEngine, key: &str, wall: u64) -> bool {
+            engine.tombstone_object("bucket", key, wall, 0, 1).await.unwrap()
+        }
+
+        /// One rule orders writes and deletes alike: the larger HLC wins,
+        /// whichever arrives first, and a repeat changes nothing.
+        #[tokio::test]
+        async fn a_tombstone_and_a_write_keep_whichever_is_newer() {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = create_test_engine(&temp_dir).await;
+
+            // A delete newer than the write replaces it; a write older than
+            // the delete does not come back; a newer one does.
+            put_at_hlc(&engine, "bucket", "deleted", b"v10", 10).await;
+            assert!(tombstone(&engine, "deleted", 20).await);
+            assert_eq!(version_of(&engine, "deleted").await, Some((TOMBSTONE, 20)));
+            put_at_hlc(&engine, "bucket", "deleted", b"v15", 15).await;
+            assert_eq!(version_of(&engine, "deleted").await, Some((TOMBSTONE, 20)));
+            put_at_hlc(&engine, "bucket", "deleted", b"v30", 30).await;
+            assert_eq!(version_of(&engine, "deleted").await, Some((LIVE, 30)));
+            let (data, _) = engine.get_object("bucket", "deleted").await.unwrap();
+            assert_eq!(data, b"v30");
+
+            // A delete older than the write leaves it; at one HLC the delete
+            // outranks the write (`VersionRank`), as every replica decides.
+            put_at_hlc(&engine, "bucket", "rewritten", b"v20", 20).await;
+            assert!(!tombstone(&engine, "rewritten", 10).await);
+            assert_eq!(version_of(&engine, "rewritten").await, Some((LIVE, 20)));
+            assert!(tombstone(&engine, "rewritten", 20).await);
+            assert_eq!(
+                version_of(&engine, "rewritten").await,
+                Some((TOMBSTONE, 20))
+            );
+            put_at_hlc(&engine, "bucket", "rewritten", b"v20", 20).await;
+            assert_eq!(
+                version_of(&engine, "rewritten").await,
+                Some((TOMBSTONE, 20))
+            );
+
+            // A key never written gets a tombstone too; a repeat or an older
+            // delete changes nothing, a newer delete replaces it.
+            assert!(tombstone(&engine, "never-written", 10).await);
+            assert!(!tombstone(&engine, "never-written", 10).await);
+            assert!(!tombstone(&engine, "never-written", 5).await);
+            assert_eq!(
+                version_of(&engine, "never-written").await,
+                Some((TOMBSTONE, 10))
+            );
+            assert!(tombstone(&engine, "never-written", 12).await);
+            assert_eq!(
+                version_of(&engine, "never-written").await,
+                Some((TOMBSTONE, 12))
+            );
+        }
+
+        /// A record stored without an HLC is not weighed against a delete,
+        /// as it is not weighed against a write; and a write without an HLC
+        /// replaces a tombstone, as it replaces any record. A tombstone
+        /// itself always has an HLC.
+        #[tokio::test]
+        async fn a_record_without_an_hlc_is_not_weighed_against_a_tombstone() {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = create_test_engine(&temp_dir).await;
+
+            engine
+                .put_object("bucket", "plain", b"no hlc", "text/plain", &HashMap::new())
+                .await
+                .unwrap();
+            assert!(tombstone(&engine, "plain", 1).await);
+            assert_eq!(version_of(&engine, "plain").await, Some((TOMBSTONE, 1)));
+
+            engine
+                .put_object(
+                    "bucket",
+                    "plain",
+                    b"no hlc again",
+                    "text/plain",
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(version_of(&engine, "plain").await, Some((LIVE, 0)));
+
+            let refused = engine.tombstone_object("bucket", "plain", 0, 0, 1).await;
+            assert!(
+                matches!(refused, Err(StorageError::InvalidOperation { .. })),
+                "{refused:?}"
+            );
+            assert_eq!(version_of(&engine, "plain").await, Some((LIVE, 0)));
+        }
+
+        /// Every read path answers a tombstone as an absent object; only the
+        /// listing that asks for tombstones sees it.
+        #[tokio::test]
+        async fn a_tombstone_answers_every_read_as_an_absent_object() {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = create_test_engine(&temp_dir).await;
+            put_at_hlc(&engine, "bucket", "gone", b"deleted bytes", 10).await;
+            put_at_hlc(&engine, "bucket", "kept", b"kept bytes", 10).await;
+            assert!(tombstone(&engine, "gone", 20).await);
+
+            let not_found = |result: Result<(), StorageError>| {
+                matches!(result, Err(StorageError::ObjectNotFound { .. }))
+            };
+            assert!(not_found(
+                engine.get_object("bucket", "gone").await.map(|_| ())
+            ));
+            assert!(not_found(
+                engine.head_object("bucket", "gone").await.map(|_| ())
+            ));
+            assert!(not_found(
+                engine
+                    .open_object_stream("bucket", "gone", crate::storage::ReadOptions::default())
+                    .await
+                    .map(|_| ())
+            ));
+
+            let keys = |entries: Vec<(String, IndexRecord)>| -> Vec<String> {
+                entries.into_iter().map(|(key, _)| key).collect()
+            };
+            assert_eq!(
+                keys(engine.list_objects("bucket", "", 100).await.unwrap()),
+                ["kept"]
+            );
+            assert_eq!(
+                keys(engine.list_objects_after("bucket", "", "a", 100).await.unwrap()),
+                ["kept"]
+            );
+            let with_tombstones =
+                engine.list_objects_with_tombstones("bucket", "", None, 100).await.unwrap();
+            let tombstoned: Vec<(&str, bool)> = with_tombstones
+                .iter()
+                .map(|(key, record)| (key.as_str(), record.is_tombstone()))
+                .collect();
+            assert_eq!(tombstoned, [("gone", true), ("kept", false)]);
+            assert_eq!(
+                keys(
+                    engine
+                        .list_objects_with_tombstones("bucket", "", Some("gone"), 100)
+                        .await
+                        .unwrap()
+                ),
+                ["kept"]
+            );
+
+            let stats = engine.get_stats().await.unwrap();
+            assert_eq!(stats.objects_count, 1);
+            assert_eq!(stats.storage_used_bytes, b"kept bytes".len() as u64);
+
+            let versions =
+                engine.list_object_versions("bucket", "", None, None, 100).await.unwrap();
+            let listed: Vec<&str> = versions.versions.iter().map(|v| v.key.as_str()).collect();
+            assert_eq!(listed, ["kept"]);
+            assert!(versions.delete_markers.is_empty());
+        }
+
+        /// Tombstones are skipped while a page is filled, not after: a page
+        /// holds `max_keys` objects whenever the bucket has that many more.
+        #[tokio::test]
+        async fn a_listing_page_counts_objects_only() {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = create_test_engine(&temp_dir).await;
+            for key in ["k1", "k2", "k3", "k4", "k5"] {
+                put_at_hlc(&engine, "bucket", key, key.as_bytes(), 10).await;
+            }
+            for key in ["k2", "k3"] {
+                assert!(tombstone(&engine, key, 20).await);
+            }
+
+            let page = engine.list_objects("bucket", "", 2).await.unwrap();
+            let page: Vec<&str> = page.iter().map(|(key, _)| key.as_str()).collect();
+            assert_eq!(page, ["k1", "k4"]);
+            let next = engine.list_objects_after("bucket", "", "k1", 2).await.unwrap();
+            let next: Vec<&str> = next.iter().map(|(key, _)| key.as_str()).collect();
+            assert_eq!(next, ["k4", "k5"]);
+        }
+
+        /// The record a tombstone replaces gives up its data in the same
+        /// batch, as a delete does: deduplication and compaction no longer
+        /// count it, and a blob another object shares stays.
+        #[tokio::test]
+        async fn a_tombstone_releases_the_data_of_the_record_it_replaces() {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = create_test_engine(&temp_dir).await;
+            put_at_hlc(&engine, "bucket", "alone", b"content of one", 10).await;
+            put_at_hlc(&engine, "bucket", "shared-1", b"content of two", 10).await;
+            put_at_hlc(&engine, "bucket", "shared-2", b"content of two", 10).await;
+            let alone = Deduplicator::compute_hash(b"content of one");
+            let shared = Deduplicator::compute_hash(b"content of two");
+            assert_eq!(
+                engine.deduplicator().get_entry(&shared).unwrap().unwrap().ref_count,
+                2
+            );
+
+            assert!(tombstone(&engine, "alone", 20).await);
+            assert!(tombstone(&engine, "shared-1", 20).await);
+
+            assert!(engine.deduplicator().get_entry(&alone).unwrap().is_none());
+            assert_eq!(
+                engine.deduplicator().get_entry(&shared).unwrap().unwrap().ref_count,
+                1
+            );
+            let (data, _) = engine.get_object("bucket", "shared-2").await.unwrap();
+            assert_eq!(data, b"content of two");
+
+            let live = engine.index_db().scan_live_content_hashes().await.unwrap();
+            assert_eq!(live, std::collections::HashSet::from([shared]));
+            let (referenced, manifests) = engine.index_db().scan_all_content_refs().await.unwrap();
+            assert_eq!(referenced, std::collections::HashSet::from([shared]));
+            assert!(manifests.is_empty());
+            assert_eq!(engine.index_db().count_inline_objects().await.unwrap(), 0);
+        }
+
+        /// A multipart object gives up its segment and manifest references.
+        #[tokio::test]
+        async fn a_tombstone_releases_a_multipart_object() {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = create_test_engine(&temp_dir).await;
+            let metadata = HashMap::from([
+                ("_s4_hlc_wall".to_string(), "10".to_string()),
+                ("_s4_hlc_logical".to_string(), "0".to_string()),
+                ("_s4_hlc_node_id".to_string(), "1".to_string()),
+            ]);
+            let upload_id = "tombstoned-multipart";
+            engine
+                .create_multipart_session(upload_id, "bucket", "parts", "text/plain", &metadata)
+                .await
+                .unwrap();
+            let part = engine
+                .upload_part_streaming(
+                    upload_id,
+                    1,
+                    Box::new(std::io::Cursor::new(vec![7u8; 256])),
+                    256,
+                )
+                .await
+                .unwrap();
+            engine.mark_session_completing(upload_id).await.unwrap();
+            engine
+                .complete_multipart_native(
+                    "bucket",
+                    "parts",
+                    upload_id,
+                    &[part.record],
+                    "etag-1",
+                    "text/plain",
+                    &metadata,
+                )
+                .await
+                .unwrap();
+            let record = engine.head_object("bucket", "parts").await.unwrap();
+            let manifest = record.composite_manifest_blob_id().unwrap();
+            assert!(engine.get_existing_blob_ref(&manifest).unwrap().is_live());
+
+            assert!(engine.tombstone_object("bucket", "parts", 20, 0, 1).await.unwrap());
+
+            assert!(!engine.get_existing_blob_ref(&manifest).unwrap().is_live());
+            assert_eq!(version_of(&engine, "parts").await, Some((TOMBSTONE, 20)));
+        }
+
+        /// A tombstone is in the journal as the record it is: replaying the
+        /// journal into an empty index puts it back, and reopening the
+        /// engine keeps it.
+        #[tokio::test]
+        async fn a_tombstone_survives_a_reopen_and_a_journal_replay() {
+            let temp_dir = TempDir::new().unwrap();
+            {
+                let engine = create_test_engine(&temp_dir).await;
+                put_at_hlc(&engine, "bucket", "gone", b"bytes", 10).await;
+                assert!(tombstone(&engine, "gone", 20).await);
+                assert!(tombstone(&engine, "never-written", 30).await);
+            }
+            let engine = create_test_engine(&temp_dir).await;
+            assert_eq!(version_of(&engine, "gone").await, Some((TOMBSTONE, 20)));
+
+            engine.index_db().objects_keyspace().clear().unwrap();
+            assert_eq!(version_of(&engine, "gone").await, None);
+            engine.recover_index().await.unwrap();
+            assert_eq!(version_of(&engine, "gone").await, Some((TOMBSTONE, 20)));
+            assert_eq!(
+                version_of(&engine, "never-written").await,
+                Some((TOMBSTONE, 30))
+            );
+            assert!(engine.head_object("bucket", "gone").await.is_err());
+        }
+
+        /// A versioned delete marker lives under `key#version_id` and is no
+        /// tombstone: the listing still returns it, for the S3 layer to hide
+        /// the key whose newest version it is.
+        #[tokio::test]
+        async fn a_versioned_delete_marker_is_still_listed() {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = create_test_engine(&temp_dir).await;
+            engine
+                .put_object_versioned(
+                    "bucket",
+                    "versioned",
+                    b"v1",
+                    "text/plain",
+                    &HashMap::new(),
+                    VersioningStatus::Enabled,
+                )
+                .await
+                .unwrap();
+            let deleted = engine
+                .delete_object_versioned("bucket", "versioned", None, VersioningStatus::Enabled)
+                .await
+                .unwrap();
+            assert!(deleted.delete_marker);
+
+            let listed = engine.list_objects("bucket", "", 100).await.unwrap();
+            let markers: Vec<&IndexRecord> = listed
+                .iter()
+                .filter(|(_, record)| record.is_delete_marker)
+                .map(|(_, record)| record)
+                .collect();
+            assert_eq!(markers.len(), 1, "{listed:?}");
+            assert!(!markers[0].is_tombstone());
+        }
+
+        /// A namespace entry rebuilt from an erasure-coded manifest replaces a
+        /// tombstone older than it — the key was deleted and written again —
+        /// and leaves a newer one, like any record it finds.
+        #[tokio::test]
+        async fn a_restored_namespace_entry_replaces_only_an_older_tombstone() {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = create_test_engine(&temp_dir).await;
+            let entry = |wall: u64| {
+                let mut record = IndexRecord::new(
+                    EXTERNAL_DATA_FILE_ID,
+                    0,
+                    5,
+                    [7u8; 32],
+                    "\"etag\"".into(),
+                    "text/plain".into(),
+                )
+                .into_erasure_coded(1, 1);
+                record.hlc_timestamp = wall;
+                record.origin_node_id = 1;
+                record
+            };
+            assert!(tombstone(&engine, "rewritten", 10).await);
+            assert!(tombstone(&engine, "deleted-after", 30).await);
+
+            assert!(engine
+                .restore_erasure_coded_entry("bucket", "rewritten", entry(20))
+                .await
+                .unwrap());
+            assert!(!engine
+                .restore_erasure_coded_entry("bucket", "deleted-after", entry(20))
+                .await
+                .unwrap());
+
+            assert_eq!(version_of(&engine, "rewritten").await, Some((LIVE, 20)));
+            assert_eq!(
+                version_of(&engine, "deleted-after").await,
+                Some((TOMBSTONE, 30))
+            );
+        }
+
+        /// The rollback pass removes tombstones, of objects and of bucket
+        /// markers alike, and nothing else.
+        #[tokio::test]
+        async fn purging_tombstones_leaves_objects_and_versioned_markers() {
+            let temp_dir = TempDir::new().unwrap();
+            let engine = create_test_engine(&temp_dir).await;
+            put_at_hlc(&engine, "bucket", "kept", b"kept", 10).await;
+            put_at_hlc(&engine, "bucket", "gone", b"gone", 10).await;
+            assert!(tombstone(&engine, "gone", 20).await);
+            assert!(engine
+                .tombstone_object("__system__", "__s4_bucket_marker_deleted", 20, 0, 1)
+                .await
+                .unwrap());
+            engine
+                .put_object_versioned(
+                    "bucket",
+                    "versioned",
+                    b"v1",
+                    "text/plain",
+                    &HashMap::new(),
+                    VersioningStatus::Enabled,
+                )
+                .await
+                .unwrap();
+            engine
+                .delete_object_versioned("bucket", "versioned", None, VersioningStatus::Enabled)
+                .await
+                .unwrap();
+
+            assert_eq!(engine.purge_tombstones().await.unwrap(), 2);
+
+            assert_eq!(version_of(&engine, "gone").await, None);
+            assert!(matches!(
+                engine.key_version("__system__", "__s4_bucket_marker_deleted").await.unwrap(),
+                KeyVersion::Absent
+            ));
+            assert_eq!(version_of(&engine, "kept").await, Some((LIVE, 10)));
+            let listed = engine.list_objects("bucket", "", 100).await.unwrap();
+            assert!(listed.iter().any(|(_, record)| record.is_delete_marker));
+            assert_eq!(engine.purge_tombstones().await.unwrap(), 0);
+        }
     }
 }

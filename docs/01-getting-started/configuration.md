@@ -14,8 +14,12 @@ This page is the complete reference. Feature pages link here rather than repeati
 | `S4_ACCESS_KEY_ID` | Access key for S3 authentication. Set to an empty value, it switches login with these keys off | Random dev key at every start | `myaccesskey` |
 | `S4_SECRET_ACCESS_KEY` | Secret key for S3 authentication. Set to an empty value, it switches login with these keys off | Random dev key at every start | `mysecretkey` |
 | `S4_ROOT_USERNAME` | Root admin username | `root` | `admin` |
-| `S4_ROOT_PASSWORD` | Root admin password (enables IAM when set) | None (IAM disabled) | `password12345` |
+| `S4_ROOT_PASSWORD` | Root admin password (enables IAM when set). Root is not stored: a new value takes effect at the next start and ends root's earlier sessions | None (IAM disabled) | `password12345` |
 | `S4_JWT_SECRET` | Secret that signs admin JWTs, at least 32 bytes. Required, and identical on every node, in cluster and gateway mode with IAM — see [Admin JWT Secret](#admin-jwt-secret) | Single node: random, generated at every start (admin sessions end on restart) | Output of `openssl rand -hex 32`, generated once |
+| `S4_JWT_LIFETIME_HOURS` | Lifetime of an admin JWT in hours | `24` | `8` |
+| `S4_IAM_ENCRYPTION_KEY` | Key the secrets of IAM users' S3 credentials are encrypted with, 32 bytes in hex. Identical on every node of a cluster — see [IAM Encryption Key](#iam-encryption-key) | Derived from `S4_JWT_SECRET`; without it, a key the node generates and keeps in its data directory | Output of `openssl rand -hex 32`, generated once |
+| `S4_IAM_ENCRYPTION_KEY_PREVIOUS` | The key `S4_IAM_ENCRYPTION_KEY` replaced: secrets encrypted with it are still read, and encrypted again with the new key | None | Output of `openssl rand -hex 32` |
+| `S4_IAM_AUDIT_RETENTION_DAYS` | How many days the audit log of IAM changes keeps an entry; `0` keeps every entry | `90` | `365` |
 | `S4_MAX_UPLOAD_SIZE` | Maximum upload size per request | `5GB` | `10GB`, `100MB`, `1024KB` |
 | `S4_TLS_CERT` | Path to TLS certificate (PEM) — enables HTTPS with `S4_TLS_KEY` | None (HTTP mode) | `/etc/ssl/certs/s4.pem` |
 | `S4_TLS_KEY` | Path to TLS private key (PEM) — enables HTTPS with `S4_TLS_CERT` | None (HTTP mode) | `/etc/ssl/private/s4-key.pem` |
@@ -37,6 +41,31 @@ Without `S4_JWT_SECRET` a single node generates a random secret at every start, 
 end on restart. Generate the value once and keep it: a value generated anew at every start or on
 every node behaves like no value at all.
 
+### IAM Encryption Key
+
+The server needs the secret of an IAM user's S3 credentials itself to check a request signature,
+so it keeps the secret, encrypted with AES-256-GCM. The key comes from, in this order:
+
+1. `S4_IAM_ENCRYPTION_KEY`;
+2. a key derived from `S4_JWT_SECRET`, so an existing deployment needs no new variable;
+3. a key a single node generates for itself and keeps in its data directory, when neither is set.
+   The secrets are then not readable from the data files alone, but whoever copies the whole data
+   directory can read them: set one of the variables above in production.
+
+Every node of a cluster must use the same key: a node with another key answers the S3 requests of
+the users whose secret it cannot read `503`, and the cluster health turns `critical` naming the
+node. A key that is not 32 bytes in hex stops the start.
+
+To replace the key, set the new one as `S4_IAM_ENCRYPTION_KEY` and the old one as
+`S4_IAM_ENCRYPTION_KEY_PREVIOUS` on every node, and restart the nodes. Once every node is up with
+the same key, the server encrypts every secret again with the new key by itself;
+`s4_iam_records_by_key_id` shows how many users are left under each key, and the old key can be
+removed once none is. Moving from the key derived from `S4_JWT_SECRET` to `S4_IAM_ENCRYPTION_KEY`
+needs no `_PREVIOUS`: the derived key stays readable while `S4_JWT_SECRET` is set. Changing
+`S4_JWT_SECRET` without `S4_IAM_ENCRYPTION_KEY` changes the derived key: set
+`S4_IAM_ENCRYPTION_KEY` first, wait until no user is left under the derived key, then change the
+JWT secret.
+
 ### Secrets from Files (`_FILE`)
 
 Every credential above can be read from a file instead of the environment: append `_FILE` to
@@ -51,6 +80,8 @@ the process environment or in a compose file kept in git.
 | `S4_ACCESS_KEY_ID` | `S4_ACCESS_KEY_ID_FILE` |
 | `S4_SECRET_ACCESS_KEY` | `S4_SECRET_ACCESS_KEY_FILE` |
 | `S4_JWT_SECRET` | `S4_JWT_SECRET_FILE` |
+| `S4_IAM_ENCRYPTION_KEY` | `S4_IAM_ENCRYPTION_KEY_FILE` |
+| `S4_IAM_ENCRYPTION_KEY_PREVIOUS` | `S4_IAM_ENCRYPTION_KEY_PREVIOUS_FILE` |
 
 The Enterprise licence has its own file variable, `S4_LICENSE_FILE` (see
 [Licensing](#licensing-enterprise-edition)).
@@ -74,6 +105,8 @@ A Docker Compose example is in [Docker Deployment](../08-deployment/docker.md#cr
 |----------|-------------|---------|---------|
 | `S4_LIFECYCLE_ENABLED` | Enable the lifecycle policy worker | `true` | `false` |
 | `S4_LIFECYCLE_INTERVAL_HOURS` | Lifecycle evaluation interval, in hours | `24` | `1`, `6`, `168` |
+| `S4_LIFECYCLE_INTERVAL_SECS` | The same interval in seconds; when set, `S4_LIFECYCLE_INTERVAL_HOURS` is not read | — | `600` |
+| `S4_LIFECYCLE_DAYS_AHEAD` | *Dev and testing only.* Evaluates lifecycle rules as if this many more days had passed, so that objects expire early; at most 36500, a larger value is taken as 36500. The node warns at start when it is set | `0` | `1` |
 | `S4_LIFECYCLE_DRY_RUN` | Log what would be deleted without deleting it | `false` | `true` |
 
 ## Volume Compaction
@@ -104,6 +137,7 @@ See [Clustering](../08-deployment/clustering.md) for how these fit together.
 | Variable | Description | Default | Example |
 |----------|-------------|---------|---------|
 | `S4_MODE` | Operating mode: `single`, `cluster`, `gateway` | `single` | `cluster` |
+| `S4_CLUSTER_MIGRATION_CONCURRENCY` | Single-mode records copied to their cluster replicas at once during [migration](../08-deployment/clustering.md#moving-from-single-mode). Must be positive | `4` | `2` |
 | `S4_CLUSTER_NAME` | Cluster name, for network isolation | `default` | `production` |
 | `S4_NODE_ID` | Human-readable node name (the internal UUID is generated) | Auto | `node-1` |
 | `S4_EXPECTED_NODE_IDENTITY` | Cluster identity (UUID) this data directory must belong to. Node replacement tool, not an everyday setting — see [Erasure Coding → Replacing a node](../04-features/erasure-coding.md#replacing-a-node) | unset | `0d3bb4d8-876d-4b6a-a27f-49a69d11d3ae` |
@@ -117,13 +151,25 @@ See [Clustering](../08-deployment/clustering.md) for how these fit together.
 | `S4_REPLICATION_FACTOR` | Replication factor N | `3` | `3` |
 | `S4_WRITE_QUORUM` | Write quorum W | `2` | `2` |
 | `S4_READ_QUORUM` | Read quorum R | `2` | `2` |
-| `S4_GC_GRACE_DAYS` | Tombstone GC grace period, in days | `7` | `7` |
+| `S4_BUCKET_METADATA_REPLICATION_FACTOR` | Replicas of each bucket's existence record and settings. Unset, the pool derives it from the failures it survives: as many as its data in a replicated pool, `2f + 1` in an erasure-coded one (5 for RS 4+2 on six nodes). A value below the derived one or above the pool's nodes stops the node from starting; a higher one is reached by the same move as the derived one, and a lower one later is refused. Must be the same on every node of the pool, or the move waits and the nodes log why. See [Federation → Buckets](../04-features/federation.md#buckets) | derived | `6` |
+| `S4_GC_GRACE_DAYS` | How long a tombstone of a replicated pool is kept at least, in days. It must be longer than `S4_MAX_REJOIN_DOWNTIME_DAYS` plus `S4_ANTI_ENTROPY_INTERVAL_SECS` times the other nodes of the pool plus 60.5 seconds (the replica write timeout and the tolerated clock skew), or the node does not start. The safety-margin calculation is checked for overflow; an overflow also refuses startup | `7` | `7` |
+| `S4_GC_GRACE_SECS` | The same grace period in seconds; when set, `S4_GC_GRACE_DAYS` is not read | — | `86400` |
+| `S4_TOMBSTONE_GC_INTERVAL_SECS` | Seconds between two passes of tombstone GC. A pass removes each tombstone older than the grace period that every other replica of its key has had, as the node's completed anti-entropy rounds show, with one write to disk per page of tombstones. Only full rounds advance the frontier, to their start minus 60.5 seconds; after a restart every other owner needs a new full round. Must be above 0 | `21600` | `3600` |
 | `S4_MAX_REJOIN_DOWNTIME_DAYS` | Maximum offline days before a returning node must rebuild before it serves erasure-coded reads. Also bounds the tombstone GC grace period. See [Erasure Coding → Coming back to the pool](../04-features/erasure-coding.md#coming-back-to-the-pool) | `3` | `3` |
-| `S4_ANTI_ENTROPY_INTERVAL_SECS` | Merkle tree exchange interval, in seconds. No effect yet: the anti-entropy rounds of a replicated pool are not started | `600` | `600` |
+| `S4_ANTI_ENTROPY_INTERVAL_SECS` | Seconds between two anti-entropy rounds of a node of a replicated pool. Each round compares the node with one peer, the peers taken in turn, and brings every key the two hold in different versions to its newest version. A live node below protocol 8 skips rounds; a live peer whose protocol is unknown retains its turn. Must be above 0 on a node that runs rounds; not checked on one with rounds switched off | `600` | `300` |
+| `S4_ANTI_ENTROPY_MAX_KEYS_PER_ROUND` | Most divergent keys one anti-entropy round settles; the next round with the same peer goes on from where this one stopped. Must be above 0 on a node that runs rounds | `1000` | `5000` |
+| `S4_ANTI_ENTROPY_ENABLED` | `false` stops the node from starting anti-entropy rounds; it still answers the rounds of its peers, but its own repair frontier and tombstone GC cannot advance. Set it on every node to stop anti-entropy in the whole pool. Accepts `true`, `1`, `yes`, `on` and `false`, `0`, `no`, `off` in any case; any other value stops the node from starting, with an error that names the variable | `true` | `false` |
+| `S4_REBALANCE_MAX_BYTES_PER_SEC` | Bytes of copies a node sends per second, at most, while a grown pool moves its keys to the new nodes. Must be above 0 | `67108864` | `33554432` |
+| `S4_REBALANCE_MAX_KEYS_PER_SEC` | Keys a node brings to the new nodes per second, at most, while a grown pool moves them. Must be above 0 | `500` | `200` |
+| `S4_REBALANCE_CONCURRENT_RANGES` | Ranges of the ring a node moves to the new nodes at the same time. Must be above 0 | `2` | `4` |
+| `S4_REBALANCE_MIN_FREE_RATIO` | Share of its disk a new node keeps free. A pool's growth does not move keys until every new node has room for its share of the pool with this share left over, and a node that falls below it receives nothing until it has room again; the node log names which node is short. At least 0 and below 1 | `0.10` | `0.2` |
 | `S4_SCRUBBER_FULL_SCAN_DAYS` | Full CRC32 scrub cycle, in days | `30` | `30` |
 | `S4_SCRUBBER_START_DELAY_SECS` | How long the scrubber waits after start before its first cycle. Healing a damaged blob means fetching a healthy copy from a peer, and a node that has just started has not finished hearing about its peers | `30` | `30` |
 | `S4_SCRUBBER_UNHEALED_RETRY_SECS` | How soon the scrubber runs again after a cycle that found damage it could not heal. A cycle that healed everything waits the full scan period | `300` | `300` |
-| `S4_HINT_TTL_HOURS` | How long a hint for a replica that missed a write is kept, in hours. After that only a quorum read brings the replica up to date — anti-entropy of a replicated pool is not started yet; `0` keeps no hints | `3` | `3` |
+| `S4_HINT_TTL_HOURS` | How long a hint for a replica that missed a write is kept, in hours. After that anti-entropy brings the replica up to date; `0` keeps no hints | `3` | `3` |
+| `S4_IAM_LEASE_SECS` | How long a node grants the lease of IAM changes for, in seconds: one change of users, keys or root's sessions at a time across the cluster. A node that stalls or is cut off in the middle of a change frees the lease after this long. Values below 1 count as 1. Set the same value on every node | `5` | `5` |
+| `S4_IAM_LEASE_WAIT_SECS` | How long a change of IAM waits while another change holds the lease, in seconds; after that it answers `503` with `Retry-After` | `10` | `30` |
+| `S4_IAM_MAX_STALENESS_SECS` | How long a cluster node keeps checking the logins, admin sessions and S3 keys of IAM users after most nodes of the cluster last agreed with its copy of them, in seconds; after that it answers them `503` with `Retry-After` until they agree again. `0` keeps it checking them however long it is cut off. Root and the S3 credentials of the environment are not affected | `30` | `10` |
 
 ## Erasure Coding (Enterprise Edition)
 

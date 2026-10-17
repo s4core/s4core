@@ -17,13 +17,20 @@
 //! This module exports the public API for the S4 server, including
 //! configuration types and the main application.
 
+pub mod bucket_metadata_placement;
 pub mod cluster_bootstrap;
 pub mod compaction_worker;
 pub mod config;
+pub mod config_adoption;
 pub mod edition;
+pub mod iam_adoption;
+pub mod iam_upkeep;
 pub mod lifecycle_worker;
 pub mod multipart_cleanup_worker;
+pub mod pool_generation;
+pub mod rollback;
 pub mod secrets;
+pub mod unenforced_configs;
 
 mod app;
 

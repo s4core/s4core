@@ -904,3 +904,156 @@ fn count_volume_files(temp: &TempDir) -> usize {
         })
         .count()
 }
+
+/// A tombstone left by a cluster delete holds no data: the blob of the object
+/// it replaced is dead space like that of a deleted object, compaction
+/// reclaims it, and the tombstone itself stays in the index.
+#[tokio::test]
+async fn test_compaction_reclaims_the_blobs_of_tombstoned_objects() {
+    use s4_core::KeyVersion;
+
+    let temp = TempDir::new().unwrap();
+    let engine = create_test_engine(&temp).await;
+    let bucket = "test-tombstones";
+
+    let objects = write_objects(&engine, bucket, 20, "tomb-").await;
+    engine.sync().await.unwrap();
+    for (key, _) in objects.iter().take(15) {
+        assert!(engine.tombstone_object(bucket, key, 20, 0, 1).await.unwrap());
+    }
+    engine.sync().await.unwrap();
+
+    let config = CompactionConfig::on_demand(0.0, false, 24 * 3600);
+    let compactor = VolumeCompactor::new(
+        engine.volumes_dir().to_path_buf(),
+        engine.index_db().clone(),
+        engine.deduplicator().clone(),
+        engine.volume_writer().clone(),
+        config,
+    );
+    let stats = compactor.run().await.unwrap();
+
+    assert!(stats.volumes_compacted > 0, "stats: {stats:?}");
+    assert!(stats.total_bytes_reclaimed > 0, "stats: {stats:?}");
+    assert_eq!(stats.errors, 0, "stats: {stats:?}");
+    for (key, expected) in objects.iter().skip(15) {
+        let (data, _) = engine.get_object(bucket, key).await.unwrap();
+        assert_eq!(&data, expected, "{key}");
+    }
+    for (key, _) in objects.iter().take(15) {
+        assert!(
+            matches!(
+                engine.key_version(bucket, key).await.unwrap(),
+                KeyVersion::Tombstone(_)
+            ),
+            "{key}"
+        );
+    }
+}
+
+/// Reference counts that drifted low — a release done twice, an update lost —
+/// must not cost a live object its bytes. The plain object's dedup entry is
+/// gone and the multipart object's manifest and segments count zero, while
+/// dead blobs around them make their volumes worth compacting: compaction
+/// keeps every blob a live record reaches, and both objects read back whole.
+#[tokio::test]
+async fn compaction_keeps_the_blobs_of_live_objects_whose_counts_drifted() {
+    let temp = TempDir::new().unwrap();
+    let engine = create_test_engine(&temp).await;
+    let metadata = HashMap::new();
+
+    let mut dead = write_objects(&engine, "bucket", 4, "dead-a-").await;
+    let plain: Vec<u8> = format!("kept-plain-{}", "p".repeat(200)).into_bytes();
+    engine
+        .put_object(
+            "bucket",
+            "plain",
+            &plain,
+            "application/octet-stream",
+            &metadata,
+        )
+        .await
+        .unwrap();
+    dead.extend(write_objects(&engine, "bucket", 4, "dead-b-").await);
+
+    engine
+        .create_multipart_session("upload", "bucket", "multi", "text/plain", &metadata)
+        .await
+        .unwrap();
+    let bodies: Vec<Vec<u8>> = (1..=2)
+        .map(|n| format!("kept-part-{n}-{}", "m".repeat(200)).into_bytes())
+        .collect();
+    let mut parts = Vec::new();
+    for (n, body) in bodies.iter().enumerate() {
+        let part = engine
+            .upload_part_streaming(
+                "upload",
+                n as u32 + 1,
+                Box::new(std::io::Cursor::new(body.clone())),
+                body.len() as u64,
+            )
+            .await
+            .unwrap();
+        parts.push(part.record);
+        dead.extend(write_objects(&engine, "bucket", 3, &format!("dead-p{n}-")).await);
+    }
+    engine.mark_session_completing("upload").await.unwrap();
+    engine
+        .complete_multipart_native(
+            "bucket",
+            "multi",
+            "upload",
+            &parts,
+            "etag-2",
+            "text/plain",
+            &metadata,
+        )
+        .await
+        .unwrap();
+    dead.extend(write_objects(&engine, "bucket", 6, "dead-c-").await);
+    for (key, _) in &dead {
+        engine.delete_object("bucket", key).await.unwrap();
+    }
+    engine.sync().await.unwrap();
+
+    // The counts drift low
+    let plain_hash = engine.head_object("bucket", "plain").await.unwrap().content_hash;
+    engine.deduplicator().remove_entry(&plain_hash).unwrap();
+    let manifest = engine
+        .head_object("bucket", "multi")
+        .await
+        .unwrap()
+        .composite_manifest_blob_id()
+        .unwrap();
+    let blob_refs = engine.index_db().blob_refs_keyspace();
+    for blob_id in std::iter::once(manifest).chain(parts.iter().map(|part| part.blob_id)) {
+        let bytes = blob_refs.get(blob_id.as_bytes()).unwrap().unwrap();
+        let mut entry: s4_core::types::BlobRefEntry = bincode::deserialize(&bytes).unwrap();
+        entry.ref_count_committed = 0;
+        entry.ref_count_staged = 0;
+        blob_refs
+            .insert(blob_id.as_bytes(), bincode::serialize(&entry).unwrap())
+            .unwrap();
+    }
+
+    let compactor = VolumeCompactor::new(
+        engine.volumes_dir().to_path_buf(),
+        engine.index_db().clone(),
+        engine.deduplicator().clone(),
+        engine.volume_writer().clone(),
+        CompactionConfig {
+            fragmentation_threshold: 0.1,
+            min_dead_bytes: 0,
+            max_volumes_per_run: 100,
+            dry_run: false,
+            ..Default::default()
+        },
+    );
+    let stats = compactor.run().await.unwrap();
+    assert!(stats.volumes_compacted > 0, "{stats:?}");
+
+    let (data, _) = engine.get_object("bucket", "plain").await.unwrap();
+    assert_eq!(data, plain);
+    let (data, _) = engine.get_object("bucket", "multi").await.unwrap();
+    assert_eq!(data, bodies.concat());
+}

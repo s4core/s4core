@@ -111,6 +111,52 @@ wired at runtime and what still blocks final production readiness:
 | Auto-tiering | Disabled by default |
 | Multi-set pools | Disabled by default; adding a set needs every pool node on EC v2 |
 
+### Two Nodes Down
+
+Buckets survive as many lost nodes as the pool does. A bucket's existence record
+and its settings (CORS, lifecycle, policy, encryption) are kept on `2f + 1`
+replicas, where `f` is the number of nodes the profile survives, and read and
+written through a majority of them: five replicas with quorums of three in a pool
+of six nodes with RS 4+2. With any two nodes of such a pool down bucket creation,
+existence checks and deletion of an empty bucket remain available, and its
+settings read and change as usual.
+
+New objects are a different matter. Until it is erasure coded, a new object is
+kept on three replicas and two of them must answer, so with two nodes of the pool
+down part of the new PUTs answer `503`: in a pool of six nodes about one in five,
+in a pool of nine about one in twelve. A client that retries the PUT, or writes
+the next key, usually succeeds. Objects already erasure coded read as long as the
+profile allows, subject to the metadata and namespace checks described below.
+
+Deleting an object requires two of its three namespace replicas, even after its
+hot bytes have been purged, followed by the EC manifest quorum. Losing two of
+those namespace owners therefore makes DELETE answer `503`, even if enough EC
+shards remain to reconstruct the bytes. The server does not confirm an EC delete
+after a failed namespace quorum. A `503` may still mean some replicas applied the
+operation; retry after quorum is restored. A read of an EC tombstone also needs
+the namespace quorum to distinguish that delete from a newer hot overwrite.
+
+For the same reason object listings answer `503` while two nodes of the pool are
+down: every object's entry is kept on three replicas, and a listing that cannot
+hear two of them for every key cannot say which objects exist. The node answers
+`503`, which S3 clients retry, rather than a list that leaves out objects or shows
+deleted ones; with one node down listings answer as usual.
+
+**Moving to more replicas.** A pool created or upgraded on this release moves its
+buckets' records from three replicas to the larger number by itself, once every
+node of the pool runs this release and is up: it writes to both layouts, brings
+the records stored before to the new replicas, and then reads from the new
+layout only. The move takes seconds on a pool of a few thousand buckets and holds
+while any node of the pool is down; `/api/admin/cluster/health` shows its stage
+and the nodes it waits for (see
+[Federation → Buckets](federation.md#buckets)). During the move a pool survives
+one node down for its buckets, as before.
+
+**No rollback once the move has begun.** A node of an earlier release that
+rejoins the pool after the move started cannot create or delete buckets: the
+other nodes refuse its writes, and it answers `503`. Keep every node on this
+release, or return the rolled-back node to it.
+
 ## Built-In Profiles
 
 | Profile | Layout | Required pool nodes | Storage overhead | Notes |
@@ -1764,6 +1810,19 @@ recorded in its manifest and never changes; adding a set adds capacity for new
 objects and moves nothing that is already stored. Rebalancing existing data
 between sets is deliberately out of scope and deferred to EC v3.
 
+Growing a pool also gives part of the keys it already holds new replica nodes:
+every bucket's records and settings, objects still held on their RF=3 replicas
+(those below `S4_EC_MIN_OBJECT_SIZE`, and the hot copies of objects not yet
+erasure-coded), the
+namespace entries of erasure-coded objects, open multipart uploads and the
+pool's own erasure-coding records — the set roster, the set layouts and the
+tiering policies. The pool moves them to their new nodes in the background while
+it keeps serving: writes reach the old and the new replicas, reads go to the old
+ones until each range of the ring is verified on the new ones. Shards and
+manifests stay on their set and do not move. How the move runs, how long it
+takes and how to watch, pause and resume it is in
+[Clustering → Growing a pool](../08-deployment/clustering.md#growing-a-pool).
+
 Growing a pool is two steps, and only the first needs a restart:
 
 1. **Add the nodes to the pool's configuration.** The pool's node count must be a
@@ -1771,10 +1830,14 @@ Growing a pool is two steps, and only the first needs a restart:
    eighteen for a pool of two sets. Nodes are **appended**, never inserted: the
    pool's inherited set is the first `width` nodes in configured order, and that
    order is what every manifest written so far names. A node that starts with a
-   reordered list refuses to adopt the pool's set list and says so, rather than
-   serving objects from the wrong nodes.
+   reordered list, or with a node missing, refuses to start and says so, rather
+   than serving objects from the wrong nodes. Start the new nodes with the full
+   list, then restart the current ones one at a time; the move of the keys that
+   change replicas begins by itself once every node runs with the new list.
 2. **Form the new nodes into a set**, on a running cluster, through the admin
    API. Every other node picks the new set up within `S4_EC_SET_REFRESH_SECS`.
+   Form it once the growth has settled — `GET /api/admin/cluster/rebalance`
+   answers `"state": "stable"` with the grown node count on every node.
 
 A set is built on nodes no other set of the pool holds. A node already carrying
 slots elsewhere is refused: the pool would gain no capacity, and its free space
@@ -1941,12 +2004,14 @@ repair traffic, paced by the same limits every other repair is paced by.
 
 Two things are not part of this procedure and must not be improvised into it:
 bringing the replacement up with a **fresh** identity, and running two machines
-under **one** identity. A fresh identity leaves the dead node's shards assigned
-to an identity nobody holds — repair has nowhere to write, redundancy never
-comes back, and nothing reports it, because the objects go on reading through
-the surviving shards. Two machines under one identity write two histories of the
-same slots. Both are explained below, and the server refuses the second on its
-own.
+under **one** identity. A fresh identity would leave the dead node's shards
+assigned to an identity nobody holds — repair would have nowhere to write and
+redundancy would never come back, while the objects go on reading through the
+surviving shards. Two machines under one identity write two histories of the
+same slots. The server refuses both on its own: a machine with a new identity
+at a pool node's address does not start, and the error names the identity the
+pool keeps that place for, or says where to read it, with the
+`S4_EXPECTED_NODE_IDENTITY` setting the start needs.
 
 #### Which node holds which slots, and which of them the pool can see
 
@@ -2038,12 +2103,16 @@ Leaving the variable unset keeps the old behaviour exactly: an existing
 replacement has started, the identity is on its disk and the variable can be
 dropped.
 
-**What you must not do** is bring the replacement up with a *fresh* identity. It
-joins the cluster, serves requests and looks healthy, but the pool goes on
-assigning the dead node's slots to an identity that no longer exists: the new
-node owns nothing, repair has nowhere to write, and redundancy never comes back.
-Reassigning a slot to a different identity is not supported and is deferred to
-EC v3 together with moving objects between sets.
+**A fresh identity is refused.** A machine that comes up at a pool node's
+address with an empty data directory and no `S4_EXPECTED_NODE_IDENTITY`
+generates an identity of its own, and the pool's record of its members keeps
+that place for the identity that is gone. The start stops with an error that
+says so: it names the identity to take when the pool still knows it, and
+otherwise points to `GET /api/admin/cluster/topology` on any surviving node,
+where that identity is listed as a member that is not alive. Taking it is the
+fix; a new identity at that place would own none of the dead node's slots, and
+repair would have nowhere to write. Reassigning a slot to a different identity
+is not supported yet.
 
 #### Starting while the pool is short a node
 

@@ -80,6 +80,7 @@ services:
       - ${S4_DOCKER_SECURITY_OPT:-apparmor=unconfined}
     volumes:
       - ./haproxy-ee-no-ec.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./haproxy-ee-no-ec-initial.state:/usr/local/etc/haproxy/initial.state:ro
     ports:
       - "${S4_EE_HTTP_PORT:-9000}:9000"
       - "${S4_EE_HAPROXY_STATS_PORT:-8404}:8404"

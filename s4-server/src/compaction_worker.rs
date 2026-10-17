@@ -187,7 +187,8 @@ impl CompactionWorker {
                 storage.deduplicator().clone(),
                 storage.volume_writer().clone(),
                 compaction_config,
-            );
+            )
+            .with_journal(storage.journal_handle());
 
             match compactor.run().await {
                 Ok(stats) => {

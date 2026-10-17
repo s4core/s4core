@@ -33,7 +33,7 @@ use s4_cluster::{
     EcAdminTieringPromoteRequest, EcAdminTombstoneGcRequest, EcAdminTranscodePauseRequest,
     EcAdminUnpackSegmentsRequest, DEFAULT_EC_ADMIN_REPAIR_MAX_TASKS,
 };
-use s4_features::iam::JwtClaims;
+use s4_features::iam::AdminPrincipal;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -172,40 +172,40 @@ struct EcApproveRejoinBody {
 /// GET /api/admin/ec/pools
 pub async fn list_pools(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     Ok(Json(state.ec_admin_service.list_pools().await?))
 }
 
 /// GET /api/admin/ec/pools/:pool/health
 pub async fn pool_health(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(pool): Path<String>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     Ok(Json(state.ec_admin_service.pool_health(&pool).await?))
 }
 
 /// GET /api/admin/ec/pools/:pool/failure-matrix
 pub async fn failure_matrix(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(pool): Path<String>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     Ok(Json(state.ec_admin_service.failure_matrix(&pool).await?))
 }
 
 /// GET /api/admin/ec/objects/:bucket/*key where `key` ends with `/manifest`.
 pub async fn object_manifest(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path((bucket, tail)): Path<(String, String)>,
     Query(query): Query<EcObjectQuery>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let key = object_key_from_tail(&tail, "manifest")?;
     let object = EcAdminObjectRef {
         bucket,
@@ -218,11 +218,11 @@ pub async fn object_manifest(
 /// POST /api/admin/ec/objects/:bucket/*key where `key` ends with `/verify`.
 pub async fn verify_object(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path((bucket, tail)): Path<(String, String)>,
     Query(query): Query<EcObjectQuery>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let key = object_key_from_tail(&tail, "verify")?;
     let object = EcAdminObjectRef {
         bucket,
@@ -235,11 +235,11 @@ pub async fn verify_object(
 /// POST /api/admin/ec/pools/:pool/repair
 pub async fn repair_pool(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(pool): Path<String>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let body: EcRepairBody = parse_optional_body(body)?;
     let request = EcAdminRepairRequest {
         pool,
@@ -255,11 +255,11 @@ pub async fn repair_pool(
 /// `GET /api/admin/ec/pools/:pool/repair-status[?node-id=<uuid>]`
 pub async fn repair_status(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(pool): Path<String>,
     Query(query): Query<EcRepairStatusQuery>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let request = EcAdminRepairStatusRequest {
         pool,
         node_id: query.node_id,
@@ -270,11 +270,11 @@ pub async fn repair_status(
 /// POST /api/admin/ec/pools/:pool/sets
 pub async fn add_erasure_set(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(pool): Path<String>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let body: EcAddSetBody = parse_body(body)?;
     let request = EcAdminAddSetRequest {
         pool,
@@ -286,20 +286,20 @@ pub async fn add_erasure_set(
 /// GET /api/admin/ec/pools/:pool/sets
 pub async fn list_erasure_sets(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(pool): Path<String>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     Ok(Json(state.ec_admin_service.list_erasure_sets(&pool).await?))
 }
 
 /// POST /api/admin/ec/pools/:pool/sets/:set_id/deactivate
 pub async fn deactivate_erasure_set(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path((pool, set_id)): Path<(String, u64)>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let request = EcAdminDeactivateSetRequest { pool, set_id };
     Ok(Json(
         state.ec_admin_service.deactivate_erasure_set(request).await?,
@@ -312,11 +312,11 @@ pub async fn deactivate_erasure_set(
 /// this node's topology rule.
 pub async fn apply_pool_topology(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(pool): Path<String>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let body: EcApplyTopologyBody = parse_optional_body(body)?;
     let request = EcAdminApplyTopologyRequest {
         pool,
@@ -334,11 +334,11 @@ pub async fn apply_pool_topology(
 /// reached from its own storage, so no other node can lift it.
 pub async fn approve_node_rejoin(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(pool): Path<String>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let body: EcApproveRejoinBody = parse_body(body)?;
     let request = EcAdminApproveRejoinRequest {
         pool,
@@ -352,10 +352,10 @@ pub async fn approve_node_rejoin(
 /// GET /api/admin/ec/orphans
 pub async fn list_orphans(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Query(query): Query<EcOrphanListQuery>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let max_entries = query.max_entries.unwrap_or(DEFAULT_EC_ADMIN_REPAIR_MAX_TASKS);
     Ok(Json(
         state.ec_admin_service.list_orphans(max_entries).await?,
@@ -373,10 +373,10 @@ pub async fn list_orphans(
 /// a different question and says so in its own report.
 pub async fn dedup_report(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Query(query): Query<EcDedupReportQuery>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let request = EcAdminDedupReportRequest {
         max_entries: query.max_entries.unwrap_or(DEFAULT_EC_ADMIN_REPAIR_MAX_TASKS),
         local_only: query.local_only.unwrap_or(false),
@@ -387,10 +387,10 @@ pub async fn dedup_report(
 /// POST /api/admin/ec/orphans/gc
 pub async fn gc_orphans(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let body: EcOrphanGcBody = parse_optional_body(body)?;
     let request = EcAdminOrphanGcRequest {
         dry_run: body.dry_run.unwrap_or(false),
@@ -417,10 +417,10 @@ pub async fn gc_orphans(
 /// of its nodes.
 pub async fn gc_tombstones(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let body: EcTombstoneGcBody = parse_optional_body(body)?;
     let dry_run = match body.action.as_deref() {
         Some("dry_run") => true,
@@ -453,10 +453,10 @@ pub async fn gc_tombstones(
 /// that one. `dry_run` reports what would be touched and changes nothing.
 pub async fn unpack_packed_segments(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let body: EcUnpackSegmentsBody = parse_optional_body(body)?;
     let request = EcAdminUnpackSegmentsRequest {
         segment_id: body.segment_id,
@@ -471,10 +471,10 @@ pub async fn unpack_packed_segments(
 /// POST /api/admin/ec/test/fail-reconstruction
 pub async fn test_fail_reconstruction(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let body: EcTestHookBody = parse_optional_body(body)?;
     let request = EcAdminTestHookRequest {
         bucket: body.bucket,
@@ -493,10 +493,10 @@ pub async fn test_fail_reconstruction(
 /// they look at it. Refused unless EC test hooks are enabled for the process.
 pub async fn test_transcode_pause(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let body: EcTranscodePauseBody = parse_optional_body(body)?;
     let request = EcAdminTranscodePauseRequest {
         action: body.action,
@@ -520,10 +520,10 @@ pub async fn test_transcode_pause(
 /// hooks are enabled for the process.
 pub async fn test_scan_orphans(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Query(query): Query<EcOrphanListQuery>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let max_entries = query.max_entries.unwrap_or(DEFAULT_EC_ADMIN_REPAIR_MAX_TASKS);
     Ok(Json(
         state.ec_admin_service.scan_orphans(max_entries).await?,
@@ -537,10 +537,10 @@ pub async fn test_scan_orphans(
 /// fail. Refused unless EC test hooks are enabled for the process.
 pub async fn test_codec_foreign_matrix(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let body: EcCodecHookBody = parse_optional_body(body)?;
     let request = EcAdminCodecHookRequest {
         enabled: body.enabled,
@@ -554,9 +554,9 @@ pub async fn test_codec_foreign_matrix(
 /// same on a schedule; this makes the result observable at a chosen moment.
 pub async fn test_run_scrub(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     Ok(Json(state.ec_admin_service.run_scrub().await?))
 }
 
@@ -565,9 +565,9 @@ pub async fn test_run_scrub(
 /// Audits local shard inventory against every manifest immediately.
 pub async fn test_run_anti_entropy(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     Ok(Json(state.ec_admin_service.run_anti_entropy().await?))
 }
 
@@ -578,9 +578,9 @@ pub async fn test_run_anti_entropy(
 /// at a chosen moment.
 pub async fn test_reconcile_namespace(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     Ok(Json(state.ec_admin_service.reconcile_namespace().await?))
 }
 
@@ -589,10 +589,10 @@ pub async fn test_reconcile_namespace(
 /// Returns the stored bucket policy and the values in force after inheritance.
 pub async fn tiering_policy(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(bucket): Path<String>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     Ok(Json(state.ec_admin_service.tiering_policy(bucket).await?))
 }
 
@@ -602,11 +602,11 @@ pub async fn tiering_policy(
 /// bucket goes back to inheriting the node's values.
 pub async fn put_tiering_policy(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(bucket): Path<String>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let request = parse_optional_body::<EcAdminTieringPolicyRequest>(body)?;
     Ok(Json(
         state.ec_admin_service.put_tiering_policy(bucket, request).await?,
@@ -618,10 +618,10 @@ pub async fn put_tiering_policy(
 /// Reports what tiering would do right now and changes nothing.
 pub async fn tiering_dry_run(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let request = parse_body::<EcAdminTieringDryRunRequest>(body)?;
     Ok(Json(state.ec_admin_service.tiering_dry_run(request).await?))
 }
@@ -634,11 +634,11 @@ pub async fn tiering_dry_run(
 /// during an incident must not lose the way to undo what it did.
 pub async fn promote_objects(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(bucket): Path<String>,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     let mut request = parse_optional_body::<EcAdminTieringPromoteRequest>(body)?;
     // The path names the bucket. A body naming a different one would be two
     // answers to the same question, so the path wins and the body cannot
@@ -654,9 +654,9 @@ pub async fn promote_objects(
 /// an acceptance test can wait for.
 pub async fn test_run_promotion_cycle(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     Ok(Json(state.ec_admin_service.run_promotion_cycle().await?))
 }
 
@@ -669,11 +669,11 @@ pub async fn test_run_promotion_cycle(
 /// queued and waiting.
 pub async fn test_promotion_job(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path((bucket, tail)): Path<(String, String)>,
     Query(query): Query<EcObjectQuery>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     // The whole tail is the object key, as on the activity-mark route: there is
     // no trailing action segment to strip.
     let key = tail.trim_start_matches('/').to_string();
@@ -698,11 +698,11 @@ pub async fn test_promotion_job(
 /// progress is indistinguishable from one that was never queued.
 pub async fn test_transcode_job(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path((bucket, tail)): Path<(String, String)>,
     Query(query): Query<EcObjectQuery>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     // The whole tail is the object key, as on the promotion job route: there is
     // no trailing action segment to strip.
     let key = tail.trim_start_matches('/').to_string();
@@ -726,9 +726,9 @@ pub async fn test_transcode_job(
 /// not a schedule an acceptance test can wait for.
 pub async fn test_run_tiering_cycle(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     Ok(Json(state.ec_admin_service.run_tiering_cycle().await?))
 }
 
@@ -739,11 +739,11 @@ pub async fn test_run_tiering_cycle(
 /// observable behaviour to assert on.
 pub async fn test_object_heat(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path((bucket, tail)): Path<(String, String)>,
     Query(query): Query<EcObjectQuery>,
 ) -> Result<Json<serde_json::Value>, EcAdminHttpError> {
-    ensure_admin(&claims)?;
+    ensure_admin(&principal)?;
     // The whole tail is the object key here: unlike the manifest and verify
     // routes, this one carries no trailing action segment to strip.
     let key = tail.trim_start_matches('/').to_string();
@@ -760,8 +760,8 @@ pub async fn test_object_heat(
     Ok(Json(state.ec_admin_service.object_heat(object).await?))
 }
 
-fn ensure_admin(claims: &JwtClaims) -> Result<(), EcAdminHttpError> {
-    if claims.role.can_admin() {
+fn ensure_admin(principal: &AdminPrincipal) -> Result<(), EcAdminHttpError> {
+    if principal.role.can_admin() {
         Ok(())
     } else {
         Err(EcAdminHttpError::Forbidden)

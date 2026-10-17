@@ -3,6 +3,7 @@ services:
     image: haproxy:3.1-alpine
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./haproxy-initial.state:/usr/local/etc/haproxy/initial.state:ro
     ports:
       - "9000:9000"
       - "8404:8404"

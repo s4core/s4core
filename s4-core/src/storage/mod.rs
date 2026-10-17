@@ -19,8 +19,10 @@ pub mod dedup;
 pub mod engine;
 pub mod index;
 pub mod journal;
+pub mod migration;
 pub mod placement;
 pub mod recovery;
+pub mod version_digest;
 pub mod version_index;
 pub mod versioning;
 pub mod volume;
@@ -28,14 +30,22 @@ pub mod volume;
 pub use bitcask::BitcaskStorageEngine;
 pub use dedup::{DedupEntry, Deduplicator};
 pub use engine::{
-    is_force_physical_write, DeleteMarkerEntry, DeleteResult, KeyspaceSnapshot, ListVersionsResult,
-    ObjectStream, ObjectVersion, ReadOptions, Snapshot, StateMachine, StorageEngine,
-    StreamingPutResult, VolumeFileInfo, FORCE_PHYSICAL_WRITE_METADATA_KEY,
+    is_force_physical_write, DeleteMarkerEntry, DeleteResult, KeyVersion, KeyspaceSnapshot,
+    ListVersionsResult, ObjectStream, ObjectVersion, PutOutcome, ReadOptions, Snapshot,
+    StateMachine, StorageEngine, StreamingPutResult, TombstoneRef, VolumeFileInfo,
+    FORCE_PHYSICAL_WRITE_METADATA_KEY, REPAIRED_ETAG_METADATA_KEY,
 };
-pub use index::{BatchAction, BatchOp, IndexDb, KeyspaceId};
+pub use index::{
+    BatchAction, BatchOp, IndexDb, IndexOptions, KeyspaceId, LiveDataRefs, VersionDigestCheck,
+    VersionDigestsOpening,
+};
 pub use journal::{JournalEntry, JournalEventType, MetadataJournal};
-pub use placement::PlacementGroupId;
+pub use placement::{ring_position, ring_position_of, PlacementGroupId};
 pub use recovery::{recover_index, recover_index_from_volumes};
+pub use version_digest::{
+    EtagRank, TombstoneHorizon, VersionDigest, VersionDigestEntry, VersionKind, VersionRank,
+    VERSION_DIGESTS_FORMAT,
+};
 pub use version_index::VersionList;
 pub use versioning::{generate_version_id, is_null_version, NULL_VERSION_ID};
 pub use volume::{VolumeReader, VolumeWriter};

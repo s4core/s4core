@@ -14,21 +14,36 @@
 
 //! Repair subsystem for maintaining replica consistency.
 //!
-//! The repair system has three layers:
-//!
-//! - **Read repair** (Phase 5) — opportunistic fix of stale replicas
-//!   detected during quorum reads.
-//! - **Anti-entropy** (Phase 7) — periodic background Merkle tree
-//!   exchange with random replica peers for full-coverage consistency.
-//! - **Repair frontier** (Phase 7) — per-replica reconciliation markers
-//!   used by tombstone GC (Phase 8) to determine safe purge points.
+//! - **Read repair** — opportunistic fix of stale replicas detected during
+//!   quorum reads.
+//! - **Anti-entropy** — rounds that compare a node with one peer at a time by
+//!   the version digests the storage keeps for every replicated key, and
+//!   settle the keys that differ.
+//! - **Settling a key** — bringing the replicas of one key to its newest
+//!   version, shared by anti-entropy and hint delivery.
+//! - **Repair frontier** — per-replica reconciliation markers used by
+//!   tombstone GC to determine safe purge points.
+//! - **Merkle tree** — built in memory by the erasure-coding anti-entropy of
+//!   the Enterprise Edition.
 
 pub mod anti_entropy;
+pub mod config_adoption;
+pub mod config_adoption_status;
 pub mod frontier;
 pub mod merkle;
+pub mod pair_tree;
 pub mod read_repair;
+pub mod reconcile;
 
-pub use anti_entropy::{AntiEntropyMetrics, AntiEntropyService, AntiEntropySnapshot};
+pub use anti_entropy::{
+    AntiEntropyGrowth, AntiEntropyMetrics, AntiEntropyResponder, AntiEntropyRounds,
+    AntiEntropyService, AntiEntropySnapshot, RoundEnd, RoundReport,
+};
+pub use config_adoption::{AdoptionReport, ConfigAdoption, ConfigReadGate};
+pub use config_adoption_status::{
+    ConfigAdoptionPhase, ConfigAdoptionSnapshot, ConfigAdoptionStatus,
+};
 pub use frontier::RepairFrontier;
 pub use merkle::{KeyRange, MerkleTree};
 pub use read_repair::ReadRepairService;
+pub use reconcile::{CopyMeter, LocalReplica, Reconciler};

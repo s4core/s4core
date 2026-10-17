@@ -22,7 +22,7 @@ use crate::s3::errors::S3Error;
 use axum::http::{HeaderMap, Request};
 use chrono;
 use hmac::{Hmac, Mac};
-use s4_features::iam::{IamStorage, User};
+use s4_features::iam::{IamError, IamStorage, User};
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::str;
@@ -272,6 +272,22 @@ impl SignatureRequestData {
     }
 }
 
+/// The S3 answer to a failed IAM lookup: unavailable while this node does not
+/// check IAM credentials (its copy of IAM is not confirmed current with its
+/// pool), access denied for anything else.
+pub(crate) fn iam_lookup_error(error: IamError) -> S3Error {
+    match error {
+        IamError::NotServing(reason) => {
+            tracing::debug!(%reason, "IAM credentials not checked on this node now");
+            S3Error::ServiceUnavailable(IamError::NotServing(reason).to_string())
+        }
+        other => {
+            tracing::warn!("IAM lookup error: {:?}", other);
+            S3Error::AccessDenied
+        }
+    }
+}
+
 /// Verifies AWS Signature V4 for a request using IAM database.
 ///
 /// # Arguments
@@ -326,10 +342,7 @@ pub async fn verify_signature_v4_with_iam_data(
     let user = iam_storage
         .get_user_by_access_key_with_secret(&auth.credential.access_key_id)
         .await
-        .map_err(|e| {
-            tracing::warn!("IAM lookup error: {:?}", e);
-            S3Error::AccessDenied
-        })?
+        .map_err(iam_lookup_error)?
         .ok_or_else(|| {
             tracing::debug!(
                 "Access key not found in IAM: {}",

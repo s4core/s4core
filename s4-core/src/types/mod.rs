@@ -27,8 +27,13 @@ pub use composite::{
     MultipartUploadSession, MultipartUploadState, ObjectLayout, MANIFEST_FORMAT_VERSION,
 };
 pub use metadata::{
-    IndexRecord, BUCKET_MARKER_KEY_PREFIX, DELETE_MARKER_FILE_ID, EXTERNAL_DATA_FILE_ID,
-    OBJECT_TAGS_METADATA_KEY,
+    is_bucket_config_key, is_bucket_marker, is_bucket_metadata, is_bucket_metadata_full_key,
+    is_cluster_control, is_cluster_control_full_key, is_replicated_key, IndexRecord,
+    BUCKET_CONFIG_KEY_PREFIXES, BUCKET_MARKER_KEY_PREFIX, CORS_CONFIG_KEY_PREFIX,
+    DELETE_MARKER_FILE_ID, ENCRYPTION_CONFIG_KEY_PREFIX, EXTERNAL_DATA_FILE_ID,
+    IAM_LEGACY_USER_KEY_PREFIX, IAM_V2_KEY_PREFIX, LIFECYCLE_CONFIG_KEY_PREFIX,
+    OBJECT_LOCK_CONFIG_KEY_PREFIX, OBJECT_TAGS_METADATA_KEY, POLICY_CONFIG_KEY_PREFIX,
+    SYSTEM_BUCKET, VERSIONING_CONFIG_KEY_PREFIX,
 };
 pub use object_lock::{DefaultRetention, RetentionMode};
 pub use storage_class::{StorageClass, S4_STORAGE_CLASS_METADATA_KEY};

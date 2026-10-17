@@ -12,29 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Persistent Merkle tree for anti-entropy divergence detection.
+//! A Merkle tree over a range of the hash ring, built in memory.
 //!
-//! The tree is built over key ranges on the hash ring. Each leaf node
-//! covers a contiguous slice of the key space and stores the BLAKE3 hash
-//! of all records in that range. Divergence between replicas is detected
-//! in O(log K) comparisons by walking the tree top-down.
+//! Each leaf covers a contiguous slice of the range and holds the XOR of the
+//! record hashes placed in it. The erasure-coding anti-entropy of the
+//! Enterprise Edition builds one over its manifests to compare them with a
+//! peer. Replicated pools compare the version digests the storage keeps
+//! instead (`s4_core::storage::version_digest`).
 //!
 //! The tree is stored as a flat array (heap-style indexing) where node `i`
 //! has children at `2i+1` and `2i+2`. This avoids pointer-chasing and
 //! makes serialization trivial.
-//!
-//! # Persistence
-//!
-//! Tree nodes are persisted to a dedicated storage keyspace so that
-//! restarts do not require a full rescan of the data. Incremental updates
-//! are applied on every write/delete and propagated up to the root.
 
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use tracing::trace;
 
-/// Default tree depth (15 levels = 32768 leaf buckets).
+/// Default tree depth (15 levels = 16 384 leaf buckets).
 pub const DEFAULT_MERKLE_DEPTH: u8 = 15;
 
 /// Hash size in bytes (BLAKE3 output).
@@ -383,14 +378,6 @@ pub fn record_hash(key: &str, data: &[u8], hlc_wall: u64, hlc_logical: u32) -> [
     *hasher.finalize().as_bytes()
 }
 
-/// Compute a ring position for a given bucket/key combination.
-pub fn ring_position(bucket: &str, key: &str) -> u64 {
-    let combined = format!("{bucket}/{key}");
-    let hash = blake3::hash(combined.as_bytes());
-    let bytes: [u8; 8] = hash.as_bytes()[..8].try_into().expect("8 bytes from 32");
-    u64::from_be_bytes(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,20 +553,6 @@ mod tests {
         let h1 = record_hash("key1", b"data", 1000, 1);
         let h2 = record_hash("key2", b"data", 1000, 1);
         assert_ne!(h1, h2);
-    }
-
-    #[test]
-    fn ring_position_deterministic() {
-        let p1 = ring_position("bucket", "key");
-        let p2 = ring_position("bucket", "key");
-        assert_eq!(p1, p2);
-    }
-
-    #[test]
-    fn ring_position_varies_by_key() {
-        let p1 = ring_position("bucket", "key1");
-        let p2 = ring_position("bucket", "key2");
-        assert_ne!(p1, p2);
     }
 
     #[test]

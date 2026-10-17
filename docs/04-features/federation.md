@@ -1,6 +1,6 @@
 # Federation (Distributed Mode)
 
-> **Status:** Gossip membership, quorum replication, conflict resolution (HLC+LWW), read repair on quorum reads, hinted handoff, bit rot protection and cluster operations work. The background anti-entropy of a replicated pool is built but not started, and so tombstone GC purges nothing yet — see [Anti-Entropy](#anti-entropy-merkle-trees).
+> **Status:** Gossip membership, quorum replication, conflict resolution (HLC+LWW), read repair on quorum reads, hinted handoff, anti-entropy, bit rot protection and cluster operations work. Tombstone GC removes tombstones after the grace period and completed repair rounds — see [Distributed Tombstones & GC](#distributed-tombstones--gc).
 
 S4 supports a **leaderless distributed mode** where multiple nodes form a cluster and replicate data using quorum protocols. This provides high availability and horizontal scaling while maintaining S3 API compatibility.
 
@@ -26,8 +26,9 @@ erasure-coded pool type (`S4_POOL_TYPE=ec`) with fixed-width erasure sets; see
 configuration.
 
 **Rules:**
-- Pool membership is **immutable** after creation — nodes are never added or removed from existing pools
-- Horizontal scaling = adding new pools (not new nodes to existing pools)
+- A pool grows by **appending** nodes (Enterprise Edition); nodes are never removed from a pool or
+  reordered. The keys whose replicas change move to the new nodes in the background — see
+  [Clustering → Growing a pool](../08-deployment/clustering.md#growing-a-pool)
 - Each **bucket** is pinned to one pool at creation time; all objects in that bucket live in that pool
 - New buckets are created in the pool with the most free space
 
@@ -78,6 +79,13 @@ For the recommended deployment (pool size = RF = 3), every node in the pool stor
 
 For larger pools (pool size > RF), a consistent hash ring with 128 virtual nodes per physical node routes keys to the correct RF replicas.
 
+A listing asks every node of the pool and merges what they hold, deletes included. It answers
+only while every key still has a read quorum of replicas answering — no more than `RF − R` nodes
+of the pool silent, one with RF = 3 and R = 2 — and `503` otherwise: with more nodes down some
+object's last write or delete may sit only on the silent ones, and a listing without them could
+leave out an object or show a deleted one. The check that a bucket is empty before DeleteBucket
+is such a listing too.
+
 ### Buckets
 
 A bucket exists while its marker does, and the marker is written and read through the same quorums
@@ -91,8 +99,70 @@ tells `NoSuchBucket` from `NoSuchKey` without slowing the reads that find their 
 whose 404 has no body, does not ask. When too few replicas answer to tell whether the bucket
 exists, the request answers `503` and writes nothing.
 
+The marker and the bucket's configurations survive as many lost nodes as the pool does. In a
+replicated pool they are placed like its objects, with the same replicas and quorums. In an
+erasure-coded pool, which survives more lost nodes than three replicas do, they are kept on
+`2f + 1` replicas read and written through a majority, `f` being the nodes the profile survives:
+five replicas with quorums of three for RS 4+2 on six nodes (see
+[Two Nodes Down](erasure-coding.md#two-nodes-down)). `S4_BUCKET_METADATA_REPLICATION_FACTOR` raises
+the number up to the pool's nodes; it must be the same on every node.
+
+An EC pool reaches that number by itself, in four stages, once every node runs a release that
+knows them: `legacy` (three replicas), `dual_write` (writes to both layouts, while each node brings
+the records it holds to the new replicas), `read_new` (reads from the new layout) and `settled`.
+A node takes the next stage only once every node of the pool announced the current one, so a
+stage waits while any node of the pool is down, and a stage reached is never left: a restarted
+node goes on from it. `GET /api/admin/cluster/health` answers where the node is:
+
+```json
+"bucket_metadata": {
+  "stage": 1, "stage_name": "dual_write",
+  "from": {"replication_factor": 3, "write_quorum": 2, "read_quorum": 2},
+  "to": {"replication_factor": 5, "write_quorum": 3, "read_quorum": 3},
+  "backfill_complete": false,
+  "held_by": [{"node": "node-4", "reason": "not alive"}],
+  "held_for_secs": 42
+}
+```
+
+`held_by` names the nodes the next stage waits for and why; a stage that waits longer than ten
+minutes is also logged as a warning every ten minutes, with the same list. Once the move began, a
+node of an earlier release that rejoins the pool cannot create or delete buckets: the other nodes
+refuse its writes of bucket records, and count them in `s4_bucket_metadata_fenced_writes_total`.
+
 As with S3's own bucket operations, deleting a bucket is not atomic with requests already past
 their check: an object written in the same instant as its bucket is deleted can outlive it.
+
+A bucket's CORS, lifecycle, policy and encryption configurations are kept the same way: each is
+written and deleted through a write quorum and read through a read quorum, so a configuration set
+through any node is seen through every other at once and survives the loss of the node that took
+it. Each configuration changes on its own, and when two writes of the same one race, the later
+wins. A bucket deleted and created again under the same name starts without the configurations of
+the first one, even when a configuration write raced the delete. When too few replicas answer, the
+request answers `503` and may be retried. Lifecycle rules apply on every node of the pool to the
+copies of the objects it keeps, whichever node they were set through.
+
+Of these four, S4 applies only lifecycle rules. A bucket policy and an encryption configuration
+are stored and returned, but a policy does not restrict access and objects are not encrypted; the
+CORS rules of a bucket are stored and returned too, while the server answers browsers from every
+origin (see [CORS](cors.md#what-s4-applies)). This holds in single mode as well.
+
+An earlier release kept each of these configurations only on the node that took the request. After
+the upgrade every node hands the configurations it holds to the nodes that now keep them; where one
+configuration got different values through different nodes, the one changed last wins, and one
+left from a bucket deleted since is dropped. Until every node of the pool has done so, a node also
+weighs the configuration it holds itself: it answers with it unless the pool holds a newer value,
+or has deleted it, or the configuration belongs to an earlier bucket of the same name. A node that
+stays down holds this back until it returns. `s4_bucket_config_quorum_reads` turns 1 on a node once
+it reads every configuration from the pool, and stays 1 after the node restarts, including after a
+crash or while a peer is down. Uncertain deletion history never reopens local fallback; a lone older
+configuration waits for confirmation instead of overwriting a delete.
+`s4_bucket_config_adoption_keys_total` counts what was handed over
+([metrics](../06-monitoring/prometheus-metrics.md)).
+
+[Versioning](versioning.md#cluster-mode) and [Object Lock](object-lock.md#cluster-mode) are not
+supported in cluster mode: objects are written and deleted without versions or retention checks,
+and every request that would turn either on answers `501 NotImplemented`.
 
 ### Hinted Handoff
 
@@ -135,9 +205,9 @@ which the replica's LWW could not weigh. After a restart, a node delivers the hi
 
 One window stays open, the same one read repair has: a key deleted in the moment between the read
 and the write to the replica comes back on that replica. With `W=1` the rule above cannot tell a
-missed delete from a missed write either. Anti-entropy is meant to be the backstop for these, for
-hints that expired or were dropped, and for writes a coordinator crashed before hinting; on a
-replicated pool it does not run yet (see [Anti-Entropy](#anti-entropy-merkle-trees)).
+missed delete from a missed write either. Anti-entropy is the backstop for these, for hints that
+expired or were dropped, and for writes a coordinator crashed before hinting (see
+[Anti-Entropy](#anti-entropy)).
 
 ### Read Repair
 
@@ -201,32 +271,99 @@ S4 uses **Hybrid Logical Clocks (HLC)** for causal ordering and **Last-Writer-Wi
   in place (`rejected`)
 - Clients can use `If-Match` / `If-None-Match` for conditional writes
 
-## Anti-Entropy (Merkle Trees)
+## Anti-Entropy
 
-Each node builds a **Merkle tree** over its keys at start, keeps it in memory, updates it on every
-replica write and answers a peer that asks to compare trees. The background loop that would run
-the comparisons is **not started** on a replicated pool: no node runs a round, whatever
-`S4_ANTI_ENTROPY_INTERVAL_SECS` says, and `s4_anti_entropy_rounds_total` stays at 0. A replica
-that missed writes its hints did not cover stays behind until a quorum read repairs it.
+Every node of a replicated pool keeps, beside each object and each delete, a short digest of the
+version it holds: its HLC, its ETag and whether it is an object or a tombstone. The digest is
+written in the same atomic step as the record, so it never disagrees with it. Bucket markers and
+bucket configurations (CORS, lifecycle, policy, encryption) have digests and tombstones too.
+They follow the bucket metadata placement, while IAM control records follow a separate
+`ClusterControl` class replicated across the pool; each class is compared on its own shared replicas.
 
-What a round does, as the tests run it:
-1. Compares its Merkle root with a random live replica's
-2. If the roots differ, asks that replica for its copy of each key this node holds, up to 1000
-3. Takes every copy newer than its own; each such key counts in
-   `s4_anti_entropy_divergent_keys_total` and in `s4_anti_entropy_repairs_total{outcome}`
-4. Moves the **repair frontier** for that replica — only when it repaired something
+Every node orders the versions of a key the same way: the later HLC wins. Two versions with the same
+HLC are settled the same way on every node too: a delete wins over an object, and an ETag of a
+multipart upload wins over one computed from the bytes, so a copy that lost its multipart ETag gets
+it back. GET, HEAD and listings weigh tombstones in the same order, so a newer delete hides
+an older live copy. A live object is served or listed only when a read quorum holds a version
+of its key; absence alone cannot confirm a copy left by an old release's delete. Otherwise the
+request returns 503. Repair carries a tombstone to stale replicas with its original HLC.
+
+Every `S4_ANTI_ENTROPY_INTERVAL_SECS` (600 s) a node runs a **round** with one live peer of its
+pool, taking the peers in turn:
+
+1. Both nodes build a tree of 16 384 leaves in one streaming pass over their version digests.
+   Each leaf is the XOR of `blake3(full key ‖ digest)` for its keys. Only keys the pair both
+   replicate according to their placement class are compared; a key outside that shared
+   placement is left out.
+2. Behind each hash that differs, they compare keys and digests. A key held in different versions
+   by the two, or by one of them only, is divergent (`s4_anti_entropy_divergent_keys_total`).
+3. Each divergent key is read from all its replicas and brought to its newest version on every
+   replica that answered: the newest copy is written with its own HLC, or the newest tombstone is,
+   so a deleted object does not come back. Up to `S4_ANTI_ENTROPY_MAX_KEYS_PER_ROUND` (1000) keys
+   a round; the next round with the same peer goes on from where this one stopped, so keys that
+   cannot be settled never hold back the rest. A replica that does not answer in time is skipped,
+   and the others are settled without it.
+
+So a replica that missed writes and deletes — its hints expired, were dropped or were never
+stored — catches up without a client, in both directions: keys the node lacks and keys its peer
+lacks are settled alike. `s4_anti_entropy_repairs_total{outcome}` counts each divergent key once:
+`ok`, `failed` (a replica did not answer or refused), or `ambiguous`. A key is ambiguous when its
+newest copy is held by fewer replicas than a confirmed write leaves while another replica, which
+may have deleted it before the pool kept tombstones (data written before the upgrade to this
+release), has no key and cannot vouch for its deletion history: the copy is not spread. An
+acknowledged write has quorum confirmation; a lone legacy copy with unknown history on the
+other owners remains ambiguous.
+
+A round is `complete` when every key the pair compares was settled, `incomplete` when the peer
+stopped answering, a key was not settled, or the key limit was reached. Rounds are `skipped` while
+any live node of the pool announces protocol below 8, or no peer is alive. The current protocol is 9.
+The threshold includes IAM control records: protocol 5 leaves out bucket configuration digests,
+and protocol 7 leaves out IAM digests. A live peer whose protocol is not known keeps its turn
+until it announces it. A node that is down does not stop the rounds of the others. Requests
+with an incompatible digest format are refused, so an older initiator cannot compare a different
+set of keys with an upgraded responder.
+
+`S4_ANTI_ENTROPY_ENABLED=false` (`0`, `no` and `off` work too; a value that is neither on nor off
+stops the node from starting) stops a node from starting rounds — it logs a warning at start and
+`/api/admin/cluster/repair-status` reports `"anti_entropy_enabled": false` — but the node still
+answers the rounds of its peers, so the pool keeps converging. Its own repair frontier does not
+advance, and its tombstone GC waits. To stop anti-entropy in the whole pool, set it on every node.
 
 ## Distributed Tombstones & GC
 
 Deletes create tombstones that must live long enough for all replicas to see them.
 
-- **GC grace period:** 7 days (configurable via `S4_GC_GRACE_DAYS`)
-- **Tombstone purge** requires: `age > gc_grace` AND repair frontier confirms all replicas have synced.
-  The frontier moves only in anti-entropy rounds and never for the node itself, so no tombstone is
-  purged yet: `s4_tombstones_purged_total` stays at 0, and `s4_tombstones_active` counts what each
-  GC pass leaves
-- **Zombie resurrection protection:** If a node is offline > `max_rejoin_downtime` (3 days), it must full-bootstrap instead of incremental repair
+- **GC grace period:** 7 days (`S4_GC_GRACE_DAYS`, or `S4_GC_GRACE_SECS` when set). A tombstone is
+  kept at least this long
+- **Tombstone purge:** a node removes its tombstone once it is older than the grace period and, for
+  every other replica of its key, an anti-entropy round of this node with that replica *started*
+  more than 60.5 seconds after the delete and completed — so every replica has had the delete. The
+  60.5 seconds are the time a delete may still take to reach a replica (the 60-second replica write
+  timeout) and the clock skew the cluster tolerates (0.5 seconds). While a replica is down, the
+  other nodes keep the tombstones of its keys, however long it stays down. A node with
+  `S4_ANTI_ENTROPY_ENABLED=false` completes no rounds of its own and removes no tombstone. GC looks
+  for old tombstones every `S4_TOMBSTONE_GC_INTERVAL_SECS` (6 hours by default). Only a complete
+  round advances that peer's repair frontier cut, to its start time minus 60.5 seconds; incomplete
+  and skipped rounds advance nothing. The node itself needs no cut. These cuts live in memory:
+  after a restart GC waits for new complete rounds with every other owner of the key
+- **After a purge:** a node that removed tombstones no longer vouches for a key it lacks: an old copy
+  of such a key held by a single replica is not spread — anti-entropy counts it as `ambiguous` —
+  since it may be one that missed a delete whose tombstone is gone. A copy two replicas hold is
+  spread as before
+- **Safety margin:** the grace period must be longer than `S4_MAX_REJOIN_DOWNTIME_DAYS` plus a turn
+  of anti-entropy rounds over the other nodes of the pool (`S4_ANTI_ENTROPY_INTERVAL_SECS` × their
+  number) plus the 60-second replica write timeout and 0.5 seconds of clock skew; a node of a
+  replicated pool configured otherwise, or whose safety-margin calculation overflows, does not
+  start. The nodes' clocks must stay within 0.5 seconds of each other (NTP): last-writer-wins
+  and tombstone GC both rely on it
 - **Deduplication:** Remains per-node (no cross-node dedup coordination). Mark-sweep GC runs every 24 hours instead of ref-count decrement
+
+The node keeps monotone deletion-history and purge horizons, so forgetting a tombstone never
+makes an older lone copy safe to spread. Existing digests are trusted only with a valid clean
+shutdown seal. After a crash or an upgrade from a release without that seal, the node rebuilds
+them before opening network handlers and sets its deletion-history boundary to the later of
+the retained floor and the current time plus tolerated clock skew. A clean restart preserves
+that boundary; it still needs new repair frontier cuts before GC can resume.
 
 ## Bit Rot Protection (Data Scrubber)
 
@@ -247,6 +384,20 @@ Background scrubber verifies data integrity and auto-heals from replicas.
 | Single-node | `single` (default) | Standard standalone server, no cluster overhead |
 | Cluster | `cluster` | Storage node with full replication |
 | Gateway | `gateway` | Stateless router — no local storage, forwards to cluster nodes |
+
+### Moving Existing Single-Node Data
+
+A node restarted in cluster mode on its single-mode data directory copies its bucket markers and
+objects to every owner in the background, preserving bytes, ETags, content types and user metadata.
+Migration starts once every pool member is alive and runs the same S4 version, and resumes after an
+interruption. Newer cluster writes and deletes take precedence over the earlier copies.
+
+Wait for `migration_pending_records` in the health response, or
+`s4_cluster_migration_pending_records`, to reach zero on every node before switching clients.
+Objects still waiting for replicas can answer `503`. This transition supports one populated source
+in a replicated pool; versioning in `Enabled` or `Suspended` and an erasure-coded destination refuse
+the transition. See [Moving from Single Mode](../08-deployment/clustering.md#moving-from-single-mode)
+for the procedure, limitations and an S3 copy alternative for earlier releases.
 
 ### Graceful Shutdown
 
@@ -273,7 +424,7 @@ Every route needs a SuperUser token from `POST /api/admin/login`, sent as
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/admin/cluster/health` | GET | Members of the pool by status, `healthy`/`degraded`/`critical` by the quorum every key can still reach, epoch |
+| `/api/admin/cluster/health` | GET | Members of the pool by status, `healthy`/`degraded`/`critical` by the quorum every key can still reach, epoch, versioning and Object Lock this node stores and does not enforce |
 | `/api/admin/cluster/topology` | GET | The pool, its quorum and every configured member with status, addresses and version |
 | `/api/admin/node/health` | GET | The node asked: identity, name, pool, addresses, version, uptime |
 | `/api/admin/node/drain` | POST | Not implemented: answers `501`. Stop the node with `SIGTERM` instead |
@@ -302,7 +453,9 @@ Every answer is the view of the node asked and matches its `/metrics`; what each
 | `S4_READ_QUORUM` | Read quorum (R) | `2` |
 | `S4_GC_GRACE_DAYS` | Tombstone GC grace period (days) | `7` |
 | `S4_MAX_REJOIN_DOWNTIME_DAYS` | Max offline days before full bootstrap required | `3` |
-| `S4_ANTI_ENTROPY_INTERVAL_SECS` | Anti-entropy Merkle exchange interval; no effect yet, the rounds are not started | `600` |
+| `S4_ANTI_ENTROPY_INTERVAL_SECS` | Seconds between two anti-entropy rounds of a node | `600` |
+| `S4_ANTI_ENTROPY_MAX_KEYS_PER_ROUND` | Most divergent keys one round settles | `1000` |
+| `S4_ANTI_ENTROPY_ENABLED` | `false`: the node starts no rounds, but answers its peers' | `true` |
 | `S4_SCRUBBER_FULL_SCAN_DAYS` | Full CRC32 scrub cycle (days) | `30` |
 | `S4_HINT_TTL_HOURS` | How long a hint is kept; `0` keeps none | `3` |
 

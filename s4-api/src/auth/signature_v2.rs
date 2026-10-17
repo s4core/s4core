@@ -250,10 +250,7 @@ pub async fn verify_signature_v2_with_iam_data(
     let user = iam_storage
         .get_user_by_access_key_with_secret(&req_data.access_key_id)
         .await
-        .map_err(|e| {
-            tracing::warn!("IAM lookup error: {:?}", e);
-            S3Error::AccessDenied
-        })?
+        .map_err(crate::auth::signature_v4::iam_lookup_error)?
         .ok_or_else(|| {
             tracing::debug!("Access key not found in IAM: {}", req_data.access_key_id);
             S3Error::AccessDenied

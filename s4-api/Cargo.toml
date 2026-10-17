@@ -41,9 +41,11 @@ md5 = "0.7"
 async-trait = "0.1"
 
 [dev-dependencies]
+s4-cluster = { path = "../s4-cluster", features = ["test-util"] }
 tokio-test = "0.4"
 http-body-util = "0.1"
 tempfile = "3"
+jsonwebtoken = "9"
 
 [lints]
 workspace = true

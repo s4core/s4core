@@ -146,6 +146,7 @@ pub struct DeleteObjectsResult {
 ///
 /// - 200 OK if bucket created successfully
 /// - 409 Conflict if bucket already exists
+/// - 501 Not Implemented for Object Lock in cluster mode, with no bucket created
 pub async fn create_bucket(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
@@ -164,6 +165,17 @@ pub async fn create_bucket(
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+
+    // Refused before the marker is written: a client asking for Object Lock
+    // gets no bucket that would not keep it.
+    if object_lock_enabled {
+        if let Some(resp) = super::cluster_unsupported::refuse_in_cluster(
+            &state,
+            super::cluster_unsupported::OBJECT_LOCK_UNSUPPORTED,
+        ) {
+            return resp;
+        }
+    }
 
     if let Err(e) = create_bucket_marker(&state, &bucket).await {
         return bucket_change_error_response(e);
@@ -277,7 +289,12 @@ pub(crate) async fn create_bucket_marker(
 
     if let Some(ref write_coord) = state.write_coordinator {
         if let Some(ref read_coord) = state.read_coordinator {
-            match read_coord.head("__system__", &marker_key).await {
+            // One round: the marker and the configurations are read side by side.
+            let (marker, configurations) = tokio::join!(
+                read_coord.head("__system__", &marker_key),
+                pass_configurations_of_earlier_buckets(read_coord, bucket)
+            );
+            match marker {
                 Ok(_) => return Err(BucketChangeError::AlreadyExists),
                 Err(ClusterError::ObjectNotFound { .. }) => {}
                 Err(e) => {
@@ -285,6 +302,7 @@ pub(crate) async fn create_bucket_marker(
                     return Err(BucketChangeError::Cluster(e));
                 }
             }
+            configurations?;
         }
         let written = write_coord
             .write(
@@ -325,6 +343,43 @@ pub(crate) async fn create_bucket_marker(
         })
 }
 
+/// Reads the bucket's configuration keys through read quorums before its
+/// marker is written, so that this node's clock passes every version of them
+/// and the marker comes out newer than any configuration an earlier bucket of
+/// the same name left behind: a configuration written after that bucket's
+/// DeleteBucket, by a request that checked the bucket before it, possibly
+/// through a node whose clock runs ahead of this one. Such a configuration
+/// then reads as not set (`read_bucket_config`), and the new bucket starts
+/// without it. Read side by side with the marker: the clock moves past
+/// whatever the reads return before the marker is written. A configuration
+/// an earlier release stored without an HLC is ordered by its wall clock
+/// alone, with a tolerance ([`s4_cluster::config_of_generation`]).
+async fn pass_configurations_of_earlier_buckets(
+    read_coord: &s4_cluster::QuorumReadCoordinator,
+    bucket: &str,
+) -> Result<(), BucketChangeError> {
+    let [cors, versioning, lifecycle, policy, object_lock, encryption] =
+        super::bucket_config_keys(bucket);
+    let (cors, versioning, lifecycle, policy, object_lock, encryption) = tokio::join!(
+        read_coord.head("__system__", &cors),
+        read_coord.head("__system__", &versioning),
+        read_coord.head("__system__", &lifecycle),
+        read_coord.head("__system__", &policy),
+        read_coord.head("__system__", &object_lock),
+        read_coord.head("__system__", &encryption)
+    );
+    for result in [cors, versioning, lifecycle, policy, object_lock, encryption] {
+        match result {
+            Ok(_) | Err(ClusterError::ObjectNotFound { .. }) => {}
+            Err(e) => {
+                error!("Cluster read of a configuration of bucket {bucket} failed: {e:?}");
+                return Err(BucketChangeError::Cluster(e));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Deletes a bucket: with `force` its objects first, otherwise only while it
 /// holds none; then its marker and its configuration. In cluster mode every
 /// step goes through the quorums, objects as DeleteObject deletes them, so
@@ -354,10 +409,8 @@ pub(crate) async fn delete_bucket_and_contents(
             if force {
                 delete_all_objects_in_cluster(state, &write_coord, list_coord, bucket).await?;
             } else {
-                match list_coord.list(bucket, "", 1, None).await {
-                    Ok(result) if !result.entries.is_empty() => {
-                        return Err(BucketChangeError::NotEmpty)
-                    }
+                match list_coord.list_up_to(bucket, "", 1).await {
+                    Ok(entries) if !entries.is_empty() => return Err(BucketChangeError::NotEmpty),
                     Ok(_) => {}
                     Err(e) => {
                         error!("Failed to check bucket emptiness: {:?}", e);
@@ -422,9 +475,13 @@ pub(crate) async fn delete_bucket_and_contents(
 }
 
 /// Deletes every object of a bucket through the write quorum, page by page.
-/// A key listed again after it was deleted — a replica that has not taken the
-/// delete yet still lists it — is not deleted twice; a page made only of such
-/// keys stops the deletion rather than loop.
+///
+/// A pass follows the listing's continuation tokens to the end of the bucket:
+/// the tombstones the deletes leave are skipped by the listing, and starting
+/// each page from the first key would scan them again every time. Passes
+/// repeat until one finds nothing, which catches an object written behind a
+/// pass. A key listed again after it was deleted is not deleted twice; a pass
+/// made only of such keys stops the deletion rather than loop.
 async fn delete_all_objects_in_cluster(
     state: &AppState,
     write_coord: &s4_cluster::QuorumWriteCoordinator,
@@ -433,39 +490,48 @@ async fn delete_all_objects_in_cluster(
 ) -> Result<(), BucketChangeError> {
     let mut deleted = std::collections::HashSet::new();
     loop {
-        let page = list_coord.list(bucket, "", 1000, None).await.map_err(|e| {
-            error!(
-                "Failed to list objects of {} to delete them: {:?}",
-                bucket, e
-            );
-            BucketChangeError::Cluster(e)
-        })?;
-        if page.entries.is_empty() {
-            return Ok(());
-        }
+        let mut listed_any = false;
         let mut progressed = false;
-        for entry in page.entries {
-            if !deleted.insert(entry.key.clone()) {
-                continue;
-            }
-            progressed = true;
-            if let Err(response) =
-                super::object::delete_object_in_cluster(state, write_coord, bucket, &entry.key)
-                    .await
-            {
-                let message = format!(
-                    "Failed to delete object {} of {}: {}",
-                    entry.key,
-                    bucket,
-                    response.status()
+        let mut after: Option<String> = None;
+        loop {
+            let page = list_coord.list(bucket, "", 1000, after.as_deref()).await.map_err(|e| {
+                error!(
+                    "Failed to list objects of {} to delete them: {:?}",
+                    bucket, e
                 );
-                error!("{}", message);
-                return Err(if response.status() == StatusCode::SERVICE_UNAVAILABLE {
-                    BucketChangeError::Unavailable(message)
-                } else {
-                    BucketChangeError::Storage(message)
-                });
+                BucketChangeError::Cluster(e)
+            })?;
+            for entry in &page.entries {
+                listed_any = true;
+                if !deleted.insert(entry.key.clone()) {
+                    continue;
+                }
+                progressed = true;
+                if let Err(response) =
+                    super::object::delete_object_in_cluster(state, write_coord, bucket, &entry.key)
+                        .await
+                {
+                    let message = format!(
+                        "Failed to delete object {} of {}: {}",
+                        entry.key,
+                        bucket,
+                        response.status()
+                    );
+                    error!("{}", message);
+                    return Err(if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+                        BucketChangeError::Unavailable(message)
+                    } else {
+                        BucketChangeError::Storage(message)
+                    });
+                }
             }
+            match page.next_continuation_token {
+                Some(token) if page.is_truncated => after = Some(token),
+                _ => break,
+            }
+        }
+        if !listed_any {
+            return Ok(());
         }
         if !progressed {
             return Err(BucketChangeError::Storage(format!(
@@ -512,17 +578,11 @@ pub async fn list_buckets(State(state): State<AppState>) -> impl IntoResponse {
     let buckets: Vec<String> = if let Some(ref list_coord) = state.list_coordinator {
         // Cluster mode: distributed list of bucket markers across all nodes
         match list_coord
-            .list(
-                "__system__",
-                s4_core::types::BUCKET_MARKER_KEY_PREFIX,
-                1000,
-                None,
-            )
+            .list_up_to("__system__", s4_core::types::BUCKET_MARKER_KEY_PREFIX, 1000)
             .await
         {
-            Ok(result) => {
-                let mut names: Vec<String> = result
-                    .entries
+            Ok(entries) => {
+                let mut names: Vec<String> = entries
                     .iter()
                     .filter_map(|e| {
                         e.key

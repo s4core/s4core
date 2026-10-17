@@ -36,8 +36,11 @@ use crate::ec_object::{
 };
 use crate::error::ClusterError;
 use crate::gossip::GossipHandle;
+use crate::iam_adoption::IamOwnUsers;
+use crate::iam_catch_up::IamCopy;
+use crate::iam_lease::{fence_from_proto_hlc, IamLeaseKeeper};
 use crate::identity::{NodeId, NodeMeta};
-use crate::repair::anti_entropy::AntiEntropyService;
+use crate::repair::anti_entropy::AntiEntropyResponder;
 use crate::replica::{ReplicaMultipartHandler, ReplicaReadHandler, ReplicaWriteHandler};
 use crate::rpc::proto::{self, s4_node_server};
 use crate::rpc::tls::TlsConfig;
@@ -79,12 +82,27 @@ pub struct NodeRpcServer {
     replica_handler: Option<Arc<ReplicaWriteHandler>>,
     multipart_handler: Option<Arc<ReplicaMultipartHandler>>,
     read_handler: Option<Arc<ReplicaReadHandler>>,
-    anti_entropy: Option<Arc<AntiEntropyService>>,
     heat_query: Option<Arc<dyn EcHeatQuery>>,
     content_digest_scan: Option<Arc<dyn EcContentDigestScan>>,
     tombstone_probe: Option<Arc<dyn EcTombstoneProbeService>>,
+    anti_entropy: Option<Arc<AntiEntropyResponder>>,
+    iam_lease: Option<Arc<IamLeaseKeeper>>,
+    iam_copy: Option<Arc<IamCopy>>,
+    iam_own_users: Option<Arc<IamOwnUsers>>,
+    pool_move: PoolMoveSlot,
     started_at: std::time::Instant,
 }
+
+/// What answers `PoolMove` on this node: its part in the pool's growth.
+#[async_trait::async_trait]
+pub trait PoolMoveResponder: Send + Sync {
+    /// Answers, after applying what the request hands this node.
+    async fn pool_move(&self, request: proto::PoolMoveRequest) -> proto::PoolMoveResponse;
+}
+
+/// Where the answerer of `PoolMove` is put once the node has built it: the
+/// gRPC server starts before the placement it reports on.
+pub type PoolMoveSlot = Arc<std::sync::OnceLock<Arc<dyn PoolMoveResponder>>>;
 
 impl NodeRpcServer {
     /// Create a new gRPC server instance without a storage engine.
@@ -108,8 +126,19 @@ impl NodeRpcServer {
             content_digest_scan: None,
             tombstone_probe: None,
             anti_entropy: None,
+            iam_lease: None,
+            iam_copy: None,
+            iam_own_users: None,
+            pool_move: PoolMoveSlot::default(),
             started_at: std::time::Instant::now(),
         }
+    }
+
+    /// Answers `PoolMove` by whatever `slot` holds once it is filled; until
+    /// then the call is unavailable.
+    pub fn with_pool_move(mut self, slot: PoolMoveSlot) -> Self {
+        self.pool_move = slot;
+        self
     }
 
     /// Attach a replica write handler for Phase 4 data plane operations.
@@ -166,22 +195,76 @@ impl NodeRpcServer {
         self
     }
 
-    /// Attach an anti-entropy service for Phase 7 Merkle exchange.
+    /// Attach the answers to the anti-entropy rounds of this node's peers.
     ///
-    /// When set, ExchangeMerkleDigest and RepairSync requests will be
-    /// handled by the anti-entropy service.
-    pub fn with_anti_entropy(mut self, service: Arc<AntiEntropyService>) -> Self {
-        self.anti_entropy = Some(service);
+    /// Without it the node answers `Unimplemented`, as a node before protocol 5
+    /// does.
+    pub fn with_anti_entropy(mut self, responder: Arc<AntiEntropyResponder>) -> Self {
+        self.anti_entropy = Some(responder);
+        self
+    }
+
+    /// Attach this node's grants of the lease of IAM changes.
+    ///
+    /// Without it the node answers `Unimplemented`, as a node before protocol 8
+    /// does, and a holder counts it as not granting.
+    pub fn with_iam_lease(mut self, keeper: Arc<IamLeaseKeeper>) -> Self {
+        self.iam_lease = Some(keeper);
+        self
+    }
+
+    /// Answer `IamVersions` from this node's copy of IAM, for peers that
+    /// catch theirs up with it.
+    pub fn with_iam_copy(mut self, copy: Arc<IamCopy>) -> Self {
+        self.iam_copy = Some(copy);
+        self
+    }
+
+    /// Answer `IamOwnUsers` with the user records this node keeps of its
+    /// own, for the report of the pool's adoption of IAM.
+    pub fn with_iam_own_users(mut self, own: Arc<IamOwnUsers>) -> Self {
+        self.iam_own_users = Some(own);
         self
     }
 
     /// Start the gRPC server in a background task.
     ///
     /// Returns a [`RpcServerHandle`] that can be used to trigger graceful shutdown.
-    /// The server binds to `config.bind_addr` and serves the S4Node service.
+    /// The server binds to `config.bind_addr` before this returns and serves the
+    /// S4Node service.
+    ///
+    /// # Errors
+    ///
+    /// The address could not be bound — another process listens on it. A
+    /// server bound in its background task would fail there without a word,
+    /// and the node would run without its peers reaching it. The socket is
+    /// bound with `SO_REUSEADDR`, so connections of a previous run still in
+    /// `TIME_WAIT` on the port do not keep it from binding.
     pub async fn start(self, config: RpcServerConfig) -> Result<RpcServerHandle, ClusterError> {
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let bind_addr = config.bind_addr;
+        let listener = tokio::net::TcpListener::bind(bind_addr).await.map_err(|e| {
+            ClusterError::Rpc(format!("gRPC server could not bind {bind_addr}: {e}"))
+        })?;
+        self.start_on(listener, config)
+    }
+
+    /// [`Self::start`] on a listener that is already bound. Tests hand over the
+    /// listener they reserved the address with: closing it and binding the same
+    /// port again leaves a moment in which a test running beside it can take
+    /// that port.
+    fn start_on(
+        self,
+        listener: tokio::net::TcpListener,
+        config: RpcServerConfig,
+    ) -> Result<RpcServerHandle, ClusterError> {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let bind_addr = listener
+            .local_addr()
+            .map_err(|e| ClusterError::Rpc(format!("gRPC server listener has no address: {e}")))?;
+        // As `Server::builder()` sets them for an address it binds itself.
+        let incoming =
+            tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
+                .map_err(|e| ClusterError::Rpc(format!("gRPC server on {bind_addr}: {e}")))?;
         let max_message_size = config.max_message_size;
         let tls_config = config.tls.clone();
         let shutdown_timeout = config.shutdown_timeout;
@@ -207,7 +290,7 @@ impl NodeRpcServer {
 
             builder
                 .add_service(svc)
-                .serve_with_shutdown(bind_addr, async move {
+                .serve_with_incoming_shutdown(incoming, async move {
                     let _ = shutdown_rx.wait_for(|&v| v).await;
                     info!("gRPC server received shutdown signal");
                 })
@@ -218,8 +301,6 @@ impl NodeRpcServer {
             Ok::<(), ClusterError>(())
         });
 
-        // Give the server a moment to bind.
-        tokio::time::sleep(Duration::from_millis(50)).await;
         info!(addr = %bind_addr, "gRPC server started");
 
         Ok(RpcServerHandle {
@@ -232,6 +313,7 @@ impl NodeRpcServer {
 
 fn delete_request_from_hint(hint_req: &proto::HintRequest) -> proto::DeleteBlobRequest {
     proto::DeleteBlobRequest {
+        placement_generation: hint_req.placement_generation,
         bucket: hint_req.bucket.clone(),
         key: hint_req.key.clone(),
         hlc: hint_req.hlc.clone(),
@@ -240,6 +322,10 @@ fn delete_request_from_hint(hint_req: &proto::HintRequest) -> proto::DeleteBlobR
         topology_epoch: 0,
         version_id: hint_req.version_id.clone(),
         expected_source_hlc: hint_req.expected_source_hlc.clone(),
+        bucket_metadata_stage: 0,
+        // A hint replays an operation a replica missed, at its own HLC.
+        repair_copy: true,
+        iam_lease: None,
     }
 }
 
@@ -248,6 +334,58 @@ impl s4_node_server::S4Node for NodeRpcServer {
     // ========================================================================
     // Cluster management — fully implemented in Phase 2
     // ========================================================================
+
+    async fn anti_entropy_leaves(
+        &self,
+        request: Request<proto::AntiEntropyLeavesRequest>,
+    ) -> Result<Response<proto::AntiEntropyLeavesResponse>, Status> {
+        let Some(responder) = &self.anti_entropy else {
+            return Err(Status::unimplemented(
+                "AntiEntropyLeaves is not served by this node",
+            ));
+        };
+        Ok(Response::new(responder.leaves(request.get_ref()).await))
+    }
+
+    async fn anti_entropy_keys(
+        &self,
+        request: Request<proto::AntiEntropyKeysRequest>,
+    ) -> Result<Response<proto::AntiEntropyKeysResponse>, Status> {
+        let Some(responder) = &self.anti_entropy else {
+            return Err(Status::unimplemented(
+                "AntiEntropyKeys is not served by this node",
+            ));
+        };
+        Ok(Response::new(responder.keys(request.get_ref()).await))
+    }
+
+    async fn pool_move(
+        &self,
+        request: Request<proto::PoolMoveRequest>,
+    ) -> Result<Response<proto::PoolMoveResponse>, Status> {
+        let Some(responder) = self.pool_move.get() else {
+            return Err(Status::unavailable(
+                "this node has not set up its part in the pool's growth yet",
+            ));
+        };
+        Ok(Response::new(
+            responder.pool_move(request.into_inner()).await,
+        ))
+    }
+
+    async fn range_digests(
+        &self,
+        request: Request<proto::RangeDigestsRequest>,
+    ) -> Result<Response<proto::RangeDigestsResponse>, Status> {
+        let Some(handler) = &self.read_handler else {
+            return Err(Status::unimplemented(
+                "RangeDigests is not served by this node",
+            ));
+        };
+        Ok(Response::new(
+            handler.range_digests(request.get_ref()).await,
+        ))
+    }
 
     async fn health(
         &self,
@@ -299,6 +437,9 @@ impl s4_node_server::S4Node for NodeRpcServer {
 
         match handler.handle_write(request.get_ref()).await {
             Ok(response) => Ok(Response::new(response)),
+            Err(e @ ClusterError::PlacementGenerationFenced { .. }) => {
+                Err(cluster_error_to_status(e))
+            }
             Err(e) => {
                 error!(error = %e, "replica write failed");
                 Ok(Response::new(proto::WriteBlobResponse {
@@ -306,6 +447,9 @@ impl s4_node_server::S4Node for NodeRpcServer {
                     error: e.to_string(),
                     local_sequence: 0,
                     epoch_mismatch: false,
+                    superseded_by: None,
+                    stage_fenced: false,
+                    lease_fenced: false,
                 }))
             }
         }
@@ -336,6 +480,8 @@ impl s4_node_server::S4Node for NodeRpcServer {
                     version_id: None,
                     content_length: 0,
                     epoch_mismatch: false,
+                    tombstone: false,
+                    etag: String::new(),
                 }))
             }
         }
@@ -353,6 +499,9 @@ impl s4_node_server::S4Node for NodeRpcServer {
 
         match handler.handle_delete(request.get_ref()).await {
             Ok(response) => Ok(Response::new(response)),
+            Err(e @ ClusterError::PlacementGenerationFenced { .. }) => {
+                Err(cluster_error_to_status(e))
+            }
             Err(e) => {
                 error!(error = %e, "replica delete failed");
                 Ok(Response::new(proto::DeleteBlobResponse {
@@ -360,6 +509,9 @@ impl s4_node_server::S4Node for NodeRpcServer {
                     error: e.to_string(),
                     local_sequence: 0,
                     epoch_mismatch: false,
+                    superseded_by: None,
+                    stage_fenced: false,
+                    lease_fenced: false,
                 }))
             }
         }
@@ -377,6 +529,9 @@ impl s4_node_server::S4Node for NodeRpcServer {
 
         match handler.handle_detach_object_data(request.get_ref()).await {
             Ok(response) => Ok(Response::new(response)),
+            Err(e @ ClusterError::PlacementGenerationFenced { .. }) => {
+                Err(cluster_error_to_status(e))
+            }
             Err(e) => {
                 error!(error = %e, "replica detach failed");
                 Ok(Response::new(proto::DetachObjectDataResponse {
@@ -401,6 +556,9 @@ impl s4_node_server::S4Node for NodeRpcServer {
 
         match handler.handle_attach_object_data(request.get_ref()).await {
             Ok(response) => Ok(Response::new(response)),
+            Err(e @ ClusterError::PlacementGenerationFenced { .. }) => {
+                Err(cluster_error_to_status(e))
+            }
             Err(e) => {
                 error!(error = %e, "replica attach failed");
                 Ok(Response::new(proto::AttachObjectDataResponse {
@@ -425,6 +583,9 @@ impl s4_node_server::S4Node for NodeRpcServer {
 
         match handler.handle_restore_namespace_entry(request.get_ref()).await {
             Ok(response) => Ok(Response::new(response)),
+            Err(e @ ClusterError::PlacementGenerationFenced { .. }) => {
+                Err(cluster_error_to_status(e))
+            }
             Err(e) => {
                 error!(error = %e, "replica namespace restore failed");
                 Ok(Response::new(proto::RestoreNamespaceEntryResponse {
@@ -449,6 +610,9 @@ impl s4_node_server::S4Node for NodeRpcServer {
 
         match handler.handle_create(request.get_ref()).await {
             Ok(response) => Ok(Response::new(response)),
+            Err(e @ ClusterError::PlacementGenerationFenced { .. }) => {
+                Err(cluster_error_to_status(e))
+            }
             Err(e) => {
                 error!(error = %e, "replica multipart create failed");
                 Ok(Response::new(proto::CreateMultipartUploadReplicaResponse {
@@ -472,6 +636,9 @@ impl s4_node_server::S4Node for NodeRpcServer {
 
         match handler.handle_upload_part(request.into_inner()).await {
             Ok(response) => Ok(Response::new(response)),
+            Err(e @ ClusterError::PlacementGenerationFenced { .. }) => {
+                Err(cluster_error_to_status(e))
+            }
             Err(e) => {
                 error!(error = %e, "replica multipart part failed");
                 Ok(Response::new(proto::UploadMultipartPartReplicaResponse {
@@ -506,6 +673,7 @@ impl s4_node_server::S4Node for NodeRpcServer {
                         session: Vec::new(),
                         part_records: Vec::new(),
                         epoch_mismatch: false,
+                        key_hlc: None,
                     },
                 ))
             }
@@ -524,6 +692,9 @@ impl s4_node_server::S4Node for NodeRpcServer {
 
         match handler.handle_complete(request.get_ref()).await {
             Ok(response) => Ok(Response::new(response)),
+            Err(e @ ClusterError::PlacementGenerationFenced { .. }) => {
+                Err(cluster_error_to_status(e))
+            }
             Err(e) => {
                 error!(error = %e, "replica multipart complete failed");
                 Ok(Response::new(
@@ -550,6 +721,9 @@ impl s4_node_server::S4Node for NodeRpcServer {
 
         match handler.handle_abort(request.get_ref()).await {
             Ok(response) => Ok(Response::new(response)),
+            Err(e @ ClusterError::PlacementGenerationFenced { .. }) => {
+                Err(cluster_error_to_status(e))
+            }
             Err(e) => {
                 error!(error = %e, "replica multipart abort failed");
                 Ok(Response::new(proto::AbortMultipartUploadReplicaResponse {
@@ -596,6 +770,9 @@ impl s4_node_server::S4Node for NodeRpcServer {
 
         match handler.handle_write(&assembled).await {
             Ok(response) => Ok(Response::new(response)),
+            Err(e @ ClusterError::PlacementGenerationFenced { .. }) => {
+                Err(cluster_error_to_status(e))
+            }
             Err(e) => {
                 error!(error = %e, "streamed replica write failed");
                 Ok(Response::new(proto::WriteBlobResponse {
@@ -603,6 +780,9 @@ impl s4_node_server::S4Node for NodeRpcServer {
                     error: e.to_string(),
                     local_sequence: 0,
                     epoch_mismatch: false,
+                    superseded_by: None,
+                    stage_fenced: false,
+                    lease_fenced: false,
                 }))
             }
         }
@@ -631,6 +811,7 @@ impl s4_node_server::S4Node for NodeRpcServer {
         let header = proto::ReadBlobChunk {
             payload: Some(proto::read_blob_chunk::Payload::Header(
                 proto::ReadBlobHeader {
+                    etag: record.etag,
                     content_hash: record.content_hash.to_vec(),
                     content_type: record.content_type,
                     metadata: record.metadata,
@@ -728,6 +909,8 @@ impl s4_node_server::S4Node for NodeRpcServer {
                     etag: String::new(),
                     epoch_mismatch: false,
                     content_hash: Vec::new(),
+                    tombstone: false,
+                    tombstone_horizon: None,
                 }))
             }
         }
@@ -899,87 +1082,6 @@ impl s4_node_server::S4Node for NodeRpcServer {
     }
 
     // ========================================================================
-    // Repair / Anti-entropy — Phase 7
-    // ========================================================================
-
-    async fn exchange_merkle_digest(
-        &self,
-        request: Request<proto::MerkleDigestRequest>,
-    ) -> Result<Response<proto::MerkleDigestResponse>, Status> {
-        let Some(ae) = &self.anti_entropy else {
-            return Err(Status::unimplemented(
-                "ExchangeMerkleDigest requires anti-entropy service (not configured)",
-            ));
-        };
-
-        let response = ae.handle_merkle_exchange(request.get_ref()).await;
-        Ok(Response::new(response))
-    }
-
-    type RepairSyncStream =
-        tokio_stream::wrappers::ReceiverStream<Result<proto::RepairSyncResponse, Status>>;
-
-    async fn repair_sync(
-        &self,
-        request: Request<proto::RepairSyncRequest>,
-    ) -> Result<Response<Self::RepairSyncStream>, Status> {
-        let Some(handler) = &self.read_handler else {
-            return Err(Status::unimplemented(
-                "RepairSync requires a storage engine (not configured)",
-            ));
-        };
-
-        let req = request.into_inner();
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
-        let read_handler = handler.clone();
-
-        tokio::spawn(async move {
-            for key in req.keys {
-                // Parse "bucket/key" or just "key" for range-based repair.
-                let (bucket, obj_key) = match key.split_once('/') {
-                    Some((b, k)) => (b.to_string(), k.to_string()),
-                    None => (req.bucket.clone(), key.clone()),
-                };
-
-                let read_req = proto::ReadBlobRequest {
-                    bucket: bucket.clone(),
-                    key: obj_key.clone(),
-                    version_id: None,
-                    coordinator_id: Vec::new(),
-                    operation_id: Vec::new(),
-                    topology_epoch: req.topology_epoch,
-                    range_start: None,
-                    range_end: None,
-                };
-
-                match read_handler.handle_read(&read_req).await {
-                    Ok(resp) if resp.success => {
-                        let _ = tx
-                            .send(Ok(proto::RepairSyncResponse {
-                                key: format!("{bucket}/{obj_key}"),
-                                data: resp.data,
-                                record: Vec::new(),
-                                hlc: resp.hlc,
-                                version_id: resp.version_id,
-                                content_hash: resp.content_hash,
-                                content_type: resp.content_type,
-                                metadata: resp.metadata,
-                            }))
-                            .await;
-                    }
-                    Ok(_) | Err(_) => {
-                        // Key not found or error — skip it.
-                    }
-                }
-            }
-        });
-
-        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
-            rx,
-        )))
-    }
-
-    // ========================================================================
     // Snapshot streaming — Phase 7+
     // ========================================================================
 
@@ -998,6 +1100,154 @@ impl s4_node_server::S4Node for NodeRpcServer {
     // ========================================================================
     // Hinted handoff — Phase 4 (delivery via DeliverHint)
     // ========================================================================
+
+    async fn iam_lease_acquire(
+        &self,
+        request: Request<proto::IamLeaseAcquireRequest>,
+    ) -> Result<Response<proto::IamLeaseAcquireResponse>, Status> {
+        let Some(keeper) = &self.iam_lease else {
+            return Err(Status::unimplemented(
+                "IamLeaseAcquire is not served by this node",
+            ));
+        };
+        let request = request.into_inner();
+        let holder = NodeId::from_bytes(&request.holder)
+            .map_err(|e| Status::invalid_argument(format!("holder: {e}")))?;
+        let ceiling = fence_from_proto_hlc(request.ceiling.as_ref());
+        let duration = Duration::from_millis(request.duration_ms);
+        let response = match keeper.acquire(holder, request.epoch, ceiling, duration).await {
+            Ok((grant, max_epoch)) => crate::iam_lease::grant_to_proto(grant, max_epoch),
+            Err(error) => proto::IamLeaseAcquireResponse {
+                max_epoch: keeper.max_epoch().await,
+                error: error.to_string(),
+                ..Default::default()
+            },
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn iam_lease_release(
+        &self,
+        request: Request<proto::IamLeaseReleaseRequest>,
+    ) -> Result<Response<proto::IamLeaseReleaseResponse>, Status> {
+        let Some(keeper) = &self.iam_lease else {
+            return Err(Status::unimplemented(
+                "IamLeaseRelease is not served by this node",
+            ));
+        };
+        let request = request.into_inner();
+        let holder = NodeId::from_bytes(&request.holder)
+            .map_err(|e| Status::invalid_argument(format!("holder: {e}")))?;
+        let closing = fence_from_proto_hlc(request.closing.as_ref());
+        let released = keeper
+            .release(holder, request.epoch, closing)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        Ok(Response::new(proto::IamLeaseReleaseResponse { released }))
+    }
+
+    async fn iam_lease_read(
+        &self,
+        request: Request<proto::IamLeaseReadRequest>,
+    ) -> Result<Response<proto::IamLeaseReadResponse>, Status> {
+        let Some(keeper) = &self.iam_lease else {
+            return Err(Status::unimplemented(
+                "IamLeaseRead is not served by this node",
+            ));
+        };
+        let request = request.into_inner();
+        let fence = request.fence.as_ref().and_then(crate::iam_lease::LeaseFence::from_proto);
+        let start_after = Some(request.start_after.as_str()).filter(|key| !key.is_empty());
+        let max_keys = (request.max_keys as usize).clamp(1, 1000);
+        let response =
+            match keeper.read(fence.as_ref(), &request.prefix, start_after, max_keys).await {
+                Ok((records, is_truncated)) => proto::IamLeaseReadResponse {
+                    records: records
+                        .into_iter()
+                        .map(|record| proto::IamLeaseRecord {
+                            tombstone: record.data.is_none(),
+                            key: record.key,
+                            data: record.data.unwrap_or_default(),
+                            hlc: Some(record.hlc.to_proto()),
+                            etag: record.etag,
+                        })
+                        .collect(),
+                    is_truncated,
+                    ..Default::default()
+                },
+                Err(refusal) => proto::IamLeaseReadResponse {
+                    lease_fenced: matches!(refusal, crate::iam_lease::Refusal::Fenced(_)),
+                    error: refusal.to_string(),
+                    ..Default::default()
+                },
+            };
+        Ok(Response::new(response))
+    }
+
+    async fn iam_versions(
+        &self,
+        request: Request<proto::IamVersionsRequest>,
+    ) -> Result<Response<proto::IamVersionsResponse>, Status> {
+        let Some(copy) = &self.iam_copy else {
+            return Err(Status::unimplemented(
+                "IamVersions is not served by this node",
+            ));
+        };
+        let request = request.into_inner();
+        let start_after = Some(request.start_after.as_str()).filter(|key| !key.is_empty());
+        let max_keys = (request.max_keys as usize).clamp(1, 1000);
+        let response = match copy.versions(start_after, max_keys).await {
+            Ok(page) => proto::IamVersionsResponse {
+                versions: page
+                    .versions
+                    .into_iter()
+                    .map(|version| proto::IamVersion {
+                        tombstone: version.tombstone,
+                        key: version.key,
+                        hlc: Some(version.hlc.to_proto()),
+                        etag: version.etag,
+                    })
+                    .collect(),
+                is_truncated: page.is_truncated,
+                digest: page.digest.to_vec(),
+                ..Default::default()
+            },
+            Err(error) => proto::IamVersionsResponse {
+                error: error.to_string(),
+                ..Default::default()
+            },
+        };
+        Ok(Response::new(response))
+    }
+
+    async fn iam_own_users(
+        &self,
+        request: Request<proto::IamOwnUsersRequest>,
+    ) -> Result<Response<proto::IamOwnUsersResponse>, Status> {
+        let Some(own) = &self.iam_own_users else {
+            return Err(Status::unimplemented(
+                "IamOwnUsers is not served by this node",
+            ));
+        };
+        let request = request.into_inner();
+        let start_after = Some(request.start_after.as_str()).filter(|key| !key.is_empty());
+        let max_keys = (request.max_keys as usize).clamp(1, 1000);
+        let response = match own.page(start_after, max_keys).await {
+            Ok((records, is_truncated)) => proto::IamOwnUsersResponse {
+                records: records
+                    .into_iter()
+                    .map(|(key, data)| proto::IamOwnRecord { key, data })
+                    .collect(),
+                is_truncated,
+                ..Default::default()
+            },
+            Err(error) => proto::IamOwnUsersResponse {
+                error: error.to_string(),
+                ..Default::default()
+            },
+        };
+        Ok(Response::new(response))
+    }
 
     async fn deliver_hint(
         &self,
@@ -1023,6 +1273,9 @@ impl s4_node_server::S4Node for NodeRpcServer {
                     accepted: false,
                     error: resp.error,
                 })),
+                Err(e @ ClusterError::PlacementGenerationFenced { .. }) => {
+                    Err(cluster_error_to_status(e))
+                }
                 Err(e) => Ok(Response::new(proto::HintResponse {
                     accepted: false,
                     error: e.to_string(),
@@ -1032,6 +1285,8 @@ impl s4_node_server::S4Node for NodeRpcServer {
 
         // Reconstruct a WriteBlobRequest from the hint
         let write_req = proto::WriteBlobRequest {
+            verify_content: false,
+            placement_generation: hint_req.placement_generation,
             bucket: hint_req.bucket.clone(),
             key: hint_req.key.clone(),
             data: hint_req.data.clone(),
@@ -1043,6 +1298,11 @@ impl s4_node_server::S4Node for NodeRpcServer {
             coordinator_id: Vec::new(),
             operation_id: hint_req.operation_id.clone(),
             topology_epoch: 0, // Hints bypass epoch check
+            etag: String::new(),
+            bucket_metadata_stage: 0,
+            // A hint replays an operation a replica missed, at its own HLC.
+            repair_copy: true,
+            iam_lease: None,
         };
 
         match handler.handle_write(&write_req).await {
@@ -1054,6 +1314,9 @@ impl s4_node_server::S4Node for NodeRpcServer {
                 accepted: false,
                 error: resp.error,
             })),
+            Err(e @ ClusterError::PlacementGenerationFenced { .. }) => {
+                Err(cluster_error_to_status(e))
+            }
             Err(e) => Ok(Response::new(proto::HintResponse {
                 accepted: false,
                 error: e.to_string(),
@@ -1189,6 +1452,8 @@ impl StreamedBlob {
         }
 
         Ok(proto::WriteBlobRequest {
+            verify_content: false,
+            placement_generation: header.placement_generation,
             bucket: header.bucket,
             key: header.key,
             data: self.data,
@@ -1200,6 +1465,10 @@ impl StreamedBlob {
             coordinator_id: header.coordinator_id,
             operation_id: header.operation_id,
             topology_epoch: header.topology_epoch,
+            etag: header.etag,
+            bucket_metadata_stage: header.bucket_metadata_stage,
+            repair_copy: header.repair_copy,
+            iam_lease: header.iam_lease,
         })
     }
 }
@@ -1219,6 +1488,9 @@ fn content_digest_to_proto(digest: EcContentDigest) -> proto::EcContentDigest {
 fn cluster_error_to_status(error: ClusterError) -> Status {
     match error {
         ClusterError::ObjectNotFound { .. } => Status::not_found(error.to_string()),
+        ClusterError::PlacementGenerationFenced { .. } => {
+            Status::failed_precondition(error.to_string())
+        }
         ClusterError::EpochMismatch { .. } => Status::failed_precondition(error.to_string()),
         ClusterError::QuorumNotMet { .. } => Status::unavailable(error.to_string()),
         ClusterError::ReadTimeout(_) | ClusterError::WriteTimeout(_) => {
@@ -1308,6 +1580,38 @@ mod tests {
         GossipHandle::new_for_testing(HashMap::new())
     }
 
+    /// A server whose address another listener holds fails to start, rather
+    /// than returning a handle to a server that never listens; once the
+    /// address is free it starts and listens before `start` returns.
+    #[tokio::test]
+    async fn a_server_on_a_taken_address_fails_to_start() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap();
+        let server = || {
+            NodeRpcServer::new(
+                NodeId(1),
+                Arc::new(test_node_meta(NodeId(1))),
+                Arc::new(test_gossip_handle()),
+            )
+        };
+        let config = RpcServerConfig {
+            bind_addr: addr,
+            ..RpcServerConfig::default()
+        };
+        let refused = server().start(config.clone()).await;
+        assert!(
+            matches!(&refused, Err(ClusterError::Rpc(why)) if why.contains("could not bind")),
+            "a server started on a taken address"
+        );
+        drop(taken);
+        let handle = server().start(config).await.unwrap();
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_ok(),
+            "not listening once started"
+        );
+        drop(handle);
+    }
+
     #[test]
     fn delete_hint_replay_request_preserves_generation_guard() {
         let hlc = proto::HybridTimestamp {
@@ -1322,6 +1626,7 @@ mod tests {
         };
         let operation_id = uuid::Uuid::new_v4().as_u128().to_be_bytes().to_vec();
         let hint = proto::HintRequest {
+            placement_generation: 0,
             target_node_id: vec![3; 16],
             bucket: "bucket".to_string(),
             key: "key".to_string(),
@@ -1350,6 +1655,7 @@ mod tests {
         proto::WriteBlobChunk {
             payload: Some(proto::write_blob_chunk::Payload::Header(
                 proto::WriteBlobHeader {
+                    placement_generation: 0,
                     bucket: "bucket".into(),
                     key: "key".into(),
                     content_hash: vec![9u8; 32],
@@ -1361,6 +1667,10 @@ mod tests {
                     operation_id: vec![4u8; 16],
                     topology_epoch: 11,
                     total_size,
+                    bucket_metadata_stage: 2,
+                    repair_copy: true,
+                    iam_lease: None,
+                    etag: "abc-2".into(),
                 },
             )),
         }
@@ -1407,6 +1717,12 @@ mod tests {
         assert_eq!(request.coordinator_id, vec![3u8; 16]);
         assert_eq!(request.operation_id, vec![4u8; 16]);
         assert_eq!(request.topology_epoch, 11);
+        assert_eq!(request.bucket_metadata_stage, 2);
+        assert!(request.repair_copy);
+        assert_eq!(
+            request.etag, "abc-2",
+            "a streamed repair copy keeps its ETag"
+        );
     }
 
     /// A zero-length object is a header and nothing more.
@@ -1547,6 +1863,173 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn grpc_placement_fence_preserves_stream_generation_and_storage() {
+        use s4_core::storage::{BitcaskStorageEngine, StorageEngine};
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            BitcaskStorageEngine::new(
+                dir.path().join("volumes"),
+                dir.path().join("metadata"),
+                10 * 1024 * 1024,
+                4096,
+                false,
+            )
+            .await
+            .unwrap(),
+        );
+        let node_id = NodeId::generate();
+        let handler = ReplicaWriteHandler::new(
+            storage.clone(),
+            Arc::new(crate::idempotency::IdempotencyTracker::new()),
+            1,
+        )
+        .with_placement_generation(2);
+        let multipart = ReplicaMultipartHandler::new(
+            Arc::new(crate::replica::multipart::fencing_tests::UntouchedStorage),
+            Arc::new(crate::idempotency::IdempotencyTracker::new()),
+            1,
+        )
+        .with_placement_generation(2);
+        let server = NodeRpcServer::new(
+            node_id,
+            Arc::new(test_node_meta(node_id)),
+            Arc::new(test_gossip_handle()),
+        )
+        .with_replica_handler(Arc::new(handler))
+        .with_multipart_handler(Arc::new(multipart));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = server
+            .start_on(
+                listener,
+                RpcServerConfig {
+                    bind_addr: addr,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut client = S4NodeClient::connect(format!("http://{addr}")).await.unwrap();
+        // Exercise the production client, not just generated tonic bindings:
+        // a refusal must stay typed and must not be retried.
+        let metrics = crate::test_metrics::TestMetrics::install();
+        let mut remote_meta = test_node_meta(node_id);
+        remote_meta.addr.grpc_addr = addr;
+        let members = HashMap::from([(
+            node_id,
+            crate::gossip::NodeState {
+                meta: remote_meta,
+                status: crate::identity::NodeStatus::Alive,
+                last_seen: std::time::Instant::now(),
+            },
+        )]);
+        let node_client = crate::rpc::client::NodeClient::new(
+            Arc::new(GossipHandle::new_for_testing(members)),
+            crate::rpc::client::NodeClientConfig::default(),
+        );
+        assert!(matches!(
+            node_client.send_write(node_id, proto::WriteBlobRequest::default()).await,
+            Err(ClusterError::ReplicaFenced(_))
+        ));
+        assert_eq!(
+            metrics.value("s4_pool_generation_fenced_writes_total", &[]),
+            Some(1.0)
+        );
+        let part = proto::UploadMultipartPartReplicaChunk {
+            payload: Some(proto::upload_multipart_part_replica_chunk::Payload::Header(
+                proto::UploadMultipartPartReplicaHeader::default(),
+            )),
+        };
+        assert_eq!(
+            client
+                .upload_multipart_part_replica(tokio_stream::iter([part]))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            client
+                .create_multipart_upload_replica(
+                    proto::CreateMultipartUploadReplicaRequest::default()
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(
+            client
+                .complete_multipart_upload_replica(
+                    proto::CompleteMultipartUploadReplicaRequest::default()
+                )
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(client.abort_multipart_upload_replica(proto::AbortMultipartUploadReplicaRequest::default()).await
+            .unwrap_err().code(), tonic::Code::FailedPrecondition);
+        let mut request = proto::WriteBlobRequest {
+            bucket: "bucket".into(),
+            key: "key".into(),
+            data: b"value".to_vec(),
+            operation_id: 1u128.to_be_bytes().to_vec(),
+            ..Default::default()
+        };
+        let err = client.write_blob(request.clone()).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(err.message().contains("placement generation fenced"));
+        assert!(storage.get_object("bucket", "key").await.is_err());
+        request.placement_generation = 2;
+        assert!(client.write_blob(request.clone()).await.unwrap().into_inner().success);
+        // A stale duplicate is refused before the idempotency tracker answers.
+        request.placement_generation = 0;
+        assert_eq!(
+            client.write_blob(request).await.unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        let delete = proto::DeleteBlobRequest {
+            bucket: "bucket".into(),
+            key: "key".into(),
+            operation_id: 2u128.to_be_bytes().to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(
+            client.delete_blob(delete).await.unwrap_err().code(),
+            tonic::Code::FailedPrecondition
+        );
+        for generation in [0, 2] {
+            let header = proto::WriteBlobHeader {
+                bucket: "bucket".into(),
+                key: "stream".into(),
+                operation_id: 3u128.to_be_bytes().to_vec(),
+                placement_generation: generation,
+                total_size: 5,
+                ..Default::default()
+            };
+            let chunks = vec![
+                proto::WriteBlobChunk {
+                    payload: Some(proto::write_blob_chunk::Payload::Header(header)),
+                },
+                proto::WriteBlobChunk {
+                    payload: Some(proto::write_blob_chunk::Payload::Data(b"value".to_vec())),
+                },
+            ];
+            let result = client.write_blob_stream(tokio_stream::iter(chunks)).await;
+            if generation == 0 {
+                assert_eq!(result.unwrap_err().code(), tonic::Code::FailedPrecondition);
+            } else {
+                assert!(result.unwrap().into_inner().success);
+            }
+        }
+        assert_eq!(
+            storage.get_object("bucket", "key").await.unwrap().0,
+            b"value"
+        );
+        handle.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn write_blob_without_handler_returns_unimplemented() {
         let node_id = NodeId::generate();
         let meta = Arc::new(test_node_meta(node_id));
@@ -1592,6 +2075,210 @@ mod tests {
         let err = client.deliver_hint(proto::HintRequest::default()).await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unimplemented);
 
+        handle.shutdown().await.unwrap();
+    }
+
+    /// The Merkle exchange of earlier releases is gone from the protocol: a
+    /// node answers it `Unimplemented` even with the storage that served
+    /// `RepairSync`. No node of an earlier release sends it, since their
+    /// rounds never ran.
+    #[tokio::test]
+    async fn the_merkle_exchange_of_earlier_releases_is_unimplemented() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let storage = s4_core::storage::BitcaskStorageEngine::new(
+            temp.path().join("volumes"),
+            temp.path().join("metadata_db"),
+            1024 * 1024,
+            4096,
+            false,
+        )
+        .await
+        .unwrap();
+        let node_id = NodeId::generate();
+        let server = NodeRpcServer::new(
+            node_id,
+            Arc::new(test_node_meta(node_id)),
+            Arc::new(test_gossip_handle()),
+        )
+        .with_read_handler(Arc::new(ReplicaReadHandler::new(Arc::new(storage), 1)));
+        let addr: SocketAddr = "127.0.0.1:19104".parse().unwrap();
+        let handle = server
+            .start(RpcServerConfig {
+                bind_addr: addr,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        for method in ["ExchangeMerkleDigest", "RepairSync"] {
+            let mut grpc = tonic::client::Grpc::new(channel.clone());
+            grpc.ready().await.unwrap();
+            let path = tonic::codegen::http::uri::PathAndQuery::try_from(format!(
+                "/s4.cluster.S4Node/{method}"
+            ))
+            .unwrap();
+            let err = grpc
+                .unary(
+                    tonic::Request::new(proto::HealthRequest {}),
+                    path,
+                    tonic::codec::ProstCodec::<proto::HealthRequest, proto::HealthResponse>::default(),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::Unimplemented, "{method}");
+        }
+
+        let mut client = S4NodeClient::new(channel);
+        let health = client.health(proto::HealthRequest {}).await.unwrap().into_inner();
+        assert_eq!(health.protocol_version, crate::protocol::PROTOCOL_VERSION);
+
+        handle.shutdown().await.unwrap();
+    }
+    /// Both production RPC shapes copy a legacy multipart ETag using the
+    /// transport field and made-up HLC; an untrusted metadata key never does.
+    #[tokio::test]
+    async fn legacy_multipart_copy_keeps_etag_and_metadata_over_unary_and_streaming_rpc() {
+        use s4_core::StorageEngine;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Arc::new(
+            s4_core::storage::BitcaskStorageEngine::open(
+                dir.path().join("volumes"),
+                dir.path().join("metadata"),
+                1024 * 1024,
+                4096,
+                true,
+                s4_core::storage::IndexOptions {
+                    version_digests: true,
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let node = NodeId(7);
+        let server = NodeRpcServer::new(
+            node,
+            Arc::new(test_node_meta(node)),
+            Arc::new(test_gossip_handle()),
+        )
+        .with_replica_handler(Arc::new(ReplicaWriteHandler::new(
+            storage.clone(),
+            Arc::new(crate::idempotency::IdempotencyTracker::new()),
+            1,
+        )));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = server
+            .start_on(
+                listener,
+                RpcServerConfig {
+                    bind_addr: addr,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut client = S4NodeClient::connect(format!("http://{addr}")).await.unwrap();
+        let etag = "9b2cf535f27731c974343645a3985328-2";
+        let data = b"first part and second part";
+        for streaming in [false, true] {
+            for with_hlc in [false, true] {
+                let key = format!("copy-{streaming}-{with_hlc}");
+                let operation =
+                    (1 + u128::from(streaming) * 2 + u128::from(with_hlc)).to_be_bytes().to_vec();
+                let hlc = with_hlc.then(|| proto::HybridTimestamp {
+                    wall_time: 1234,
+                    logical: 0,
+                    node_id: 0u128.to_be_bytes().to_vec(),
+                });
+                let metadata = HashMap::from([
+                    ("label".into(), "single-node-value".into()),
+                    ("_s4_etag".into(), "forged-etag-9".into()),
+                ]);
+                let response = if streaming {
+                    let header = proto::WriteBlobHeader {
+                        bucket: "bucket".into(),
+                        key: key.clone(),
+                        content_type: "application/example".into(),
+                        metadata,
+                        hlc,
+                        etag: etag.into(),
+                        operation_id: operation,
+                        total_size: data.len() as u64,
+                        repair_copy: true,
+                        ..Default::default()
+                    };
+                    client
+                        .write_blob_stream(tokio_stream::iter([
+                            proto::WriteBlobChunk {
+                                payload: Some(proto::write_blob_chunk::Payload::Header(header)),
+                            },
+                            blob_body(&data[..7]),
+                            blob_body(&data[7..]),
+                        ]))
+                        .await
+                        .unwrap()
+                        .into_inner()
+                } else {
+                    client
+                        .write_blob(proto::WriteBlobRequest {
+                            bucket: "bucket".into(),
+                            key: key.clone(),
+                            data: data.to_vec(),
+                            content_type: "application/example".into(),
+                            metadata,
+                            hlc,
+                            etag: etag.into(),
+                            operation_id: operation,
+                            repair_copy: true,
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap()
+                        .into_inner()
+                };
+                assert!(response.success, "{}", response.error);
+                let (stored, record) = storage.get_object("bucket", &key).await.unwrap();
+                assert_eq!(stored, data);
+                assert_eq!(record.content_type, "application/example");
+                assert_eq!(
+                    record.metadata.get("label").map(String::as_str),
+                    Some("single-node-value")
+                );
+                assert!(!record.metadata.contains_key("_s4_etag"));
+                if with_hlc {
+                    assert_eq!(record.etag, etag);
+                    assert_eq!(
+                        (
+                            record.hlc_timestamp,
+                            record.hlc_logical,
+                            record.origin_node_id
+                        ),
+                        (1234, 0, 0)
+                    );
+                } else {
+                    assert_ne!(record.etag, etag);
+                    assert_ne!(record.etag, "forged-etag-9");
+                    assert_eq!(record.hlc_timestamp, 0);
+                }
+            }
+        }
+        // Defense-in-depth marker creation on a brand-new replica is already
+        // stamped, so it does not become a fresh single-node migration source.
+        assert!(storage
+            .index_db()
+            .legacy_migration_page(true, None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        let legacy = storage.index_db().legacy_migration_page(false, None, 10).await.unwrap();
+        assert_eq!(
+            legacy.iter().map(|(key, _)| key.as_str()).collect::<Vec<_>>(),
+            vec!["bucket/copy-false-false", "bucket/copy-true-false"]
+        );
         handle.shutdown().await.unwrap();
     }
 }

@@ -24,21 +24,30 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use s4_api::handlers::UnenforcedConfigs;
+use s4_cluster::metadata_placement::{
+    derive_target, Backfill, BackfillPass, PlacementStatus, QuorumShape,
+};
 use s4_cluster::rpc::server::RpcServerHandle;
 use s4_cluster::{
-    AntiEntropyConfig, AntiEntropyService, BucketPlacement, ClusterAdminService, ClusterConfig,
-    ClusterEvent, ClusterLimits, DataScrubber, DistributedGcService, DistributedListCoordinator,
-    Edition, FilesystemCapacity, GcConfig, GossipConfig, GossipIdentity, GossipService,
-    HealingContext, HintDelivery, HintedHandoffConfig, HintedHandoffManager, HybridClock,
-    IdempotencyTracker, ListTimeouts, MultipartReplicaStorage, NodeAddr, NodeCapacityProvider,
-    NodeClient, NodeClientConfig, NodeClusterAdmin, NodeId, NodeMeta, NodeRpcServer, PeerNames,
-    PlacementRouter, PoolConfig, PoolId, PoolRoster, PoolShape, QuorumReadCoordinator,
-    QuorumWriteCoordinator, ReadRepairService, ReadTimeouts, ReplicaMultipartHandler,
-    ReplicaReadHandler, ReplicaWriteHandler, RpcServerConfig, ScrubberConfig, TombstonePolicy,
-    WriteTimeouts, PROTOCOL_VERSION, S4_VERSION,
+    AntiEntropyResponder, AntiEntropyRounds, AntiEntropyService, BucketPlacement,
+    ClusterAdminService, ClusterConfig, ClusterEvent, ClusterLimits, ConfigAdoption,
+    ConfigAdoptionStatus, ConfigReadGate, DataScrubber, DistributedGcService,
+    DistributedListCoordinator, Edition, FilesystemCapacity, GossipConfig, GossipHandle,
+    GossipIdentity, GossipService, HealingContext, HintDelivery, HintedHandoffConfig,
+    HintedHandoffManager, HlcTimestamp, HybridClock, IamAdoptionCollector, IamAdoptionGate,
+    IamCatchUp, IamCatchUpConfig, IamConfigCheck, IamCopy, IamFreshness, IamLeaseHolder,
+    IamLeaseKeeper, IamOwnUsers, IamStatusSource, IdempotencyTracker, ListTimeouts, LocalReplica,
+    MultipartReplicaStorage, NodeAddr, NodeCapacityProvider, NodeClient, NodeClientConfig,
+    NodeClusterAdmin, NodeId, NodeMeta, NodeRpcServer, PeerNames, PlacementRouter, PoolConfig,
+    PoolId, PoolLayout, PoolRoster, PoolShape, QuorumReadCoordinator, QuorumWriteCoordinator,
+    ReadRepairService, ReadTimeouts, Reconciler, ReplicaMultipartHandler, ReplicaReadHandler,
+    ReplicaWriteHandler, RpcServerConfig, ScrubberConfig, WriteTimeouts, PROTOCOL_VERSION,
+    S4_VERSION,
 };
 use s4_core::storage::engine::StorageEngine;
 use s4_core::storage::BitcaskStorageEngine;
+use s4_features::iam::IamDirectory;
 use tokio::sync::{mpsc, watch, RwLock};
 use tracing::{debug, info};
 
@@ -53,7 +62,56 @@ use crate::config::ClusterModeConfig;
 /// Cluster components (coordinators, replica handlers) require
 /// `Arc<dyn StorageEngine>`.  The server holds storage behind an
 /// `Arc<RwLock<…>>` for shared access — this adapter bridges the two.
-struct SharedStorageAdapter(Arc<RwLock<BitcaskStorageEngine>>);
+///
+/// Every change a cluster node makes to its storage goes through here — a
+/// write it coordinates, one a peer sends, a hint, anti-entropy, read repair —
+/// so this is where the node's directory of IAM users learns of a changed
+/// user record (plan CLUSTER-IAM-REPLICATION.md, decision 2), and its copy of
+/// IAM, as the pool compares it, of a changed record (decision 4).
+struct SharedStorageAdapter {
+    engine: Arc<RwLock<BitcaskStorageEngine>>,
+    iam_directory: Option<Arc<IamDirectory>>,
+    iam_copy: Option<Arc<IamCopy>>,
+}
+
+impl SharedStorageAdapter {
+    fn new(engine: Arc<RwLock<BitcaskStorageEngine>>) -> Self {
+        Self {
+            engine,
+            iam_directory: None,
+            iam_copy: None,
+        }
+    }
+
+    /// The same adapter, telling `directory` of every change of a user record.
+    fn with_iam_directory(mut self, directory: Option<Arc<IamDirectory>>) -> Self {
+        self.iam_directory = directory;
+        self
+    }
+
+    /// The same adapter, telling `copy` of every change of a record of the
+    /// cluster's control state.
+    fn with_iam_copy(mut self, copy: Arc<IamCopy>) -> Self {
+        self.iam_copy = Some(copy);
+        self
+    }
+
+    /// Brings the IAM directory and the copy of IAM to what `bucket/key`
+    /// holds now, after a change of it; any other key leaves them alone.
+    /// Called once the write lock is released: both read the record back.
+    async fn observe(&self, bucket: &str, key: &str) {
+        if let Some(directory) = &self.iam_directory {
+            if let Err(e) = directory.observe(bucket, key).await {
+                tracing::warn!(%bucket, %key, error = %e, "IAM directory not refreshed");
+            }
+        }
+        if let Some(copy) = &self.iam_copy {
+            if let Err(e) = copy.observe(bucket, key).await {
+                tracing::warn!(%bucket, %key, error = %e, "copy of IAM not refreshed");
+            }
+        }
+    }
+}
 
 #[async_trait::async_trait]
 impl StorageEngine for SharedStorageAdapter {
@@ -65,8 +123,31 @@ impl StorageEngine for SharedStorageAdapter {
         content_type: &str,
         metadata: &std::collections::HashMap<String, String>,
     ) -> Result<String, s4_core::error::StorageError> {
-        let storage = self.0.write().await;
-        storage.put_object(bucket, key, data, content_type, metadata).await
+        let result = {
+            let storage = self.engine.write().await;
+            storage.put_object(bucket, key, data, content_type, metadata).await
+        };
+        self.observe(bucket, key).await;
+        result
+    }
+
+    // Must be delegated explicitly: the trait's default reports every write
+    // as stored, and a coordinator would never raise a write that a newer
+    // version outranked.
+    async fn put_object_outcome(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        content_type: &str,
+        metadata: &std::collections::HashMap<String, String>,
+    ) -> Result<s4_core::PutOutcome, s4_core::error::StorageError> {
+        let result = {
+            let storage = self.engine.write().await;
+            storage.put_object_outcome(bucket, key, data, content_type, metadata).await
+        };
+        self.observe(bucket, key).await;
+        result
     }
 
     async fn get_object(
@@ -74,7 +155,7 @@ impl StorageEngine for SharedStorageAdapter {
         bucket: &str,
         key: &str,
     ) -> Result<(Vec<u8>, s4_core::types::IndexRecord), s4_core::error::StorageError> {
-        let storage = self.0.read().await;
+        let storage = self.engine.read().await;
         storage.get_object(bucket, key).await
     }
 
@@ -83,8 +164,12 @@ impl StorageEngine for SharedStorageAdapter {
         bucket: &str,
         key: &str,
     ) -> Result<(), s4_core::error::StorageError> {
-        let storage = self.0.write().await;
-        storage.delete_object(bucket, key).await
+        let result = {
+            let storage = self.engine.write().await;
+            storage.delete_object(bucket, key).await
+        };
+        self.observe(bucket, key).await;
+        result
     }
 
     // Must be delegated explicitly: the trait's default checks the generation
@@ -100,15 +185,98 @@ impl StorageEngine for SharedStorageAdapter {
         expected_hlc_logical: u32,
         expected_origin_node_id: u128,
     ) -> Result<bool, s4_core::error::StorageError> {
-        let storage = self.0.write().await;
+        let result = {
+            let storage = self.engine.write().await;
+            storage
+                .delete_object_if_hlc(
+                    bucket,
+                    key,
+                    expected_hlc_timestamp,
+                    expected_hlc_logical,
+                    expected_origin_node_id,
+                )
+                .await
+        };
+        self.observe(bucket, key).await;
+        result
+    }
+
+    // Must be delegated explicitly: the trait's default refuses, because a
+    // delete in its place would lose the tombstone. Under the write lock, like
+    // every write, so that the HLC check and the batch see the same record.
+    async fn tombstone_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        hlc_timestamp: u64,
+        hlc_logical: u32,
+        origin_node_id: u128,
+    ) -> Result<bool, s4_core::error::StorageError> {
+        let result = {
+            let storage = self.engine.write().await;
+            storage
+                .tombstone_object(bucket, key, hlc_timestamp, hlc_logical, origin_node_id)
+                .await
+        };
+        self.observe(bucket, key).await;
+        result
+    }
+
+    // Must be delegated explicitly: the trait's default removes nothing, and
+    // tombstone GC would never shrink the index. Under the write lock, like
+    // every write, so that a write or delete landing on a key after GC found
+    // its tombstone is never removed in its place. One lock and one sync to
+    // disk for the whole page.
+    async fn gc_tombstones(
+        &self,
+        tombstones: &[s4_core::storage::TombstoneRef],
+    ) -> Result<u64, s4_core::error::StorageError> {
+        let storage = self.engine.write().await;
+        storage.gc_tombstones(tombstones).await
+    }
+
+    // Must be delegated explicitly: the trait's defaults read through
+    // `head_object` and `list_objects`, which answer a tombstone as absence.
+    async fn key_version(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<s4_core::KeyVersion, s4_core::error::StorageError> {
+        let storage = self.engine.read().await;
+        storage.key_version(bucket, key).await
+    }
+
+    // Must be delegated explicitly: the trait's default has no horizon, and
+    // a replica that reports none makes every copy beside its absent key
+    // ambiguous to hint delivery.
+    async fn tombstone_horizon(
+        &self,
+    ) -> Result<Option<s4_core::storage::TombstoneHorizon>, s4_core::error::StorageError> {
+        let storage = self.engine.read().await;
+        storage.tombstone_horizon().await
+    }
+
+    async fn version_digests_in(
+        &self,
+        from: u64,
+        to: Option<u64>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<s4_core::storage::VersionDigestEntry>, s4_core::error::StorageError> {
+        let storage = self.engine.read().await;
+        storage.version_digests_in(from, to, after, limit).await
+    }
+
+    async fn list_objects_with_tombstones(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<Vec<(String, s4_core::types::IndexRecord)>, s4_core::error::StorageError> {
+        let storage = self.engine.read().await;
         storage
-            .delete_object_if_hlc(
-                bucket,
-                key,
-                expected_hlc_timestamp,
-                expected_hlc_logical,
-                expected_origin_node_id,
-            )
+            .list_objects_with_tombstones(bucket, prefix, start_after, max_keys)
             .await
     }
 
@@ -124,7 +292,7 @@ impl StorageEngine for SharedStorageAdapter {
         expected_origin_node_id: u128,
         layout: s4_core::types::ObjectLayout,
     ) -> Result<bool, s4_core::error::StorageError> {
-        let storage = self.0.write().await;
+        let storage = self.engine.write().await;
         storage
             .detach_object_data_if_hlc(
                 bucket,
@@ -150,7 +318,7 @@ impl StorageEngine for SharedStorageAdapter {
         expected_origin_node_id: u128,
         data: &[u8],
     ) -> Result<bool, s4_core::error::StorageError> {
-        let storage = self.0.write().await;
+        let storage = self.engine.write().await;
         storage
             .attach_object_data_if_hlc(
                 bucket,
@@ -171,7 +339,7 @@ impl StorageEngine for SharedStorageAdapter {
         key: &str,
         record: s4_core::types::IndexRecord,
     ) -> Result<bool, s4_core::error::StorageError> {
-        let storage = self.0.write().await;
+        let storage = self.engine.write().await;
         storage.restore_erasure_coded_entry(bucket, key, record).await
     }
 
@@ -180,7 +348,7 @@ impl StorageEngine for SharedStorageAdapter {
         bucket: &str,
         key: &str,
     ) -> Result<s4_core::types::IndexRecord, s4_core::error::StorageError> {
-        let storage = self.0.read().await;
+        let storage = self.engine.read().await;
         storage.head_object(bucket, key).await
     }
 
@@ -190,7 +358,7 @@ impl StorageEngine for SharedStorageAdapter {
         prefix: &str,
         max_keys: usize,
     ) -> Result<Vec<(String, s4_core::types::IndexRecord)>, s4_core::error::StorageError> {
-        let storage = self.0.read().await;
+        let storage = self.engine.read().await;
         storage.list_objects(bucket, prefix, max_keys).await
     }
 
@@ -201,7 +369,7 @@ impl StorageEngine for SharedStorageAdapter {
         start_after: &str,
         max_keys: usize,
     ) -> Result<Vec<(String, s4_core::types::IndexRecord)>, s4_core::error::StorageError> {
-        let storage = self.0.read().await;
+        let storage = self.engine.read().await;
         storage.list_objects_after(bucket, prefix, start_after, max_keys).await
     }
 
@@ -311,18 +479,22 @@ impl StorageEngine for SharedStorageAdapter {
         metadata: &std::collections::HashMap<String, String>,
         etag: &str,
     ) -> Result<s4_core::storage::StreamingPutResult, s4_core::error::StorageError> {
-        let storage = self.0.read().await;
-        storage
-            .put_object_streaming(
-                bucket,
-                key,
-                reader,
-                content_length,
-                content_type,
-                metadata,
-                etag,
-            )
-            .await
+        let result = {
+            let storage = self.engine.read().await;
+            storage
+                .put_object_streaming(
+                    bucket,
+                    key,
+                    reader,
+                    content_length,
+                    content_type,
+                    metadata,
+                    etag,
+                )
+                .await
+        };
+        self.observe(bucket, key).await;
+        result
     }
 
     async fn open_object_stream(
@@ -331,7 +503,7 @@ impl StorageEngine for SharedStorageAdapter {
         key: &str,
         options: s4_core::storage::ReadOptions,
     ) -> Result<s4_core::storage::ObjectStream, s4_core::error::StorageError> {
-        let storage = self.0.read().await;
+        let storage = self.engine.read().await;
         storage.open_object_stream(bucket, key, options).await
     }
 
@@ -342,7 +514,7 @@ impl StorageEngine for SharedStorageAdapter {
         version_id: Option<&str>,
         data: &[u8],
     ) -> Result<(), s4_core::error::StorageError> {
-        let storage = self.0.write().await;
+        let storage = self.engine.write().await;
         storage.heal_object_blob(bucket, key, version_id, data).await
     }
 
@@ -353,7 +525,7 @@ impl StorageEngine for SharedStorageAdapter {
         version_id: &str,
         options: s4_core::storage::ReadOptions,
     ) -> Result<s4_core::storage::ObjectStream, s4_core::error::StorageError> {
-        let storage = self.0.read().await;
+        let storage = self.engine.read().await;
         storage.open_object_version_stream(bucket, key, version_id, options).await
     }
 }
@@ -368,7 +540,7 @@ impl MultipartReplicaStorage for SharedStorageAdapter {
         content_type: &str,
         metadata: &std::collections::HashMap<String, String>,
     ) -> Result<(), s4_core::error::StorageError> {
-        let storage = self.0.read().await;
+        let storage = self.engine.read().await;
         storage
             .create_multipart_session(upload_id, bucket, key, content_type, metadata)
             .await
@@ -379,7 +551,7 @@ impl MultipartReplicaStorage for SharedStorageAdapter {
         upload_id: &str,
     ) -> Result<s4_core::types::composite::MultipartUploadSession, s4_core::error::StorageError>
     {
-        let storage = self.0.read().await;
+        let storage = self.engine.read().await;
         storage.get_multipart_session(upload_id).await
     }
 
@@ -390,7 +562,7 @@ impl MultipartReplicaStorage for SharedStorageAdapter {
         reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         content_length: u64,
     ) -> Result<s4_core::types::composite::MultipartPartRecord, s4_core::error::StorageError> {
-        let storage = self.0.read().await;
+        let storage = self.engine.read().await;
         storage
             .upload_part_streaming(upload_id, part_number, reader, content_length)
             .await
@@ -402,7 +574,7 @@ impl MultipartReplicaStorage for SharedStorageAdapter {
         upload_id: &str,
     ) -> Result<Vec<s4_core::types::composite::MultipartPartRecord>, s4_core::error::StorageError>
     {
-        let storage = self.0.read().await;
+        let storage = self.engine.read().await;
         storage.list_multipart_parts(upload_id)
     }
 
@@ -411,7 +583,7 @@ impl MultipartReplicaStorage for SharedStorageAdapter {
         upload_id: &str,
     ) -> Result<s4_core::types::composite::MultipartUploadSession, s4_core::error::StorageError>
     {
-        let storage = self.0.read().await;
+        let storage = self.engine.read().await;
         storage.mark_session_completing(upload_id).await
     }
 
@@ -419,7 +591,7 @@ impl MultipartReplicaStorage for SharedStorageAdapter {
         &self,
         upload_id: &str,
     ) -> Result<(), s4_core::error::StorageError> {
-        let storage = self.0.read().await;
+        let storage = self.engine.read().await;
         storage.revert_session_to_open(upload_id).await
     }
 
@@ -433,7 +605,7 @@ impl MultipartReplicaStorage for SharedStorageAdapter {
         content_type: &str,
         metadata: &std::collections::HashMap<String, String>,
     ) -> Result<s4_core::types::IndexRecord, s4_core::error::StorageError> {
-        let storage = self.0.read().await;
+        let storage = self.engine.read().await;
         storage
             .complete_multipart_native(
                 bucket,
@@ -451,8 +623,39 @@ impl MultipartReplicaStorage for SharedStorageAdapter {
         &self,
         upload_id: &str,
     ) -> Result<(), s4_core::error::StorageError> {
-        let storage = self.0.read().await;
+        let storage = self.engine.read().await;
         storage.abort_multipart_native(upload_id).await
+    }
+
+    async fn current_key_version(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<s4_core::KeyVersion, s4_core::error::StorageError> {
+        let storage = self.engine.read().await;
+        storage.key_version(bucket, key).await
+    }
+
+    async fn list_multipart_sessions_after(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<s4_core::types::composite::MultipartUploadSession>, s4_core::error::StorageError>
+    {
+        let storage = self.engine.read().await;
+        storage.list_multipart_sessions_after(after, limit)
+    }
+
+    async fn read_multipart_part(
+        &self,
+        upload_id: &str,
+        part_number: u32,
+    ) -> Result<
+        (s4_core::types::composite::MultipartPartRecord, Vec<u8>),
+        s4_core::error::StorageError,
+    > {
+        let storage = self.engine.read().await;
+        storage.read_multipart_part(upload_id, part_number).await
     }
 }
 
@@ -474,6 +677,15 @@ pub struct ClusterState {
     pub read_coordinator: Arc<QuorumReadCoordinator>,
     /// List coordinator — injected into `AppState` for distributed LIST.
     pub list_coordinator: Arc<DistributedListCoordinator>,
+    /// Takes the lease of IAM changes for the changes that come to this node
+    /// — injected into `AppState`.
+    pub iam_lease: Arc<IamLeaseHolder>,
+    /// Whether a majority of the pool agrees with this node's copy of IAM,
+    /// which IAM credentials are checked against — injected into `AppState`.
+    pub iam_freshness: Arc<IamFreshness>,
+    /// How IAM stands on this node, for the admin API — injected into
+    /// `AppState`.
+    pub iam_status: Arc<IamStatusSource>,
     /// Enterprise Erasure Coding admin service, when this pool is EC.
     pub ec_admin_service: Option<EcAdminServiceHandle>,
     /// Enterprise Erasure Coding S3 object runtime, when this pool is EC.
@@ -481,15 +693,100 @@ pub struct ClusterState {
     /// What the cluster routes of the admin API report, read from the same
     /// state as the metrics.
     pub cluster_admin_service: Arc<dyn ClusterAdminService>,
+    /// This node's hybrid logical clock, the one its coordinators stamp
+    /// writes and deletes with.
+    pub clock: Arc<HybridClock>,
+    /// Opens the quorum reads of bucket configurations once the pool adopted
+    /// them — injected into `AppState`.
+    pub config_read_gate: ConfigReadGate,
+    /// Shared local progress adopting bucket configurations, used by readiness.
+    pub config_adoption_status: ConfigAdoptionStatus,
+    /// The count of unenforced bucket configurations the cluster health
+    /// reports — injected into `AppState`.
+    pub unenforced_configs: UnenforcedConfigs,
+    /// What the pool's adoption of IAM needs once the node's IAM is set up.
+    pub iam_adoption: IamAdoptionParts,
+    /// This node's part in the pool's growth, while one is prepared or runs:
+    /// its state, and the move of its keys with pause and resumption.
+    pub pool_transition: Option<Arc<s4_cluster::rebalance::PoolTransition>>,
     /// Background task handles to abort on shutdown.
     pub background_handles: Vec<tokio::task::JoinHandle<()>>,
     /// gRPC server handle (for graceful shutdown).
     pub rpc_handle: RpcServerHandle,
 }
 
+/// The pieces of the pool's adoption of the IAM its nodes kept of their own
+/// (plan CLUSTER-IAM-REPLICATION.md, decision 8): the admin API asks the pool
+/// through `collector`, and [`crate::iam_adoption::IamAdoptionWorker`], built
+/// once the node's IAM is, opens `gate`.
+pub struct IamAdoptionParts {
+    /// Asks every node of the pool what it keeps of its own.
+    pub collector: Arc<IamAdoptionCollector>,
+    /// Opens IAM changes on this node.
+    pub gate: IamAdoptionGate,
+    /// This node.
+    pub node_id: NodeId,
+    /// The nodes of its pool.
+    pub pool: Vec<NodeId>,
+    /// Carries the announcements.
+    pub gossip: Arc<GossipHandle>,
+    /// Where the open gate is recorded.
+    pub index_db: Arc<s4_core::storage::IndexDb>,
+    /// Stops the worker.
+    pub shutdown: tokio::sync::watch::Receiver<bool>,
+    /// Compares the IAM configuration of the pool's nodes; this node
+    /// announces its own through it.
+    pub config: Arc<IamConfigCheck>,
+}
+
+/// Seals the secrets of the user records this node sends to another with
+/// the keys of its directory.
+struct DirectorySealer(Arc<IamDirectory>);
+
+#[async_trait::async_trait]
+impl s4_cluster::OwnRecordSealer for DirectorySealer {
+    async fn seal(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+        self.0.sealed_record(data).await.map_err(|e| e.to_string())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bootstrap entry point
 // ---------------------------------------------------------------------------
+
+/// Settles this node's tombstone horizon: the HLC from which every delete on
+/// it left a tombstone ([`s4_core::storage::IndexDb::settle_tombstone_horizon`]).
+/// Decided once, on the first start that keeps tombstones; zero when that
+/// start created the index. Otherwise it is this node's clock plus the clock
+/// skew the cluster tolerates: a peer whose clock runs ahead may have issued
+/// HLCs past this node's `now` to records this node deleted before it kept
+/// tombstones.
+async fn settle_tombstone_horizon(
+    storage: &RwLock<BitcaskStorageEngine>,
+    clock: &HybridClock,
+) -> Result<HlcTimestamp> {
+    let index_db = storage.read().await.index_db().clone();
+    let now = clock.now();
+    let skew = u64::try_from(clock.max_clock_skew().as_millis()).unwrap_or(u64::MAX);
+    let ahead_of_every_peer = HlcTimestamp {
+        wall_time: now.wall_time.saturating_add(skew),
+        ..now
+    };
+    let horizon: HlcTimestamp = index_db
+        .settle_tombstone_horizon(ahead_of_every_peer.into())
+        .await
+        .context("Failed to settle the tombstone horizon")?
+        .into();
+    if horizon.is_zero() {
+        info!("Tombstone horizon: zero, every delete on this node left a tombstone");
+    } else {
+        info!(
+            %horizon,
+            "Tombstone horizon: deletes before it may have left no tombstone on this node"
+        );
+    }
+    Ok(horizon)
+}
 
 /// Start all cluster services and return handles for lifecycle management.
 ///
@@ -504,6 +801,7 @@ pub struct ClusterState {
 pub async fn bootstrap_cluster(
     cluster_config: &ClusterModeConfig,
     storage: Arc<RwLock<BitcaskStorageEngine>>,
+    iam_directory: Option<Arc<IamDirectory>>,
     data_dir: &Path,
     cluster_limits: &ClusterLimits,
 ) -> Result<ClusterState> {
@@ -581,6 +879,10 @@ pub async fn bootstrap_cluster(
     // the network. It answers both questions a start has about a member that is
     // down: where it lives and who it is (decision EC2-203).
     let mut peer_record = s4_cluster::PoolPeerRecord::load(data_dir);
+    // Capture the complete roster before pruning config entries: on the first
+    // generation-aware start, a simultaneous membership edit is unsafe.
+    let previous_pool_nodes: Vec<NodeId> =
+        peer_record.recalled_identities().into_values().collect();
     let pool_members = parse_pool_nodes(pool_nodes_str, &peer_record.last_known_addrs())
         .await
         .context("Failed to parse S4_POOL_NODES")?;
@@ -636,6 +938,10 @@ pub async fn bootstrap_cluster(
         storage_class: cluster_config.pool_storage_class().map_err(|e| anyhow::anyhow!("{e}"))?,
     };
 
+    let generation_index = storage.read().await.index_db().clone();
+    let stored_generation = s4_cluster::pool_generation::load(&generation_index)
+        .await
+        .context("Failed to read durable pool generation")?;
     let cluster_cfg = ClusterConfig {
         cluster_name: cluster_config.cluster_name.clone(),
         seeds: seeds.clone(),
@@ -643,7 +949,7 @@ pub async fn bootstrap_cluster(
         default_replication_factor: cluster_config.replication_factor,
         default_write_quorum: cluster_config.write_quorum,
         default_read_quorum: cluster_config.read_quorum,
-        epoch: 1,
+        epoch: s4_cluster::pool_generation::WIRE_TOPOLOGY_EPOCH,
     };
 
     cluster_cfg
@@ -734,7 +1040,7 @@ pub async fn bootstrap_cluster(
     // that tick, and a peer placing data in the meantime would read this node as
     // having no measured room.
     let node_capacity: Arc<dyn NodeCapacityProvider> = Arc::new(FilesystemCapacity::new(data_dir));
-    let node_meta = NodeMeta {
+    let mut node_meta = NodeMeta {
         node_id,
         node_name,
         addr: node_addr,
@@ -782,12 +1088,23 @@ pub async fn bootstrap_cluster(
     .map_err(|e| anyhow::anyhow!("Failed to start gossip service: {e}"))?;
 
     let gossip_handle = Arc::new(gossip_handle);
+    // Durable ownership is announced before waiting for new members, so a
+    // blank node cannot mistake a grown configured roster for the old ring.
+    if let Some(record) = &stored_generation {
+        gossip_handle.announce_pool_generation(
+            s4_cluster::pool_generation::GenerationAnnouncement::of(record, false),
+        );
+    }
     info!(%gossip_addr, "Gossip service started");
 
     // -----------------------------------------------------------------------
     // 6. Create HLC
     // -----------------------------------------------------------------------
     let clock = Arc::new(HybridClock::new(node_id));
+
+    // Before the node serves any write: from here on every delete leaves a
+    // tombstone.
+    settle_tombstone_horizon(&storage, &clock).await?;
 
     // -----------------------------------------------------------------------
     // 7. Create RPC client pool
@@ -803,7 +1120,18 @@ pub async fn bootstrap_cluster(
     // -----------------------------------------------------------------------
     // 8. Create StorageEngine adapter for cluster components
     // -----------------------------------------------------------------------
-    let shared_storage = Arc::new(SharedStorageAdapter(storage.clone()));
+    // This node's copy of IAM as the pool compares it, read through an
+    // adapter of its own that tells nobody of anything (plan
+    // CLUSTER-IAM-REPLICATION.md, decision 4).
+    let iam_copy = Arc::new(IamCopy::new(Arc::new(SharedStorageAdapter::new(
+        storage.clone(),
+    ))));
+    let iam_directory_for_sealing = iam_directory.clone();
+    let shared_storage = Arc::new(
+        SharedStorageAdapter::new(storage.clone())
+            .with_iam_directory(iam_directory)
+            .with_iam_copy(iam_copy.clone()),
+    );
     let storage_engine: Arc<dyn StorageEngine> = shared_storage.clone();
     let multipart_storage: Arc<dyn MultipartReplicaStorage> = shared_storage.clone();
 
@@ -811,11 +1139,6 @@ pub async fn bootstrap_cluster(
     // 9. Create read replica handler (write handler created after anti-entropy)
     // -----------------------------------------------------------------------
     let idempotency = Arc::new(IdempotencyTracker::default());
-
-    let replica_read = Arc::new(ReplicaReadHandler::new(
-        storage_engine.clone(),
-        cluster_cfg.epoch,
-    ));
 
     // -----------------------------------------------------------------------
     // 10. Name every node of the pool (real NodeIds)
@@ -898,6 +1221,42 @@ pub async fn bootstrap_cluster(
 
     let (pool_roll, naming_elapsed, pool_nodes_seen_alive) = pool_roll;
     let pool_nodes_ids: Vec<NodeId> = pool_roll.node_ids.clone();
+
+    // A node that has never recorded a generation may hold copies of keys a
+    // pool grown by an earlier release gave to other nodes: it hands them
+    // over once (plan ERASURE-CODING-FIXING-POOL-GROWTH-REBALANCE.md,
+    // `EPGR-04-4`). Marked before the generation is recorded, so a restart
+    // in between still makes the pass.
+    let progress_store: Arc<dyn s4_cluster::rebalance::ProgressStore> = Arc::new(
+        s4_cluster::rebalance::IndexProgressStore::new(generation_index.clone()),
+    );
+    if stored_generation.is_none() {
+        crate::pool_generation::mark_former_owner_pass(progress_store.as_ref())
+            .await
+            .context("Failed to mark the hand-over of copies from before pool generations")?;
+    }
+    let pool_generation = crate::pool_generation::start(
+        &generation_index,
+        &gossip_handle,
+        node_id,
+        pool_id,
+        &pool_nodes_ids,
+        stored_generation,
+        &previous_pool_nodes,
+    )
+    .await
+    .context("Pool generation refused startup configuration")?;
+    node_meta.topology_epoch = pool_generation.current.epoch;
+    metrics::gauge!("s4_cluster_epoch").set(pool_generation.current.epoch as f64);
+    let placement_cfg = crate::pool_generation::placement_config(&cluster_cfg, &pool_generation)?;
+    let active_pool_nodes = pool_generation.current.nodes.clone();
+    let replica_read = Arc::new(ReplicaReadHandler::new(
+        storage_engine.clone(),
+        cluster_cfg.epoch,
+    ));
+    info!(epoch = pool_generation.current.epoch, active_nodes = active_pool_nodes.len(),
+        proposed_epoch = ?pool_generation.proposed.as_ref().map(|g| g.epoch),
+        "Pool generation selected; placement uses the current owners");
 
     if pool_roll.recalled.is_empty() {
         info!(
@@ -1005,6 +1364,10 @@ pub async fn bootstrap_cluster(
     // -----------------------------------------------------------------------
     #[cfg(feature = "enterprise")]
     let mut ec_operations_service = None;
+    // The node failures every erasure set of the pool survives, which its
+    // bucket metadata is placed to survive too; `None` for a replicated pool.
+    #[cfg_attr(not(feature = "enterprise"), allow(unused_mut))]
+    let mut ec_guaranteed_failures: Option<u8> = None;
 
     let (ec_admin_service, ec_object_runtime): (
         Option<EcAdminServiceHandle>,
@@ -1031,6 +1394,8 @@ pub async fn bootstrap_cluster(
                 started_at,
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+            ec_guaranteed_failures =
+                Some(ec_layout.guaranteed_node_failures().map_err(|e| anyhow::anyhow!("{e}"))?);
             let ec_sets = ec_layout.sets;
 
             for ec_set in ec_sets.sets() {
@@ -1071,6 +1436,7 @@ pub async fn bootstrap_cluster(
             // only stops a restart with changed topology labels from laying
             // new objects out by those labels until the cluster answers. The
             // cluster's copies are taken once the workers are up, below.
+            service.configure_pool_generation(pool_generation.clone());
             service
                 .adopt_erasure_sets_at_startup()
                 .await
@@ -1094,57 +1460,153 @@ pub async fn bootstrap_cluster(
     };
 
     // -----------------------------------------------------------------------
-    // 11. Create anti-entropy service
+    // 11. Anti-entropy: the repair frontier GC reads, the counters the admin
+    //     API reports, and the answers to the rounds of the peers. A pool of
+    //     erasure-coded objects is reconciled by the Enterprise runtime.
     // -----------------------------------------------------------------------
-
-    let ae_config = AntiEntropyConfig {
-        enabled: true,
-        interval_secs: cluster_config.anti_entropy_interval_secs,
-        ..AntiEntropyConfig::default()
+    let anti_entropy = Arc::new(AntiEntropyService::new());
+    let anti_entropy_config = cluster_config.anti_entropy();
+    let replicated_pool = !cluster_cfg.pools[0].storage_class.is_erasure_coded();
+    // The placement of every replication class of the pool, built as the
+    // router below builds it; anti-entropy pairs nodes on the pool's data ring.
+    let pool_layout = PoolLayout::for_pool(
+        &placement_cfg,
+        &placement_cfg.pools[0],
+        active_pool_nodes.clone(),
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to create placement strategy: {e}"))?;
+    let pool_placement = pool_layout.data().strategy().clone();
+    // The replicas the pool's bucket metadata is to reach: as many as the
+    // failures the pool survives call for, or more if the operator asked.
+    let data_shape = QuorumShape {
+        replication_factor: pool_layout.data().replication_factor(),
+        write_quorum: pool_layout.data().write_quorum(),
+        read_quorum: pool_layout.data().read_quorum(),
+    };
+    let bucket_metadata_target = derive_target(
+        active_pool_nodes.len(),
+        data_shape,
+        ec_guaranteed_failures,
+        cluster_config
+            .bucket_metadata_replication_factor
+            .clone()
+            .map_err(|e| anyhow::anyhow!("{e}"))?,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Where this node is in the move of the bucket metadata to their target,
+    // announced to the pool, before anything places a key: while the pool
+    // moves them, the router places them, and this node's replicas fence
+    // their writes, by its stage.
+    let placement_index = {
+        let storage_guard = storage.read().await;
+        storage_guard.index_db().clone()
+    };
+    crate::pool_generation::inherit_bucket_metadata(
+        &placement_index,
+        &gossip_handle,
+        node_id,
+        &pool_generation,
+    )
+    .await?;
+    let bucket_metadata_placement = crate::bucket_metadata_placement::start(
+        &placement_index,
+        &gossip_handle,
+        data_shape,
+        bucket_metadata_target,
+    )
+    .await?;
+    // Where the move stands, as the metrics and the admin API report it.
+    let bucket_metadata_status = Arc::new(PlacementStatus::new(
+        pool_roster.pool(),
+        bucket_metadata_placement,
+    ));
+    let bucket_metadata_move = crate::bucket_metadata_placement::layout_move(
+        &bucket_metadata_placement,
+        data_shape,
+        &active_pool_nodes,
+    )?;
+    let pool_layout = match &bucket_metadata_move {
+        Some(moving) => pool_layout.with_bucket_metadata_move(moving.clone()),
+        None => pool_layout,
     };
 
-    let anti_entropy = Arc::new(AntiEntropyService::new(
-        ae_config,
-        node_id,
-        pool_id,
-        pool_nodes_ids.clone(),
-        gossip_handle.clone(),
-        rpc_client.clone(),
-        storage_engine.clone(),
-    ));
-
-    // Scan local storage to build the initial Merkle tree and key registry.
-    // This must happen before the gRPC server starts serving anti-entropy
-    // exchange requests, otherwise the local Merkle tree would be empty and
-    // every exchange would report full divergence.
-    anti_entropy.init_from_storage().await;
-
-    // -----------------------------------------------------------------------
-    // 11b. Create write replica handler (needs anti-entropy for Merkle updates)
-    // -----------------------------------------------------------------------
-    let replica_write = Arc::new(
-        ReplicaWriteHandler::new(storage_engine.clone(), idempotency, cluster_cfg.epoch)
-            .with_anti_entropy(anti_entropy.clone()),
+    // This node's grants of the lease of IAM changes, read before it answers
+    // anyone: its replica fences the writes of IAM by them (plan
+    // CLUSTER-IAM-REPLICATION.md, decision 3).
+    let iam_lease_keeper = Arc::new(
+        IamLeaseKeeper::open(storage_engine.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read the IAM lease ledger: {e}"))?,
     );
+    // The user records this node keeps of its own, answered to the node that
+    // builds the report of the pool's adoption of IAM (decision 8).
+    // Their secrets leave the node sealed (decision 7).
+    let iam_own_users = {
+        let own = IamOwnUsers::new(storage_engine.clone());
+        Arc::new(match &iam_directory_for_sealing {
+            Some(directory) => own.with_sealer(Arc::new(DirectorySealer(directory.clone()))),
+            None => own,
+        })
+    };
+    // Legacy generation zero is accepted only by the initial stable generation
+    // during rolling upgrades. A moving pool fences the earlier generation only
+    // once every member began, or at once when a range cut over here before a
+    // restart: the transition raises the floor then (`PoolTransition::restore`,
+    // the driver).
+    let placement_minimum = if pool_generation.current.epoch > 1 {
+        pool_generation.current.epoch
+    } else {
+        0
+    };
+    // Shared by this node's replicas and its write coordinator; it rises to
+    // the successor's epoch once every member began the pool's move.
+    let placement_floor = s4_cluster::placement_fence::PlacementFloor::new(placement_minimum);
+    let mut replica_write_handler =
+        ReplicaWriteHandler::new(storage_engine.clone(), idempotency, cluster_cfg.epoch)
+            .with_iam_lease(iam_lease_keeper.clone())
+            .with_placement_floor(placement_floor.clone());
+    if let Some(moving) = &bucket_metadata_move {
+        replica_write_handler =
+            replica_write_handler.with_bucket_metadata_stage(moving.stage_cell().clone());
+    }
+    let replica_write = Arc::new(replica_write_handler);
 
-    let replica_multipart = Arc::new(ReplicaMultipartHandler::new(
-        multipart_storage.clone(),
-        Arc::new(IdempotencyTracker::default()),
-        cluster_cfg.epoch,
-    ));
-
-    // -----------------------------------------------------------------------
-    // 12. Start gRPC server
-    // -----------------------------------------------------------------------
-    // Only the Enterprise branch below reassigns it, so a CE build sees a
-    // binding it never mutates.
-    #[cfg_attr(not(feature = "enterprise"), allow(unused_mut))]
+    let replica_multipart = Arc::new(
+        ReplicaMultipartHandler::new(
+            multipart_storage.clone(),
+            Arc::new(IdempotencyTracker::default()),
+            cluster_cfg.epoch,
+        )
+        .with_placement_floor(placement_floor.clone()),
+    );
+    // This node's part in a growth answers once the placement it reports on
+    // is built, below.
+    let pool_move_slot = s4_cluster::PoolMoveSlot::default();
     let mut rpc_server =
         NodeRpcServer::new(node_id, Arc::new(node_meta.clone()), gossip_handle.clone())
-            .with_replica_handler(replica_write)
+            .with_pool_move(pool_move_slot.clone())
+            .with_replica_handler(replica_write.clone())
             .with_multipart_handler(replica_multipart)
-            .with_read_handler(replica_read)
-            .with_anti_entropy(anti_entropy.clone());
+            .with_read_handler(replica_read.clone())
+            .with_iam_lease(iam_lease_keeper.clone())
+            .with_iam_copy(iam_copy.clone())
+            .with_iam_own_users(iam_own_users.clone());
+    let mut anti_entropy_responder = None;
+    if replicated_pool {
+        let mut responder = AntiEntropyResponder::new(
+            storage_engine.clone(),
+            pool_placement.clone(),
+            node_id,
+            pool_id,
+            cluster_cfg.epoch,
+        );
+        if let Some(moving) = &bucket_metadata_move {
+            responder = responder.with_bucket_metadata_move(moving.clone());
+        }
+        let responder = Arc::new(responder);
+        anti_entropy_responder = Some(responder.clone());
+        rpc_server = rpc_server.with_anti_entropy(responder);
+    }
 
     // Auto-tiering records an access on whichever node served it, so a node
     // deciding that an object has gone cold has to ask its peers first.
@@ -1180,16 +1642,23 @@ pub async fn bootstrap_cluster(
     // -----------------------------------------------------------------------
     // Keep identities attached to configured members, not to transport addresses.
     // An absent member's remembered IP may already belong to a live neighbour.
-    let named_pools = HashMap::from([(pool_id, pool_nodes_ids.clone())]);
-    let router = Arc::new(
-        PlacementRouter::from_pool_node_ids(
-            &cluster_cfg,
-            node_id,
-            BucketPlacement::new(),
-            &named_pools,
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to build placement router: {e}"))?,
-    );
+    let named_pools = HashMap::from([(pool_id, active_pool_nodes.clone())]);
+    let mut placement_router = PlacementRouter::from_pool_node_ids(
+        &placement_cfg,
+        node_id,
+        BucketPlacement::new(),
+        &named_pools,
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to build placement router: {e}"))?;
+    if let Some(moving) = &bucket_metadata_move {
+        placement_router = placement_router
+            .with_bucket_metadata_move(pool_id, moving.clone())
+            .map_err(|e| anyhow::anyhow!("Failed to build placement router: {e}"))?;
+    }
+    placement_router = placement_router
+        .with_pool_generation(&pool_generation)
+        .map_err(|e| anyhow::anyhow!("Failed to attach pool generation: {e}"))?;
+    let router = Arc::new(placement_router);
 
     // -----------------------------------------------------------------------
     // 13. Create hinted handoff manager
@@ -1208,15 +1677,73 @@ pub async fn bootstrap_cluster(
         )
     };
 
+    // The pool's growth, while one is prepared or runs: its arcs, the
+    // successor's layout, and this node's part in it. The ranges this node
+    // read through the successor before a restart do so again before it
+    // serves anything.
+    let growth = match (
+        router.generation_ranges(&pool_id).cloned(),
+        router.successor_layout(&pool_id).cloned(),
+    ) {
+        (Some(ranges), Some(successor)) => {
+            let transition = Arc::new(
+                s4_cluster::rebalance::PoolTransition::new(
+                    s4_cluster::rebalance::TransitionParts {
+                        record: pool_generation.clone(),
+                        local: node_id,
+                        ranges: ranges.clone(),
+                        floor: placement_floor.clone(),
+                        index: generation_index.clone(),
+                        store: progress_store.clone(),
+                        gossip: gossip_handle.clone(),
+                        hints: Some(hints.clone()),
+                        clock: clock.clone(),
+                    },
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to set up the pool's growth: {e}"))?,
+            );
+            transition
+                .restore()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to read back the pool's growth: {e}"))?;
+            if let Some(responder) = &anti_entropy_responder {
+                responder.set_growth(s4_cluster::AntiEntropyGrowth::new(
+                    ranges.clone(),
+                    &successor,
+                    gossip_handle.clone(),
+                    node_id,
+                ));
+            }
+            Some((ranges, successor, transition))
+        }
+        _ => None,
+    };
+
     // -----------------------------------------------------------------------
     // 14. Create read repair service
     // -----------------------------------------------------------------------
-    let read_repair = Arc::new(ReadRepairService::start(rpc_client.clone()));
+    // A repair whose target is this node goes through the handler peers
+    // reach it by, with the node's fences.
+    let read_repair = Arc::new(ReadRepairService::start_with_local_replica(
+        rpc_client.clone(),
+        node_id,
+        storage_engine.clone(),
+        replica_write.clone(),
+    ));
 
     // -----------------------------------------------------------------------
     // 15. Create quorum coordinators
     // -----------------------------------------------------------------------
     let write_timeouts = WriteTimeouts::default();
+    // Hands open uploads over: a part or a completion of an upload begun
+    // before a growth, and the multipart hints.
+    let upload_transfer = Arc::new(s4_cluster::rebalance::MultipartTransfer::new(
+        multipart_storage.clone(),
+        rpc_client.clone(),
+        router.clone(),
+        node_id,
+        cluster_cfg.epoch,
+    ));
     let write_coordinator = Arc::new(
         QuorumWriteCoordinator::new(
             node_id,
@@ -1228,8 +1755,19 @@ pub async fn bootstrap_cluster(
             &cluster_cfg,
             write_timeouts.clone(),
         )
-        .with_multipart_storage(multipart_storage),
+        .with_multipart_storage(multipart_storage.clone())
+        .with_upload_transfer(upload_transfer.clone())
+        .with_placement_floor(placement_floor.clone())
+        .with_iam_lease(iam_lease_keeper.clone()),
     );
+    let iam_lease = Arc::new(IamLeaseHolder::new(
+        node_id,
+        iam_lease_keeper.clone(),
+        rpc_client.clone(),
+        router.clone(),
+        clock.clone(),
+        cluster_config.iam_lease(),
+    ));
 
     let read_coordinator = Arc::new(QuorumReadCoordinator::new(
         node_id,
@@ -1242,14 +1780,17 @@ pub async fn bootstrap_cluster(
         ReadTimeouts::default(),
     ));
 
-    let list_coordinator = Arc::new(DistributedListCoordinator::new(
-        node_id,
-        storage_engine.clone(),
-        rpc_client.clone(),
-        router,
-        cluster_cfg.epoch,
-        ListTimeouts::default(),
-    ));
+    let list_coordinator = Arc::new(
+        DistributedListCoordinator::new(
+            node_id,
+            storage_engine.clone(),
+            rpc_client.clone(),
+            router.clone(),
+            cluster_cfg.epoch,
+            ListTimeouts::default(),
+        )
+        .with_read_coordinator(read_coordinator.clone()),
+    );
 
     info!(
         "Quorum coordinators created (W={}, R={})",
@@ -1261,6 +1802,20 @@ pub async fn bootstrap_cluster(
     // -----------------------------------------------------------------------
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut background_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    background_handles.push(tokio::spawn(crate::pool_generation::publish(
+        pool_generation.clone(),
+        gossip_handle.clone(),
+        node_id,
+        read_coordinator.clone(),
+        write_coordinator.clone(),
+        shutdown_rx.clone(),
+    )));
+    // The volumes directory of this node: what it stores, which a growth's
+    // new nodes need room for.
+    let stored_bytes: Arc<dyn s4_cluster::rebalance::StoredBytes> = Arc::new(
+        s4_cluster::rebalance::VolumeFiles::new(storage.read().await.volumes_dir().to_path_buf()),
+    );
+    let rebalance_config = cluster_config.rebalance();
 
     // Hinted handoff maintenance: removes the hints that outlived the TTL and
     // brings the replicas gossip holds alive to the current state of the keys
@@ -1273,10 +1828,160 @@ pub async fn bootstrap_cluster(
         node_id,
         cluster_cfg.epoch,
     )
-    .with_settle_time(write_timeouts.replica_write_timeout);
+    .with_settle_time(write_timeouts.replica_write_timeout)
+    .with_multipart_transfer(upload_transfer.clone());
     background_handles.push(tokio::spawn(
         hints.run_maintenance(Some(hint_delivery), shutdown_rx.clone()),
     ));
+
+    // Capture every original migration obligation before HTTP readiness.
+    // WithHolder includes a foreign source without counting it as an owner;
+    // the existing history guard remains authoritative after every restart.
+    let migration_status = if replicated_pool {
+        let migration_index = storage.read().await.index_db().clone();
+        let migration =
+            s4_cluster::migration::MigrationWorker::new(s4_cluster::migration::MigrationParts {
+                storage: Arc::new(s4_cluster::migration::SharedMigrationStore::new(
+                    storage.clone(),
+                    migration_index,
+                )),
+                router: router.clone(),
+                rpc: rpc_client.clone(),
+                gossip: gossip_handle.clone(),
+                reconciler: Reconciler::new(
+                    Arc::new(s4_cluster::WithHolder::new(
+                        read_coordinator.clone(),
+                        node_id,
+                    )),
+                    rpc_client.clone(),
+                    gossip_handle.clone(),
+                    node_id,
+                    cluster_cfg.epoch,
+                )
+                .with_local_replica(LocalReplica {
+                    write: replica_write.clone(),
+                    read: replica_read.clone(),
+                }),
+                local: node_id,
+                members: pool_nodes_ids.clone(),
+                epoch: cluster_cfg.epoch,
+                concurrency: cluster_config
+                    .migration_concurrency
+                    .clone()
+                    .map_err(anyhow::Error::msg)?,
+            })?;
+        migration
+            .initialize()
+            .await
+            .context("Failed to initialize single-to-cluster migration")?;
+        let status = migration.status();
+        background_handles.push(tokio::spawn(migration.run(shutdown_rx.clone())));
+        status
+    } else {
+        Arc::new(s4_cluster::migration::MigrationStatus::default())
+    };
+
+    // Anti-entropy rounds: once per interval this node compares itself with
+    // the next live peer of the pool and settles every key they hold in
+    // different versions. Switched off, the node still answers its peers.
+    let gc_grace = cluster_config.gc_grace();
+    if replicated_pool {
+        let reconciler = Reconciler::new(
+            read_coordinator.clone(),
+            rpc_client.clone(),
+            gossip_handle.clone(),
+            node_id,
+            cluster_cfg.epoch,
+        )
+        .with_local_replica(LocalReplica {
+            write: replica_write.clone(),
+            read: replica_read.clone(),
+        });
+        let mut rounds = AntiEntropyRounds::new(
+            anti_entropy.clone(),
+            anti_entropy_config.clone(),
+            gc_grace,
+            storage_engine.clone(),
+            pool_placement.clone(),
+            node_id,
+            pool_id,
+            cluster_cfg.epoch,
+            rpc_client.clone(),
+            gossip_handle.clone(),
+            reconciler,
+        )
+        .with_cut_margin(s4_cluster::gc::tombstone::arrival_window(
+            write_timeouts.replica_write_timeout,
+        ));
+        // Bucket metadata on their own layout are compared by it, and left
+        // out while the backfill brings them to the new replicas.
+        if let Some(moving) = &bucket_metadata_move {
+            rounds = rounds.with_bucket_metadata_move(moving.clone());
+        }
+        // Once the pool settled on a grown generation, rounds compare by
+        // its ring.
+        if let Some((ranges, successor, _)) = &growth {
+            rounds = rounds.with_growth(s4_cluster::AntiEntropyGrowth::new(
+                ranges.clone(),
+                successor,
+                gossip_handle.clone(),
+                node_id,
+            ));
+        }
+        let rounds = Arc::new(rounds);
+        if anti_entropy_config.enabled {
+            info!(
+                interval_secs = anti_entropy_config.interval_secs,
+                max_keys_per_round = anti_entropy_config.max_keys_per_round,
+                "Anti-entropy rounds started"
+            );
+            background_handles.push(tokio::spawn(rounds.run(shutdown_rx.clone())));
+        } else {
+            tracing::warn!(
+                "Anti-entropy rounds are switched off on this node (S4_ANTI_ENTROPY_ENABLED=false): \
+                 it starts no rounds and removes no tombstones; it still answers the rounds of \
+                 its peers"
+            );
+        }
+    }
+
+    // This node's copy of IAM, kept current with the pool and confirmed by a
+    // majority of it before credentials are checked against it (plan
+    // CLUSTER-IAM-REPLICATION.md, decision 4).
+    let iam_freshness = Arc::new(IamFreshness::new(cluster_config.iam_max_staleness()));
+    let iam_catch_up = {
+        let reconciler = Reconciler::new(
+            read_coordinator.clone(),
+            rpc_client.clone(),
+            gossip_handle.clone(),
+            node_id,
+            cluster_cfg.epoch,
+        )
+        .with_local_replica(LocalReplica {
+            write: replica_write.clone(),
+            read: replica_read.clone(),
+        });
+        let catch_up = Arc::new(IamCatchUp::new(
+            node_id,
+            iam_copy,
+            iam_freshness.clone(),
+            gossip_handle.clone(),
+            rpc_client.clone(),
+            router.clone(),
+            Arc::new(reconciler),
+            gc_grace,
+            IamCatchUpConfig {
+                start_delay: iam_test_catch_up_delay(),
+                ..IamCatchUpConfig::default()
+            },
+        ));
+        info!(
+            max_staleness_secs = cluster_config.iam_max_staleness_secs,
+            "IAM credentials are checked once a majority of the pool agrees with this node's copy of IAM"
+        );
+        background_handles.push(tokio::spawn(catch_up.clone().run(shutdown_rx.clone())));
+        catch_up
+    };
 
     #[cfg(feature = "enterprise")]
     if let Some(service) = ec_operations_service {
@@ -1412,36 +2117,90 @@ pub async fn bootstrap_cluster(
     let event_handle = tokio::spawn(cluster_event_logger(cluster_events));
     background_handles.push(event_handle);
 
-    // Distributed GC
-    let gc_config = GcConfig {
-        enabled: true,
-        interval: Duration::from_secs(
-            cluster_config.gc_grace_days as u64 * 24 * 3600 / 10, // Check ~10x per grace period
+    // Tombstone GC: a tombstone goes once it is older than the grace period
+    // and every other replica of its key has had a complete anti-entropy
+    // round with this node since it was written. Only a replicated pool has
+    // those rounds; the tombstones of erasure-coded objects are the
+    // Enterprise runtime's.
+    let mut gc_service = DistributedGcService::new(
+        cluster_config.tombstone_gc(),
+        storage_engine.clone(),
+        anti_entropy.repair_frontier().clone(),
+        pool_layout.clone(),
+        node_id,
+    );
+    // While the pool grows, every tombstone stays until it settled on the
+    // successor; from then on only rounds over the successor's ring count.
+    if let Some((ranges, successor, _)) = &growth {
+        gc_service = gc_service.with_generation(ranges.clone(), successor.clone());
+    }
+    let gc_service = Arc::new(gc_service);
+
+    // The pool's growth on this node: it begins once every member is ready,
+    // moves this node's keys to the new owners, applies the ranges cut over
+    // and settles on the successor; the member with the lowest identity
+    // verifies the ranges and passes the barrier. Then the copies this node
+    // no longer owns are handed over and removed, after the grace period.
+    let pool_transition = match &growth {
+        Some((_, _, transition)) => {
+            crate::pool_generation::start_growth(crate::pool_generation::GrowthParts {
+                transition: transition.clone(),
+                router: router.clone(),
+                rpc_client: rpc_client.clone(),
+                gossip: gossip_handle.clone(),
+                read: read_coordinator.clone(),
+                write: write_coordinator.clone(),
+                storage: storage_engine.clone(),
+                multipart_storage: multipart_storage.clone(),
+                local_replica: LocalReplica {
+                    write: replica_write.clone(),
+                    read: replica_read.clone(),
+                },
+                store: progress_store.clone(),
+                stored_bytes: stored_bytes.clone(),
+                rebalance: rebalance_config.clone(),
+                gc_grace,
+                settle: s4_cluster::gc::tombstone::arrival_window(
+                    write_timeouts.replica_write_timeout,
+                ),
+                poll: Duration::from_secs(2),
+                topology_epoch: cluster_cfg.epoch,
+                shutdown: shutdown_rx.clone(),
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to start the pool's growth: {e}"))?;
+            let _ = pool_move_slot.set(transition.clone());
+            Some(transition.clone())
+        }
+        None => None,
+    };
+    // The copies of keys this node no longer owns: those of a growth that
+    // settled before this start, or of a pool grown before generations.
+    background_handles.push(tokio::spawn(
+        crate::pool_generation::clean_up_foreign_copies(
+            crate::pool_generation::CleanUpParts {
+                record: pool_generation.clone(),
+                transition: pool_transition.clone(),
+                local: node_id,
+                router: router.clone(),
+                rpc_client: rpc_client.clone(),
+                gossip: gossip_handle.clone(),
+                read: read_coordinator.clone(),
+                storage: storage_engine.clone(),
+                multipart_storage: multipart_storage.clone(),
+                local_replica: LocalReplica {
+                    write: replica_write.clone(),
+                    read: replica_read.clone(),
+                },
+                store: progress_store.clone(),
+                rebalance: rebalance_config.clone(),
+                gc_grace,
+                topology_epoch: cluster_cfg.epoch,
+            },
+            shutdown_rx.clone(),
         ),
-        tombstone_policy: TombstonePolicy {
-            gc_grace: Duration::from_secs(cluster_config.gc_grace_days as u64 * 24 * 3600),
-            max_rejoin_downtime: Duration::from_secs(
-                cluster_config.max_rejoin_downtime_days as u64 * 24 * 3600,
-            ),
-        },
-    };
-
-    let index_db = {
-        let storage_guard = storage.read().await;
-        storage_guard.index_db().clone()
-    };
-
-    let repair_frontier = anti_entropy.repair_frontier().clone();
-    let pool_replicas = Arc::new(RwLock::new(pool_nodes_ids.clone()));
-
-    let gc_service = Arc::new(DistributedGcService::new(
-        gc_config,
-        index_db.clone(),
-        repair_frontier,
-        pool_replicas,
     ));
 
-    {
+    if replicated_pool {
         let gc = gc_service.clone();
         let rx = shutdown_rx.clone();
         let handle = tokio::spawn(async move {
@@ -1449,10 +2208,108 @@ pub async fn bootstrap_cluster(
         });
         background_handles.push(handle);
         info!(
-            "Distributed GC worker started (grace period: {} days)",
-            cluster_config.gc_grace_days
+            gc_grace_secs = gc_grace.as_secs(),
+            interval_secs = cluster_config.tombstone_gc_interval_secs,
+            "Tombstone GC worker started"
         );
     }
+
+    // Versioning and Object Lock this node accepted before cluster mode
+    // refused them: a warning for each once adoption moved them, and a gauge
+    // and the health's count kept current.
+    let unenforced_configs = UnenforcedConfigs::default();
+    let (adoption_passes, adoption_passes_rx) = watch::channel(0u64);
+    background_handles.push(tokio::spawn(crate::unenforced_configs::run(
+        storage_engine.clone(),
+        unenforced_configs.clone(),
+        adoption_passes_rx,
+        shutdown_rx.clone(),
+    )));
+
+    let index_db = {
+        let storage_guard = storage.read().await;
+        storage_guard.index_db().clone()
+    };
+    let index_db_for_iam = index_db.clone();
+
+    // Bucket configurations an earlier release stored on single nodes: this
+    // node brings its own to the replicas of their keys, and reads
+    // configurations through the quorums once every node of the pool did —
+    // at once, when an earlier start saw that.
+    let config_read_gate = crate::config_adoption::initial_gate(&index_db).await;
+    // IAM changes wait until no node of the pool keeps IAM of its own the
+    // pool has not taken over — at once, when an earlier start saw that.
+    let iam_adoption_gate = crate::iam_adoption::initial_gate(&index_db).await;
+    let iam_adoption_collector = Arc::new(IamAdoptionCollector::new(
+        node_id,
+        pool_roster.clone(),
+        pool_nodes_ids.clone(),
+        iam_own_users,
+        rpc_client.clone(),
+    ));
+    let config_adoption_status = ConfigAdoptionStatus::default();
+    let adoption = ConfigAdoption::new(
+        storage_engine.clone(),
+        Reconciler::new(
+            read_coordinator.clone(),
+            rpc_client.clone(),
+            gossip_handle.clone(),
+            node_id,
+            cluster_cfg.epoch,
+        )
+        .with_local_replica(LocalReplica {
+            write: replica_write.clone(),
+            read: replica_read.clone(),
+        }),
+        node_id,
+    );
+    background_handles.push(tokio::spawn(crate::config_adoption::adopt(
+        adoption,
+        index_db.clone(),
+        gossip_handle.clone(),
+        config_adoption_status.clone(),
+        adoption_passes,
+        shutdown_rx.clone(),
+    )));
+    background_handles.push(tokio::spawn(crate::config_adoption::open_gate(
+        pool_nodes_ids.clone(),
+        node_id,
+        gossip_handle.clone(),
+        config_read_gate.clone(),
+        index_db.clone(),
+        shutdown_rx.clone(),
+    )));
+
+    // The stages of the move of the bucket metadata that follow as their
+    // gates open, and at stage 1 the backfill of this node's bucket metadata
+    // to the new replicas.
+    let backfill: Option<Arc<dyn BackfillPass>> = bucket_metadata_move.as_ref().map(|_| {
+        Arc::new(Backfill::new(
+            storage_engine.clone(),
+            Reconciler::new(
+                read_coordinator.clone(),
+                rpc_client.clone(),
+                gossip_handle.clone(),
+                node_id,
+                cluster_cfg.epoch,
+            )
+            .with_local_replica(LocalReplica {
+                write: replica_write.clone(),
+                read: replica_read.clone(),
+            }),
+        )) as Arc<dyn BackfillPass>
+    });
+    background_handles.push(tokio::spawn(crate::bucket_metadata_placement::advance(
+        active_pool_nodes.clone(),
+        node_id,
+        gossip_handle.clone(),
+        index_db.clone(),
+        bucket_metadata_placement,
+        bucket_metadata_move.as_ref().map(|moving| moving.stage_cell().clone()),
+        backfill,
+        Some(bucket_metadata_status.clone()),
+        shutdown_rx.clone(),
+    )));
 
     // Data scrubber
     let scrubber_config = ScrubberConfig {
@@ -1479,13 +2336,7 @@ pub async fn bootstrap_cluster(
         rpc_client: rpc_client.clone(),
         gossip: gossip_handle.clone(),
         storage: storage_engine.clone(),
-        placement: Arc::new(
-            s4_cluster::PlacementStrategy::new(
-                pool_nodes_ids.clone(),
-                cluster_config.replication_factor,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to create placement strategy: {e}"))?,
-        ),
+        placement: Arc::new(pool_layout.clone()),
     };
 
     let scrubber = Arc::new(DataScrubber::new_cluster(
@@ -1509,28 +2360,88 @@ pub async fn bootstrap_cluster(
     }
 
     // The admin API reads the membership the metrics count and the counters
-    // the services above increment next to their metrics.
-    let (replication_factor, write_quorum, read_quorum) =
-        cluster_cfg.effective_quorum(&cluster_cfg.pools[0]);
-    let cluster_admin_service: Arc<dyn ClusterAdminService> = Arc::new(NodeClusterAdmin::new(
+    // the services above increment next to their metrics. The quorums it
+    // reports are those the pool's data is placed by.
+    let (replication_factor, write_quorum, read_quorum) = (
+        pool_layout.data().replication_factor(),
+        pool_layout.data().write_quorum(),
+        pool_layout.data().read_quorum(),
+    );
+    // Whether the live nodes of the pool are configured alike for IAM: root,
+    // the JWT secret and the IAM encryption key (decision 6).
+    let iam_config_check = Arc::new(IamConfigCheck::new(
+        node_id,
+        pool_nodes_ids.clone(),
+        pool_roster.clone(),
         gossip_handle.clone(),
-        node_meta,
-        PoolShape {
-            roster: pool_roster,
-            pool_id: pool_id.0,
-            storage_class: cluster_cfg.pools[0].storage_class,
-            replication_factor,
-            write_quorum,
-            read_quorum,
-            epoch: cluster_cfg.epoch,
-        },
-        anti_entropy.metrics().clone(),
-        gc_service.metrics().clone(),
-        scrubber.metrics().clone(),
     ));
+    background_handles.push(tokio::spawn(
+        iam_config_check.clone().run(shutdown_rx.clone()),
+    ));
+    // What `GET /api/admin/iam/status` answers, from what the node holds.
+    let iam_status = Arc::new(IamStatusSource::new(
+        node_id,
+        pool_roster.clone(),
+        iam_catch_up,
+        iam_freshness.clone(),
+        iam_lease_keeper,
+        iam_adoption_gate.clone(),
+    ));
+    // The pool's growth as the admin API and the metrics see it, and the
+    // pool's pause of the move of its keys.
+    let pool_growth = Arc::new(s4_cluster::rebalance::PoolGrowth::new(
+        s4_cluster::rebalance::PoolGrowthParts {
+            pool: pool_roster.pool().to_string(),
+            record: pool_generation.clone(),
+            transition: pool_transition.clone(),
+            router: router.clone(),
+            stored_bytes: stored_bytes.clone(),
+            records: Arc::new(s4_cluster::rebalance::QuorumRecords::new(
+                read_coordinator.clone(),
+                write_coordinator.clone(),
+            )),
+        },
+    ));
+    background_handles.push(tokio::spawn(
+        pool_growth.clone().run_metrics(Duration::from_secs(5), shutdown_rx.clone()),
+    ));
+    let cluster_admin_service: Arc<dyn ClusterAdminService> = Arc::new(
+        NodeClusterAdmin::new(
+            gossip_handle.clone(),
+            node_meta,
+            PoolShape {
+                roster: pool_roster,
+                pool_id: pool_id.0,
+                storage_class: cluster_cfg.pools[0].storage_class,
+                replication_factor,
+                write_quorum,
+                read_quorum,
+                epoch: cluster_cfg.epoch,
+            },
+            anti_entropy.metrics().clone(),
+            gc_service.metrics().clone(),
+            scrubber.metrics().clone(),
+        )
+        .with_config_adoption(config_adoption_status.clone())
+        .with_migration(migration_status)
+        .with_bucket_metadata(bucket_metadata_status)
+        .with_iam_adoption(iam_adoption_gate.clone())
+        .with_iam_config(iam_config_check.clone())
+        .with_pool_growth(pool_growth),
+    );
 
     // Store shutdown sender so we can signal workers on shutdown
     // (we'll drop it in app.rs shutdown sequence)
+    let iam_adoption = IamAdoptionParts {
+        collector: iam_adoption_collector,
+        gate: iam_adoption_gate,
+        node_id,
+        pool: pool_nodes_ids.clone(),
+        gossip: gossip_handle.clone(),
+        index_db: index_db_for_iam,
+        shutdown: shutdown_rx.clone(),
+        config: iam_config_check,
+    };
     let shutdown_handle = tokio::spawn(async move {
         // Keep the shutdown_tx alive until this task is aborted.
         // When aborted, drop signals all receivers.
@@ -1545,9 +2456,18 @@ pub async fn bootstrap_cluster(
         write_coordinator,
         read_coordinator,
         list_coordinator,
+        iam_lease,
+        iam_freshness,
+        iam_status,
         ec_admin_service,
         ec_object_runtime,
         cluster_admin_service,
+        clock,
+        config_read_gate,
+        config_adoption_status,
+        unenforced_configs,
+        iam_adoption,
+        pool_transition,
         background_handles,
         rpc_handle,
     })
@@ -1556,6 +2476,30 @@ pub async fn bootstrap_cluster(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The delay scenario 62 holds a started node's comparison of its copy of
+/// IAM by (`S4_IAM_TEST_CATCH_UP_DELAY_MS`): zero unless
+/// `S4_IAM_TEST_HOOKS_ENABLED` is set to a true value. Production never sets
+/// it.
+fn iam_test_catch_up_delay() -> Duration {
+    iam_test_catch_up_delay_from(
+        std::env::var("S4_IAM_TEST_HOOKS_ENABLED").ok().as_deref(),
+        std::env::var("S4_IAM_TEST_CATCH_UP_DELAY_MS").ok().as_deref(),
+    )
+}
+
+fn iam_test_catch_up_delay_from(enabled: Option<&str>, millis: Option<&str>) -> Duration {
+    let enabled = enabled.is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    });
+    match millis.and_then(|millis| millis.parse::<u64>().ok()) {
+        Some(millis) if enabled => Duration::from_millis(millis),
+        _ => Duration::ZERO,
+    }
+}
 
 /// Resolve an address string to a `SocketAddr`.
 ///
@@ -1883,8 +2827,41 @@ fn unix_time_secs() -> u64 {
 mod bucket_tests;
 
 #[cfg(test)]
+mod iam_tests;
+
+#[cfg(test)]
+mod multipart_tests;
+
+#[cfg(test)]
+mod growth_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_catch_up_delay_is_a_test_hook_inert_unless_enabled() {
+        assert_eq!(
+            iam_test_catch_up_delay_from(None, Some("6000")),
+            Duration::ZERO
+        );
+        assert_eq!(
+            iam_test_catch_up_delay_from(Some("false"), Some("6000")),
+            Duration::ZERO
+        );
+        assert_eq!(
+            iam_test_catch_up_delay_from(Some("true"), None),
+            Duration::ZERO
+        );
+        assert_eq!(
+            iam_test_catch_up_delay_from(Some("true"), Some("soon")),
+            Duration::ZERO
+        );
+        assert_eq!(
+            iam_test_catch_up_delay_from(Some("On"), Some("6000")),
+            Duration::from_millis(6000)
+        );
+    }
     use s4_core::storage::ReadOptions;
     use s4_core::StorageEngine;
     use std::collections::HashMap;
@@ -2140,6 +3117,86 @@ mod tests {
         );
     }
 
+    /// A node with data from before tombstones takes its tombstone horizon
+    /// from its own clock, ahead by the tolerated clock skew, on the first
+    /// start that keeps tombstones, and keeps it after.
+    #[tokio::test]
+    async fn the_tombstone_horizon_comes_from_the_clock_once() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let dir = temp_dir.path().to_path_buf();
+        let open = |version_digests: bool| {
+            let dir = dir.clone();
+            async move {
+                let engine = BitcaskStorageEngine::open(
+                    dir.join("volumes"),
+                    dir.join("metadata_db"),
+                    10 * 1024 * 1024,
+                    4096,
+                    false,
+                    s4_core::storage::IndexOptions { version_digests },
+                )
+                .await
+                .expect("create storage engine");
+                RwLock::new(engine)
+            }
+        };
+        open(false)
+            .await
+            .read()
+            .await
+            .put_object("photos", "cat.jpg", b"meow", "image/jpeg", &HashMap::new())
+            .await
+            .expect("put");
+
+        let storage = open(true).await;
+        let clock = HybridClock::new(NodeId(7));
+        let before = clock.now();
+        let horizon = settle_tombstone_horizon(&storage, &clock).await.expect("settle");
+        let skew = clock.max_clock_skew().as_millis() as u64;
+        assert!(
+            horizon.wall_time >= before.wall_time + skew,
+            "{horizon} is not past {before} by the clock skew of {skew} ms"
+        );
+        assert_eq!(horizon.node_id, 7);
+        storage
+            .read()
+            .await
+            .index_db()
+            .seal_version_digests()
+            .expect("seal clean shutdown");
+        drop(storage);
+
+        let storage = open(true).await;
+        let later = HybridClock::new(NodeId(8));
+        assert_eq!(
+            settle_tombstone_horizon(&storage, &later).await.expect("settle again"),
+            horizon
+        );
+    }
+
+    /// A node whose first start with tombstones created its data directory
+    /// has a zero horizon: no delete in its history went without one.
+    #[tokio::test]
+    async fn a_node_created_with_tombstones_has_a_zero_horizon() {
+        let temp_dir = tempfile::TempDir::new().expect("create temp dir");
+        let engine = BitcaskStorageEngine::open(
+            temp_dir.path().join("volumes"),
+            temp_dir.path().join("metadata_db"),
+            10 * 1024 * 1024,
+            4096,
+            false,
+            s4_core::storage::IndexOptions {
+                version_digests: true,
+            },
+        )
+        .await
+        .expect("create storage engine");
+        let horizon = settle_tombstone_horizon(&RwLock::new(engine), &HybridClock::new(NodeId(7)))
+            .await
+            .expect("settle");
+        assert!(horizon.is_zero(), "{horizon}");
+    }
+
     async fn test_adapter() -> (SharedStorageAdapter, tempfile::TempDir) {
         let temp_dir = tempfile::TempDir::new().expect("create temp dir");
         let data_path = temp_dir.path().join("volumes");
@@ -2152,7 +3209,7 @@ mod tests {
                 .expect("create storage engine");
 
         (
-            SharedStorageAdapter(Arc::new(RwLock::new(engine))),
+            SharedStorageAdapter::new(Arc::new(RwLock::new(engine))),
             temp_dir,
         )
     }
@@ -2164,6 +3221,39 @@ mod tests {
     /// storage engine does not support erasure-coded layout migration" — and
     /// the coordinator above it into a migration that can never reach quorum.
     /// One of the two was missed exactly this way.
+    /// The move of a grown pool lists this node's upload sessions and reads
+    /// their parts through the adapter; the trait's defaults refuse both, so
+    /// an adapter that forgot to delegate would leave every upload begun
+    /// before the growth behind.
+    #[tokio::test]
+    async fn the_adapter_forwards_multipart_sessions_and_parts_to_the_move() {
+        use s4_cluster::MultipartReplicaStorage;
+        let (adapter, _temp) = test_adapter().await;
+        adapter
+            .create_multipart_session("upload", "bucket", "key", "text/plain", &HashMap::new())
+            .await
+            .unwrap();
+        adapter
+            .upload_multipart_part_streaming(
+                "upload",
+                1,
+                Box::new(std::io::Cursor::new(b"part".to_vec())),
+                4,
+            )
+            .await
+            .unwrap();
+        let sessions = adapter
+            .list_multipart_sessions_after(None, 10)
+            .await
+            .expect("the listing must be delegated, not refused by the trait default");
+        assert_eq!(sessions.len(), 1);
+        let (_, data) = adapter
+            .read_multipart_part("upload", 1)
+            .await
+            .expect("the part read must be delegated, not refused by the trait default");
+        assert_eq!(data, b"part");
+    }
+
     #[tokio::test]
     async fn the_adapter_forwards_the_ec_layout_migration_both_ways() {
         let (adapter, _temp) = test_adapter().await;
@@ -2201,6 +3291,40 @@ mod tests {
         assert!(!record.is_erasure_coded());
     }
 
+    /// The adapter forwards the tombstone methods. Without that the trait
+    /// defaults take over: a delete on a replica is refused, and the version
+    /// and listing reads answer a tombstone as absence.
+    #[tokio::test]
+    async fn the_adapter_forwards_tombstones() {
+        let (adapter, _temp) = test_adapter().await;
+        let at_10 = HashMap::from([
+            ("_s4_hlc_wall".to_string(), "10".to_string()),
+            ("_s4_hlc_logical".to_string(), "0".to_string()),
+            ("_s4_hlc_node_id".to_string(), "1".to_string()),
+        ]);
+        adapter
+            .put_object("bucket", "key", b"version 10", "text/plain", &at_10)
+            .await
+            .expect("write version 10");
+
+        assert!(adapter
+            .tombstone_object("bucket", "key", 20, 0, 1)
+            .await
+            .expect("the tombstone must be delegated, not refused by the trait default"));
+
+        assert!(matches!(
+            adapter.key_version("bucket", "key").await.expect("key version"),
+            s4_core::KeyVersion::Tombstone(record) if record.hlc_timestamp == 20
+        ));
+        assert!(adapter.head_object("bucket", "key").await.is_err());
+        let listed = adapter
+            .list_objects_with_tombstones("bucket", "", None, 10)
+            .await
+            .expect("listing with tombstones");
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].1.is_tombstone());
+    }
+
     /// A conditional delete checks the generation and deletes under one write
     /// lock. A write that lands while the delete waits for the lock is checked
     /// like any other generation, not deleted unseen.
@@ -2220,7 +3344,7 @@ mod tests {
             .await
             .expect("write version 10");
 
-        let held = adapter.0.read().await;
+        let held = adapter.engine.read().await;
         let delete = tokio::spawn({
             let adapter = adapter.clone();
             async move { adapter.delete_object_if_hlc("bucket", "key", 10, 0, 1).await }

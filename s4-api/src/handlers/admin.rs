@@ -23,7 +23,8 @@ use axum::{
 use serde_json::json;
 
 use s4_features::iam::{
-    CreateUserRequest, IamError, JwtClaims, LoginRequest, UpdateUserRequest, UserResponse,
+    AdminPrincipal, AdoptionReport, AdoptionRequest, CreateUserRequest, IamError, LoginRequest,
+    UpdateUserRequest, UserRecords, UserResponse,
 };
 
 use s4_core::storage::StorageEngine;
@@ -54,24 +55,265 @@ pub async fn login(
     })))
 }
 
-/// List all users - requires SuperUser role.
+/// The most entries one page of a listing of the Admin API holds.
+const MAX_PAGE: usize = 1000;
+
+/// The page a listing of the Admin API is asked for: `max-keys` entries
+/// (1 to 1000) after `continuation-token`, as the previous page answered it.
+#[derive(Debug, Default, Deserialize)]
+pub struct PageQuery {
+    /// How many entries, at most.
+    #[serde(rename = "max-keys")]
+    max_keys: Option<usize>,
+    /// Where the previous page stopped.
+    #[serde(rename = "continuation-token")]
+    continuation_token: Option<String>,
+}
+
+impl PageQuery {
+    /// How many entries the page holds at most: `max-keys`, or `default`.
+    fn max(&self, default: usize) -> Result<usize, AdminError> {
+        match self.max_keys {
+            None => Ok(default),
+            Some(max) if (1..=MAX_PAGE).contains(&max) => Ok(max),
+            Some(_) => Err(AdminError::InvalidArgument(format!(
+                "max-keys must be between 1 and {MAX_PAGE}"
+            ))),
+        }
+    }
+
+    /// Where the page starts: after the id the token names; from the first
+    /// entry without one.
+    fn after(&self) -> Result<Option<String>, AdminError> {
+        use base64::Engine;
+        let Some(token) = self.continuation_token.as_deref().filter(|token| !token.is_empty())
+        else {
+            return Ok(None);
+        };
+        let invalid = || AdminError::InvalidArgument("invalid continuation-token".into());
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token)
+            .map_err(|_| invalid())?;
+        let text = String::from_utf8(bytes).map_err(|_| invalid())?;
+        text.strip_prefix("after:").map(|id| Some(id.to_string())).ok_or_else(invalid)
+    }
+}
+
+/// The continuation token of a page that stopped after the id `after`.
+fn continuation_token(after: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("after:{after}"))
+}
+
+/// List users - requires SuperUser role.
 ///
-/// GET /api/admin/users
+/// GET /api/admin/users[?max-keys=N&continuation-token=T]
 /// Headers: `Authorization: Bearer <token>`
-/// Returns: [{ "id": "...", "username": "...", "role": "...", ... }]
+/// Returns: `{ "users": [{ "id": "...", "username": "...", "role": "...", ... }],
+/// "is_truncated": false }`, with `next_continuation_token` when more follow.
+///
+/// Root comes first, then the stored users in the order of their ids. Without
+/// `max-keys` the whole list is one page; with it, pages of up to 1000 users
+/// follow each other by `continuation-token`.
 pub async fn list_users(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
+    Query(page): Query<PageQuery>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
     // Check permissions
-    if !claims.role.can_admin() {
+    if !principal.role.can_admin() {
         return Err(AdminError::Forbidden);
     }
 
-    let users = state.iam_storage.list_users().await?;
-    let users: Vec<UserResponse> = users.into_iter().map(UserResponse::from).collect();
+    let max = page.max(usize::MAX)?;
+    let (users, next) = state.auth_service.list_users_page(page.after()?.as_deref(), max).await?;
 
-    Ok(Json(json!({ "users": users })))
+    let mut answer = json!({ "users": users, "is_truncated": next.is_some() });
+    if let (Some(next), Some(fields)) = (next, answer.as_object_mut()) {
+        fields.insert(
+            "next_continuation_token".into(),
+            json!(continuation_token(&next)),
+        );
+    }
+    Ok(Json(answer))
+}
+
+/// The audit log of IAM changes - requires SuperUser role.
+///
+/// GET /api/admin/iam/audit[?max-keys=N&continuation-token=T]
+/// Headers: `Authorization: Bearer <token>`
+/// Returns: `{ "entries": [{ "id", "at", "actor", "action", "target_id",
+/// "target", "through", "epoch", "details" }], "is_truncated": false }`, with
+/// `next_continuation_token` when more follow; up to 1000 entries a page,
+/// in the order the changes were made (plan CLUSTER-IAM-REPLICATION.md,
+/// decision 10). Read from this node's own copy of IAM.
+pub async fn iam_audit(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AdminPrincipal>,
+    Query(page): Query<PageQuery>,
+) -> Result<Json<serde_json::Value>, AdminError> {
+    if !principal.role.can_admin() {
+        return Err(AdminError::Forbidden);
+    }
+    let log = state
+        .iam_storage
+        .audit_page(page.after()?.as_deref(), page.max(MAX_PAGE)?)
+        .await?;
+    let mut answer = json!({ "entries": log.entries, "is_truncated": log.next_after.is_some() });
+    if let (Some(next), Some(fields)) = (log.next_after, answer.as_object_mut()) {
+        fields.insert(
+            "next_continuation_token".into(),
+            json!(continuation_token(&next)),
+        );
+    }
+    Ok(Json(answer))
+}
+
+/// How IAM stands on this node and its pool - requires SuperUser role.
+///
+/// GET /api/admin/iam/status
+/// Headers: `Authorization: Bearer <token>`
+/// Returns, on a cluster node: `node`; `credentials` — `state` (`serving`,
+/// `starting` until a majority of the pool first agreed with the node's copy
+/// of IAM, `stale` once none has for longer than the bound),
+/// `confirmed_ago_ms`, `max_staleness_secs`; `epoch` of the copy; `agreeing`
+/// and `majority`; `nodes`, each with its `status`, announced `epoch`,
+/// `epoch_behind_ms` and whether it `agrees`; `lease` — `max_epoch` and the
+/// grant `held` now, with its `holder`; `adoption` — `adopted` or `pending`
+/// (plan CLUSTER-IAM-REPLICATION.md, `CIR-07-4`). Read from what the node
+/// holds, without asking any other node. A single node's IAM is all there
+/// is: it answers `mode: standalone` with credentials served.
+pub async fn iam_status(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AdminPrincipal>,
+) -> Result<Json<serde_json::Value>, AdminError> {
+    if !principal.role.can_admin() {
+        return Err(AdminError::Forbidden);
+    }
+    let Some(source) = &state.iam_status else {
+        return Ok(Json(json!({
+            "mode": "standalone",
+            "credentials": { "state": "serving" },
+            "adoption": if state.iam_storage.changes_open() { "adopted" } else { "pending" },
+        })));
+    };
+    let mut answer = json!(source.status().await);
+    if let Some(fields) = answer.as_object_mut() {
+        fields.insert("mode".into(), json!("cluster"));
+    }
+    Ok(Json(answer))
+}
+
+/// The IAM of this node acting for `principal` in the audit log.
+fn iam_of(state: &AppState, principal: &AdminPrincipal) -> s4_features::iam::IamStorage {
+    state.iam_storage.acting_as(principal.into())
+}
+
+/// The name of root when the environment configures it: a stored root
+/// without S3 credentials is no user a node keeps of its own.
+fn root_name(state: &AppState) -> Option<String> {
+    state.auth_service.root().map(|root| root.username().to_string())
+}
+
+/// What the nodes of the pool keep of their own, for the operator to decide
+/// on (plan CLUSTER-IAM-REPLICATION.md, decision 8) - requires SuperUser role.
+///
+/// GET /api/admin/iam/adoption
+/// Headers: `Authorization: Bearer <token>`
+/// Returns the report — every node's answer, every user name with its nodes,
+/// records and conflicts, its `report_id` — with `state`: `adopted` once IAM
+/// changes are open on this node, `pending` while they are not; and the
+/// pool's latest decision, when there is one. A single node's IAM is all
+/// there is: it answers `adopted` with nothing to decide.
+pub async fn iam_adoption_report(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AdminPrincipal>,
+) -> Result<Json<serde_json::Value>, AdminError> {
+    if !principal.role.can_admin() {
+        return Err(AdminError::Forbidden);
+    }
+    let decision = state.iam_storage.adoption_record().await?.map(|mut record| {
+        // The report the decision was taken on stays in the record; the
+        // answer shows the report of now.
+        record.report.users.clear();
+        record
+    });
+    let Some(adoption) = &state.iam_adoption else {
+        return Ok(Json(json!({
+            "mode": "standalone",
+            "state": "adopted",
+            "changes_open": state.iam_storage.changes_open(),
+            "decision": decision,
+        })));
+    };
+    let root = root_name(&state);
+    let report = AdoptionReport::build(&adoption.holdings(root.as_deref()).await);
+    let mut answer = json!(report);
+    if let Some(fields) = answer.as_object_mut() {
+        let changes_open = state.iam_storage.changes_open();
+        fields.insert("mode".into(), json!("cluster"));
+        fields.insert(
+            "state".into(),
+            json!(if changes_open { "adopted" } else { "pending" }),
+        );
+        fields.insert("changes_open".into(), json!(changes_open));
+        fields.insert("node".into(), json!(adoption.local_name()));
+        fields.insert(
+            "node_serves_own_iam".into(),
+            json!(state.iam_storage.directory().records() == UserRecords::Legacy),
+        );
+        fields.insert("decision".into(), json!(decision));
+    }
+    Ok(Json(answer))
+}
+
+/// Takes over the IAM the nodes of the pool keep of their own, as decided
+/// on a report (plan CLUSTER-IAM-REPLICATION.md, decision 8) - requires
+/// SuperUser role.
+///
+/// POST /api/admin/iam/adoption
+/// Headers: `Authorization: Bearer <token>`
+/// Body: `{ "report_id": "...", "mode": "union|majority|users", "users": ["<id>", ...] }`
+/// Returns the users taken over, those left out, and those the pool held
+/// already. Every node drops what it kept of its own once the decision
+/// reaches it; IAM changes open once every node has.
+pub async fn adopt_iam(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AdminPrincipal>,
+    Json(request): Json<AdoptionRequest>,
+) -> Result<Json<serde_json::Value>, AdminError> {
+    if !principal.role.can_admin() {
+        return Err(AdminError::Forbidden);
+    }
+    let Some(adoption) = &state.iam_adoption else {
+        return Err(IamError::AdoptionNotPending.into());
+    };
+    let root = root_name(&state);
+    let holdings = adoption.holdings(root.as_deref()).await;
+    let record = iam_of(&state, &principal)
+        .adopt(
+            &holdings,
+            &request,
+            &principal.username,
+            &adoption.local_name(),
+        )
+        .await?;
+    tracing::info!(
+        report_id = %record.report_id,
+        mode = ?record.mode,
+        adopted = record.adopted.len(),
+        left_out = record.left_out.len(),
+        decided_by = %record.decided_by,
+        "IAM users nodes kept of their own taken over by the cluster"
+    );
+    Ok(Json(json!({
+        "report_id": record.report_id,
+        "mode": record.mode,
+        "decided_at": record.decided_at,
+        "adopted": record.adopted,
+        "already_adopted": record.already_adopted,
+        "left_out": record.left_out,
+    })))
 }
 
 /// Create new user - requires SuperUser role.
@@ -82,16 +324,20 @@ pub async fn list_users(
 /// Returns: { "id": "...", "username": "...", "role": "...", ... }
 pub async fn create_user(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Json(request): Json<CreateUserRequest>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
     // Check permissions
-    if !claims.role.can_admin() {
+    if !principal.role.can_admin() {
         return Err(AdminError::Forbidden);
     }
 
-    let user = state
-        .iam_storage
+    // Root's name belongs to root, which is configured, not stored.
+    if state.auth_service.is_root_name(&request.username) {
+        return Err(AdminError::UserAlreadyExists);
+    }
+
+    let user = iam_of(&state, &principal)
         .create_user(request.username, request.password, request.role)
         .await?;
 
@@ -105,25 +351,15 @@ pub async fn create_user(
 /// Returns: { "id": "...", "username": "...", "role": "...", ... }
 pub async fn get_user(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
     // Check permissions
-    if !claims.role.can_admin() {
+    if !principal.role.can_admin() {
         return Err(AdminError::Forbidden);
     }
 
-    // Get user by ID using direct storage access
-    let user_key = format!("__s4_iam_user_{}", user_id);
-    let storage = state.storage.read().await;
-    let (user_bytes, _) = storage
-        .get_object("__system__", &user_key)
-        .await
-        .map_err(|_| AdminError::UserNotFound)?;
-
-    let user: s4_features::iam::User = serde_json::from_slice(&user_bytes).map_err(|e| {
-        AdminError::Storage(format!("Stored user record {user_id} is unreadable: {e}"))
-    })?;
+    let user = state.auth_service.get_user(&user_id).await?.ok_or(AdminError::UserNotFound)?;
 
     Ok(Json(json!(UserResponse::from(user))))
 }
@@ -136,17 +372,18 @@ pub async fn get_user(
 /// Returns: { "id": "...", "username": "...", "role": "...", ... }
 pub async fn update_user(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(user_id): Path<String>,
     Json(request): Json<UpdateUserRequest>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
     // Check permissions
-    if !claims.role.can_admin() {
+    if !principal.role.can_admin() {
         return Err(AdminError::Forbidden);
     }
 
-    let user = state
-        .iam_storage
+    ensure_not_root(&state, &user_id)?;
+
+    let user = iam_of(&state, &principal)
         .update_user(&user_id, request.password, request.role, request.is_active)
         .await?;
 
@@ -160,15 +397,17 @@ pub async fn update_user(
 /// Returns: 204 No Content
 pub async fn delete_user(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(user_id): Path<String>,
 ) -> Result<StatusCode, AdminError> {
     // Check permissions
-    if !claims.role.can_admin() {
+    if !principal.role.can_admin() {
         return Err(AdminError::Forbidden);
     }
 
-    state.iam_storage.delete_user(&user_id).await?;
+    ensure_not_root(&state, &user_id)?;
+
+    iam_of(&state, &principal).delete_user(&user_id).await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -181,15 +420,17 @@ pub async fn delete_user(
 /// Note: Secret key is only shown once!
 pub async fn generate_credentials(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(user_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
     // Check permissions
-    if !claims.role.can_admin() {
+    if !principal.role.can_admin() {
         return Err(AdminError::Forbidden);
     }
 
-    let credentials = state.iam_storage.generate_s3_credentials(&user_id).await?;
+    ensure_not_root(&state, &user_id)?;
+
+    let credentials = iam_of(&state, &principal).generate_s3_credentials(&user_id).await?;
 
     Ok(Json(json!(credentials)))
 }
@@ -201,17 +442,77 @@ pub async fn generate_credentials(
 /// Returns: 204 No Content
 pub async fn delete_credentials(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(user_id): Path<String>,
 ) -> Result<StatusCode, AdminError> {
     // Check permissions
-    if !claims.role.can_admin() {
+    if !principal.role.can_admin() {
         return Err(AdminError::Forbidden);
     }
 
-    state.iam_storage.delete_s3_credentials(&user_id).await?;
+    ensure_not_root(&state, &user_id)?;
+
+    iam_of(&state, &principal).delete_s3_credentials(&user_id).await?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// End every session of a user - requires SuperUser role.
+///
+/// POST /api/admin/users/:id/sessions/revoke
+/// Headers: `Authorization: Bearer <token>`
+/// Returns: 204 No Content
+///
+/// Every token issued to the user before the call stops working; the password,
+/// role and S3 credentials stay as they are. Root's sessions end the same way.
+pub async fn revoke_sessions(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AdminPrincipal>,
+    Path(user_id): Path<String>,
+) -> Result<StatusCode, AdminError> {
+    if !principal.role.can_admin() {
+        return Err(AdminError::Forbidden);
+    }
+
+    state
+        .auth_service
+        .acting_as((&principal).into())
+        .revoke_sessions(&user_id)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Log out - any authenticated account.
+///
+/// POST /api/admin/logout
+/// Headers: `Authorization: Bearer <token>`
+/// Returns: 204 No Content
+///
+/// Ends every session of the caller's account, the one of this token and any
+/// other: a token is not tracked on its own, only through its account's
+/// credential version.
+pub async fn logout(
+    State(state): State<AppState>,
+    Extension(principal): Extension<AdminPrincipal>,
+) -> Result<StatusCode, AdminError> {
+    state
+        .auth_service
+        .acting_as((&principal).into())
+        .revoke_sessions(&principal.user_id)
+        .await?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Refuses a change to root through the Admin API: root is configured by
+/// `S4_ROOT_USERNAME` and `S4_ROOT_PASSWORD`, and has no stored record to change.
+fn ensure_not_root(state: &AppState, user_id: &str) -> Result<(), AdminError> {
+    if state.auth_service.is_root_id(user_id) {
+        Err(AdminError::RootFromEnvironment)
+    } else {
+        Ok(())
+    }
 }
 
 /// Per-bucket storage statistics.
@@ -229,9 +530,9 @@ pub async fn delete_credentials(
 /// only by such a node is missing from the numbers.
 pub async fn bucket_stats(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
-    if !claims.role.can_admin() {
+    if !principal.role.can_admin() {
         return Err(AdminError::Forbidden);
     }
 
@@ -288,10 +589,10 @@ fn admin_cluster_error(error: s4_cluster::ClusterError) -> AdminError {
 /// Returns: 200 OK with { "name": "..." }
 pub async fn create_bucket(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(bucket_name): Path<String>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
-    if !claims.role.can_admin() {
+    if !principal.role.can_admin() {
         return Err(AdminError::Forbidden);
     }
 
@@ -328,11 +629,11 @@ pub struct DeleteBucketQuery {
 /// With `force=true`, all objects are deleted first, then the bucket itself.
 pub async fn delete_bucket(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(bucket_name): Path<String>,
     Query(query): Query<DeleteBucketQuery>,
 ) -> Result<StatusCode, AdminError> {
-    if !claims.role.can_admin() {
+    if !principal.role.can_admin() {
         return Err(AdminError::Forbidden);
     }
 
@@ -372,11 +673,11 @@ pub struct ListObjectsQuery {
 /// by key, and `complete` is false when a node did not answer.
 pub async fn list_bucket_objects(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Path(bucket_name): Path<String>,
     Query(params): Query<ListObjectsQuery>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
-    if !claims.role.can_admin() {
+    if !principal.role.can_admin() {
         return Err(AdminError::Forbidden);
     }
 
@@ -490,10 +791,10 @@ const DIRECTORY_END: char = '\u{10FFFF}';
 /// Returns: `{ "volumes_scanned": N, "volumes_compacted": N, "bytes_reclaimed": N, "errors": N }`
 pub async fn run_compaction(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
     Query(params): Query<CompactionParams>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
-    if !claims.role.can_admin() {
+    if !principal.role.can_admin() {
         return Err(AdminError::Forbidden);
     }
 
@@ -522,7 +823,8 @@ pub async fn run_compaction(
         storage.deduplicator().clone(),
         storage.volume_writer().clone(),
         config,
-    );
+    )
+    .with_journal(storage.journal_handle());
 
     let stats = compactor
         .run()
@@ -559,9 +861,9 @@ pub struct CompactionParams {
 /// Returns: `{ "blobs_checked": N, "blobs_ok": N, "blobs_corrupted": N, ... }`
 pub async fn run_scrubber(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
-    if !claims.role.can_admin() {
+    if !principal.role.can_admin() {
         return Err(AdminError::Forbidden);
     }
 
@@ -606,9 +908,9 @@ pub async fn run_scrubber(
 /// scrubber and answers with a static message.
 pub async fn scrubber_status(
     State(state): State<AppState>,
-    Extension(claims): Extension<JwtClaims>,
+    Extension(principal): Extension<AdminPrincipal>,
 ) -> Result<Json<serde_json::Value>, AdminError> {
-    if !claims.role.can_admin() {
+    if !principal.role.can_admin() {
         return Err(AdminError::Forbidden);
     }
 
@@ -645,6 +947,20 @@ pub enum AdminError {
     UserNotFound,
     /// A user with this name already exists (409).
     UserAlreadyExists,
+    /// The request would change root, which the environment configures (409).
+    RootFromEnvironment,
+    /// The node serves the IAM an earlier release stored on it, which the
+    /// cluster has not taken over yet, and refuses to change it (409).
+    IamAdoptionPending,
+    /// A decision on the IAM nodes kept of their own does not fit the report
+    /// (400).
+    InvalidIamAdoption(String),
+    /// No node keeps IAM of its own: nothing to take over (409).
+    IamAdoptionNotPending,
+    /// The decision names another report than the nodes answer now (409).
+    IamAdoptionReportChanged,
+    /// Some node of the pool did not answer what it keeps of its own (503).
+    IamAdoptionIncomplete(String),
     /// Username does not satisfy the format rules (400).
     InvalidUsername(String),
     /// The user has no S3 credentials issued (404).
@@ -659,12 +975,20 @@ pub enum AdminError {
     InvalidBucketName(String),
     /// Request body or parameters could not be interpreted (400).
     InvalidData,
+    /// A query parameter is out of its range or malformed (400).
+    InvalidArgument(String),
     /// IAM subsystem fault (500).
     Iam(IamError),
     /// Storage engine fault (500).
     Storage(String),
     /// Too few cluster replicas answered (503); the request may be retried.
     Unavailable(String),
+    /// Another change of IAM held the lease of IAM changes for the whole
+    /// wait (503 with `Retry-After`, in seconds).
+    IamBusy(u64),
+    /// This node does not check IAM credentials now: its copy of IAM is not
+    /// confirmed current with its pool (503 with `Retry-After`).
+    IamNotServing(String),
 }
 
 impl AdminError {
@@ -692,6 +1016,16 @@ impl AdminError {
             AdminError::Forbidden => (StatusCode::FORBIDDEN, "Forbidden"),
             AdminError::UserNotFound => (StatusCode::NOT_FOUND, "UserNotFound"),
             AdminError::UserAlreadyExists => (StatusCode::CONFLICT, "UserAlreadyExists"),
+            AdminError::RootFromEnvironment => (StatusCode::CONFLICT, "RootFromEnvironment"),
+            AdminError::IamAdoptionPending => (StatusCode::CONFLICT, "IamAdoptionPending"),
+            AdminError::InvalidIamAdoption(_) => (StatusCode::BAD_REQUEST, "InvalidIamAdoption"),
+            AdminError::IamAdoptionNotPending => (StatusCode::CONFLICT, "IamAdoptionNotPending"),
+            AdminError::IamAdoptionReportChanged => {
+                (StatusCode::CONFLICT, "IamAdoptionReportChanged")
+            }
+            AdminError::IamAdoptionIncomplete(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "IamAdoptionIncomplete")
+            }
             AdminError::InvalidUsername(_) => (StatusCode::BAD_REQUEST, "InvalidUsername"),
             AdminError::NoS3Credentials => (StatusCode::NOT_FOUND, "NoS3Credentials"),
             // Same code the S3 path uses for a missing bucket, so a client can
@@ -701,10 +1035,13 @@ impl AdminError {
             AdminError::BucketNotEmpty(_) => (StatusCode::CONFLICT, "BucketNotEmpty"),
             AdminError::InvalidBucketName(_) => (StatusCode::BAD_REQUEST, "InvalidBucketName"),
             AdminError::InvalidData => (StatusCode::BAD_REQUEST, "InvalidData"),
+            AdminError::InvalidArgument(_) => (StatusCode::BAD_REQUEST, "InvalidArgument"),
             AdminError::Iam(_) | AdminError::Storage(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "InternalError")
             }
-            AdminError::Unavailable(_) => (StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable"),
+            AdminError::Unavailable(_) | AdminError::IamBusy(_) | AdminError::IamNotServing(_) => {
+                (StatusCode::SERVICE_UNAVAILABLE, "ServiceUnavailable")
+            }
         }
     }
 
@@ -716,6 +1053,19 @@ impl AdminError {
             AdminError::Forbidden => "Forbidden".to_string(),
             AdminError::UserNotFound => "User not found".to_string(),
             AdminError::UserAlreadyExists => "User already exists".to_string(),
+            AdminError::RootFromEnvironment => "Root is configured by S4_ROOT_USERNAME and \
+                S4_ROOT_PASSWORD: change it there and restart the node. Root has no S3 \
+                credentials of its own; S4_ACCESS_KEY_ID and S4_SECRET_ACCESS_KEY play that role"
+                .to_string(),
+            AdminError::IamAdoptionPending => IamError::AdoptionPending.to_string(),
+            AdminError::InvalidIamAdoption(reason) => {
+                IamError::AdoptionInvalid(reason.clone()).to_string()
+            }
+            AdminError::IamAdoptionNotPending => IamError::AdoptionNotPending.to_string(),
+            AdminError::IamAdoptionReportChanged => IamError::AdoptionReportChanged.to_string(),
+            AdminError::IamAdoptionIncomplete(reason) => {
+                IamError::AdoptionIncomplete(reason.clone()).to_string()
+            }
             AdminError::InvalidUsername(reason) => reason.clone(),
             AdminError::NoS3Credentials => "No S3 credentials configured for this user".to_string(),
             AdminError::BucketNotFound(name) => format!("Bucket '{name}' not found"),
@@ -726,9 +1076,14 @@ impl AdminError {
             ),
             AdminError::InvalidBucketName(reason) => reason.clone(),
             AdminError::InvalidData => "Invalid request data".to_string(),
+            AdminError::InvalidArgument(reason) => reason.clone(),
             AdminError::Iam(err) => err.to_string(),
             AdminError::Storage(err) => err.clone(),
-            AdminError::Unavailable(err) => err.clone(),
+            AdminError::Unavailable(err) | AdminError::IamNotServing(err) => err.clone(),
+            AdminError::IamBusy(retry_after_secs) => IamError::Busy {
+                retry_after_secs: *retry_after_secs,
+            }
+            .to_string(),
         }
     }
 }
@@ -746,6 +1101,14 @@ impl From<IamError> for AdminError {
             IamError::InsufficientPermissions => AdminError::Forbidden,
             IamError::InvalidToken => AdminError::Unauthorized,
             IamError::NoS3Credentials => AdminError::NoS3Credentials,
+            IamError::AdoptionPending => AdminError::IamAdoptionPending,
+            IamError::AdoptionInvalid(reason) => AdminError::InvalidIamAdoption(reason),
+            IamError::AdoptionNotPending => AdminError::IamAdoptionNotPending,
+            IamError::AdoptionReportChanged => AdminError::IamAdoptionReportChanged,
+            IamError::AdoptionIncomplete(reason) => AdminError::IamAdoptionIncomplete(reason),
+            IamError::Unavailable(message) => AdminError::Unavailable(message),
+            IamError::Busy { retry_after_secs } => AdminError::IamBusy(retry_after_secs),
+            error @ IamError::NotServing(_) => AdminError::IamNotServing(error.to_string()),
             // What is left is a server-side fault: hashing, token generation,
             // storage, or a record we wrote ourselves and can no longer read.
             other => AdminError::Iam(other),
@@ -758,7 +1121,10 @@ impl IntoResponse for AdminError {
         let (status, code) = self.status_and_code();
         let message = self.message();
 
-        if status.is_server_error() {
+        if let AdminError::IamBusy(_) | AdminError::IamNotServing(_) = self {
+            // A change waiting its turn, or a node catching up, is no fault.
+            tracing::info!("Admin API request refused ({}): {}", code, message);
+        } else if status.is_server_error() {
             error!("Admin API fault ({}): {}", code, message);
         }
 
@@ -767,6 +1133,19 @@ impl IntoResponse for AdminError {
             "code": code,
         }));
 
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+        if let AdminError::IamBusy(retry_after_secs) = self {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(retry_after_secs),
+            );
+        }
+        if let AdminError::IamNotServing(_) = self {
+            response.headers_mut().insert(
+                axum::http::header::RETRY_AFTER,
+                axum::http::HeaderValue::from(1u64),
+            );
+        }
+        response
     }
 }

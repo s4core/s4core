@@ -21,25 +21,28 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use s4_features::iam::IamError;
 use serde_json::json;
-use tracing::warn;
+use tracing::error;
 
 use crate::AppState;
 
 /// JWT authentication middleware for Admin API endpoints.
 ///
-/// Extracts JWT token from Authorization: Bearer header,
-/// validates it, and inserts claims into request extensions.
+/// Extracts the JWT from the `Authorization: Bearer` header, checks it against
+/// its account (signature, expiry, the account exists, is active and still has
+/// the token's credential version) and inserts the [`AdminPrincipal`] — the
+/// account's current name and role — into the request extensions.
 ///
 /// # Usage
 ///
-/// Protected routes will receive JwtClaims as an extractor:
-///
 /// ```ignore
-/// async fn handler(claims: JwtClaims) -> impl IntoResponse {
-///     // claims.role, claims.username, etc. are available
+/// async fn handler(Extension(principal): Extension<AdminPrincipal>) -> impl IntoResponse {
+///     // principal.role is the role the account has now, not the token's
 /// }
 /// ```
+///
+/// [`AdminPrincipal`]: s4_features::iam::AdminPrincipal
 pub async fn admin_auth_middleware(
     State(state): State<AppState>,
     mut request: Request,
@@ -71,17 +74,39 @@ pub async fn admin_auth_middleware(
         }
     };
 
-    // Validate token
-    let claims = match state.auth_service.validate_token(token) {
-        Ok(claims) => claims,
-        Err(e) => {
-            warn!("JWT validation failed: {:?}", e);
+    // Check the token against its account
+    let principal = match state.auth_service.authenticate(token).await {
+        Ok(principal) => principal,
+        Err(IamError::InvalidToken) => {
             return unauthorized("Invalid or expired token");
+        }
+        Err(error @ IamError::NotServing(_)) => {
+            // This node does not check the tokens of IAM users now: another
+            // node, or this one a moment later, does. Root's tokens work here.
+            let body = Json(json!({
+                "error": error.to_string(),
+                "code": "ServiceUnavailable",
+            }));
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                body,
+            )
+                .into_response();
+        }
+        Err(e) => {
+            // The account could not be read: the token may be fine, so this is
+            // a fault of the server, not a reason to send the caller to log in.
+            error!("Admin token check failed: {e}");
+            let body = Json(json!({
+                "error": "The account of this token could not be read",
+                "code": "InternalError",
+            }));
+            return (StatusCode::INTERNAL_SERVER_ERROR, body).into_response();
         }
     };
 
-    // Insert claims into request extensions for handlers to use
-    request.extensions_mut().insert(claims);
+    request.extensions_mut().insert(principal);
 
     next.run(request).await
 }

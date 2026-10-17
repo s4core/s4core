@@ -2,6 +2,21 @@
 
 S4 supports S3-compatible Object Lock for WORM (Write Once Read Many) compliance. Object Lock prevents objects from being deleted or overwritten for a specified retention period.
 
+## Cluster Mode
+
+Object Lock works on a single node only. In cluster mode deletes are not checked against retention
+or legal hold, so every request that would turn Object Lock on answers `501 NotImplemented`:
+`PutObjectLockConfiguration`, `CreateBucket` with `x-amz-bucket-object-lock-enabled: true` (no
+bucket is created), `PutObject`, `CopyObject` and `CreateMultipartUpload` with any
+`x-amz-object-lock-*` header, and the retention and legal hold calls on objects.
+`GetObjectLockConfiguration` answers `ObjectLockConfigurationNotFoundError`.
+
+**If you turned Object Lock on in cluster mode with an earlier release:** it answered `200`, but
+objects in that bucket were never protected, and a delete removed them. Such buckets are named in
+each node's log at start, under `unenforced_bucket_configs` in `/api/admin/cluster/health` and in
+`s4_bucket_unenforced_configs{kind="object_lock"}`. Check that the objects you meant to protect are
+still there, and keep data that must stay under retention on a single-node S4.
+
 ## Prerequisites
 
 Object Lock requires **versioning to be enabled** on the bucket. You must enable versioning before configuring Object Lock.

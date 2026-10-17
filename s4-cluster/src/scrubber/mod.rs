@@ -46,7 +46,7 @@ use crate::error::ClusterError;
 use crate::gossip::GossipHandle;
 use crate::identity::NodeId;
 use crate::identity::NodeStatus;
-use crate::placement::PlacementStrategy;
+use crate::placement::PoolLayout;
 use crate::rpc::NodeClient;
 use metrics::ScrubberMetrics;
 use s4_core::storage::{IndexDb, KeyspaceId, VolumeReader};
@@ -101,8 +101,9 @@ pub struct HealingContext {
     pub rpc_client: Arc<NodeClient>,
     /// Gossip handle for discovering live nodes.
     pub gossip: Arc<GossipHandle>,
-    /// Placement strategy for finding replica set for a key.
-    pub placement: Arc<PlacementStrategy>,
+    /// The pool's placement, for finding the replica set of a key by its
+    /// replication class.
+    pub placement: Arc<PoolLayout>,
     /// Local storage engine, where a healthy copy fetched from a replica is
     /// written back. Without it a scrubber can only report damage.
     pub storage: Arc<dyn StorageEngine>,
@@ -450,7 +451,7 @@ impl DataScrubber {
         let (bucket, object_key) = object_reference(key, record.version_id.as_deref())?;
 
         // Find replicas for this key
-        let replicas = ctx.placement.get_replicas(key);
+        let replicas = ctx.placement.replicas_of_full_key(key);
 
         for replica_id in &replicas {
             if *replica_id == ctx.node_id {

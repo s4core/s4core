@@ -32,6 +32,8 @@
 //! | `iam`      | `{type}_{id}`                     | `bincode(IndexRecord)` |
 //! | `dedup`    | content hash (32 bytes)           | reserved for Phase 4 |
 //! | `journal`  | sequence number                   | reserved for Phase 5 |
+//! | `version_digests` | ring position, `{bucket}/{key}` | [`VersionDigest`](crate::storage::VersionDigest), cluster mode |
+//! | `cluster_meta` | name                         | digest layout, tombstone horizon, configurations adopted, bucket metadata placement |
 //!
 //! ## Backward Compatibility
 //!
@@ -64,19 +66,180 @@
 use crate::error::StorageError;
 use crate::storage::dedup::DedupEntry;
 use crate::storage::engine::KeyspaceSnapshot;
+use crate::storage::version_digest::{
+    digest_change, digest_key_of, DigestChange, DigestSource, TombstoneHorizon, VersionDigestEntry,
+    VERSION_DIGESTS_FORMAT,
+};
 use crate::storage::VersionList;
-use crate::types::{BlobId, IndexRecord};
-use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
-use std::collections::HashSet;
-use std::path::Path;
+use crate::types::{BlobId, BlobLocation, BlobRefEntry, IndexRecord};
+use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode, Readable};
+use std::collections::{BTreeMap, HashSet};
+use std::io::Write;
+use std::ops::Bound;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use tokio::task;
+
+/// Name of the keyspace holding the version digests of the replicated keys.
+const VERSION_DIGESTS_KEYSPACE: &str = "version_digests";
+/// Name of the keyspace holding what the cluster relies on about this node's
+/// history: the digest layout and the tombstone horizon.
+pub(crate) const CLUSTER_META_KEYSPACE: &str = "cluster_meta";
+/// Key of the digest layout version in [`CLUSTER_META_KEYSPACE`]. Written last
+/// by a rebuild: its absence means the digests were not built, or not kept.
+const DIGESTS_FORMAT_KEY: &[u8] = b"version_digests_format";
+/// Key of the tombstone horizon in [`CLUSTER_META_KEYSPACE`].
+const TOMBSTONE_HORIZON_KEY: &[u8] = b"tombstone_horizon";
+/// Monotone lower bound of the settled tombstone history, kept across opens.
+const TOMBSTONE_HORIZON_FLOOR_KEY: &[u8] = b"tombstone_horizon_floor";
+
+/// The `cluster_meta` key of the tombstone purge horizon: the newest HLC of a
+/// tombstone GC removed. Kept when the index is opened without digests: the
+/// next cluster start settles the tombstone horizon past it anyway.
+const TOMBSTONE_PURGE_HORIZON_KEY: &[u8] = b"tombstone_purge_horizon";
+/// Key in [`CLUSTER_META_KEYSPACE`] present when the index was created by an
+/// open with digests and every open since kept them: no delete in its history
+/// went without a tombstone.
+const BORN_WITH_DIGESTS_KEY: &[u8] = b"index_born_with_digests";
+
+/// The seal of the version digests of the index at `db_path`: a file beside
+/// it, outside the database, so that writing it moves no sequence number.
+fn digests_seal_path(db_path: &Path) -> PathBuf {
+    let mut name = db_path.file_name().map(std::ffi::OsString::from).unwrap_or_default();
+    name.push(".digests-sealed");
+    db_path.with_file_name(name)
+}
+
+/// The sequence number a seal records, `None` without a readable one.
+fn read_digests_seal(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+/// Key in [`CLUSTER_META_KEYSPACE`] present once a pass of adoption brought
+/// every bucket configuration this node stored before protocol 6 to the
+/// replicas of its key. An open without digests drops it: in single mode a
+/// configuration is written without an HLC again.
+const BUCKET_CONFIGS_ADOPTED_KEY: &[u8] = b"bucket_configs_adopted";
+/// Key in [`CLUSTER_META_KEYSPACE`] present once this node saw every node of
+/// its pool adopt its bucket configurations, and reads them through the
+/// quorums from then on. This cutover survives opens without digests.
+const BUCKET_CONFIG_QUORUM_READS_KEY: &[u8] = b"bucket_config_quorum_reads";
+/// Monotone evidence that local configurations may already have been
+/// replicated and deleted. Earlier releases do not erase this marker.
+const BUCKET_CONFIG_HISTORY_CHECK_KEY: &[u8] = b"bucket_config_history_check";
+/// An explicit single-mode open after the directory's most recent cluster open.
+pub(crate) const LAST_OPEN_SINGLE_KEY: &[u8] = b"last_open_single";
+/// Completion of single-node object migration, invalidated with digest history.
+const LEGACY_MIGRATION_COMPLETE_KEY: &[u8] = b"legacy_migration_complete";
+pub(crate) const LEGACY_MIGRATION_QUEUE_PREFIX: &[u8] = b"legacy_migration_queue/";
+/// Key in [`CLUSTER_META_KEYSPACE`] present once this node saw every node of
+/// its pool hold no IAM of its own that the pool has not taken over: IAM is
+/// changed through the pool from then on, across restarts. An open without
+/// digests drops it: a single node keeps IAM of its own again.
+const IAM_ADOPTED_KEY: &[u8] = b"iam_adopted";
+/// Key in [`CLUSTER_META_KEYSPACE`] of where this node is in the move of the
+/// pool's bucket metadata to its replication factor: an encoded record the
+/// cluster crate reads and writes, opaque here. Kept by an open without
+/// digests: the stage of a node only grows, and a node that forgot it would
+/// come back two stages behind its pool.
+const BUCKET_METADATA_PLACEMENT_KEY: &[u8] = b"bucket_metadata_placement";
+/// Durable pool membership, retained even by an open without version digests.
+const POOL_GENERATION_KEY: &[u8] = b"pool_generation";
+/// Prefix in [`CLUSTER_META_KEYSPACE`] of this node's progress in moving the
+/// pool's keys to a grown generation: one opaque record per name, which the
+/// cluster crate encodes. Kept by an open without digests, like the
+/// generation it belongs to.
+const REBALANCE_PREFIX: &[u8] = b"rebalance/";
+/// Digests written per batch while rebuilding.
+const REBUILD_BATCH: usize = 10_000;
+
+fn db_error(error: impl std::fmt::Display) -> StorageError {
+    StorageError::Database(error.to_string())
+}
+
+/// How an index database is opened.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IndexOptions {
+    /// Keep the version digest of every replicated key
+    /// ([`version_digest`](crate::storage::version_digest)), in the same batch
+    /// as the record: cluster mode.
+    ///
+    /// An index opened without them forgets the digests and the tombstone
+    /// horizon it had: its writes do not keep the first, and its deletes leave
+    /// no tombstones, which the second promises.
+    pub version_digests: bool,
+}
+
+/// What opening the index found about the version digests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionDigestsOpening {
+    /// The stored digests are of the current layout and were kept by every
+    /// write since they were built.
+    Current,
+    /// The digests were rebuilt from the records.
+    Rebuilt {
+        /// Digests written: one per replicated key.
+        records: u64,
+        /// How long the rebuild took.
+        elapsed: Duration,
+        /// The layout found, `None` when the digests had not been built or
+        /// were not kept by every write.
+        previous_format: Option<u32>,
+    },
+}
+
+/// The stored version digests compared with the ones the records give.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VersionDigestCheck {
+    /// Digests the records give.
+    pub expected: u64,
+    /// Digests stored.
+    pub stored: u64,
+    /// Keys whose stored digest is missing, different, or describes no record.
+    pub mismatched_keys: Vec<String>,
+}
+
+impl VersionDigestCheck {
+    /// Whether the stored digests are exactly the ones the records give.
+    pub fn is_consistent(&self) -> bool {
+        self.mismatched_keys.is_empty() && self.expected == self.stored
+    }
+}
+
+/// The keyspaces that keep the version digests, when the index keeps them.
+#[derive(Clone)]
+struct DigestKeyspaces {
+    digests: Keyspace,
+    meta: Keyspace,
+}
+
+/// The digest source of a keyspace, if writes to it change digests.
+fn digest_source(id: KeyspaceId) -> Option<DigestSource> {
+    match id {
+        KeyspaceId::Objects => Some(DigestSource::Objects),
+        KeyspaceId::Buckets => Some(DigestSource::Buckets),
+        KeyspaceId::Iam => Some(DigestSource::Iam),
+        _ => None,
+    }
+}
+
+/// Adds a digest change to `batch`.
+fn apply_digest_change(
+    batch: &mut fjall::OwnedWriteBatch,
+    digests: &Keyspace,
+    change: DigestChange,
+) {
+    match change {
+        (key, Some(value)) => batch.insert(digests, key, value),
+        (key, None) => batch.remove(digests, key),
+    }
+}
 
 // ============================================================================
 // Batch Write Types
 // ============================================================================
 
 /// Identifies a target keyspace for batch operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum KeyspaceId {
     /// Main object records (`{bucket}/{key}` and `{bucket}/{key}#{version_id}`).
     Objects,
@@ -131,6 +294,39 @@ pub enum BatchAction {
         /// New byte offset after relocation.
         new_offset: u64,
     },
+    /// Atomically read-modify-write a blob reference: add `committed` and
+    /// `staged` to its counts, never below zero. A blob without an entry gets
+    /// one at `location`; with no `location` that is an error when a count
+    /// grows (the blob was expected to exist), and nothing when it shrinks.
+    /// The read happens inside `batch_write` under `rmw_lock`.
+    AdjustBlobRef {
+        /// The blob's id (32 bytes).
+        blob_id: Vec<u8>,
+        /// Change of the committed count.
+        committed: i64,
+        /// Change of the staged count.
+        staged: i64,
+        /// Where a blob without an entry lies: `(volume_id, offset)`.
+        location: Option<(u32, u64)>,
+    },
+    /// Atomically read-modify-write a blob reference: move it to a new
+    /// location, keeping its counts. No-op if the entry does not exist.
+    RelocateBlobRef {
+        /// The blob's id (32 bytes).
+        blob_id: Vec<u8>,
+        /// New volume file ID.
+        volume_id: u32,
+        /// New byte offset within the volume.
+        offset: u64,
+    },
+}
+
+impl BatchAction {
+    /// Whether the action reads the value it writes, and so must run under
+    /// `rmw_lock`.
+    fn reads_before_write(&self) -> bool {
+        !matches!(self, Self::Put(..) | Self::Delete(..))
+    }
 }
 
 /// A single operation in an atomic batch, targeting a specific keyspace.
@@ -189,6 +385,42 @@ pub struct IndexDb {
     /// Serializes batch_write calls that contain read-modify-write operations,
     /// preventing lost-update races on dedup ref_count.
     rmw_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    /// The version digests and the cluster facts, when the index keeps them
+    /// ([`IndexOptions::version_digests`]).
+    digest_keyspaces: Option<DigestKeyspaces>,
+    /// What opening found about the version digests.
+    digests_opening: Option<VersionDigestsOpening>,
+    /// Where [`seal_version_digests`](Self::seal_version_digests) records the
+    /// sequence number the digests matched the records at.
+    digests_seal: PathBuf,
+}
+
+/// The digest changes of a batch, one per digest key, from the last operation
+/// on the key: changes of one batch commit under one sequence number, so two
+/// for the same key would leave either.
+fn batch_digest_changes(operations: &[BatchOp]) -> Result<Vec<DigestChange>, StorageError> {
+    let mut changes: Vec<DigestChange> = Vec::new();
+    let mut position_of_key = std::collections::HashMap::new();
+    for op in operations {
+        let Some(source) = digest_source(op.keyspace) else {
+            continue;
+        };
+        let change = match &op.action {
+            BatchAction::Put(key, value) => digest_change(source, key, Some(value))?,
+            BatchAction::Delete(key) => digest_change(source, key, None)?,
+            _ => None,
+        };
+        if let Some(change) = change {
+            match position_of_key.get(&change.0) {
+                Some(&position) => changes[position] = change,
+                None => {
+                    position_of_key.insert(change.0.clone(), changes.len());
+                    changes.push(change);
+                }
+            }
+        }
+    }
+    Ok(changes)
 }
 
 // ============================================================================
@@ -235,6 +467,18 @@ impl IndexDb {
         self.objects.is_empty().map_err(|e| StorageError::Database(e.to_string()))
     }
 
+    /// Whether the index holds no record at all: no object, version list,
+    /// bucket marker or IAM record. An index whose objects were all deleted
+    /// still holds its buckets and, with a root configured, its IAM state.
+    pub fn has_no_records(&self) -> Result<bool, StorageError> {
+        for keyspace in [&self.objects, &self.versions, &self.buckets, &self.iam] {
+            if !keyspace.is_empty().map_err(|e| StorageError::Database(e.to_string()))? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Flushes the fjall write-ahead log to disk and triggers memtable rotation.
     ///
     /// Call this after bulk deletes (e.g. compactor purging sessions, parts,
@@ -248,7 +492,8 @@ impl IndexDb {
     }
 
     /// Counts objects with `file_id == u32::MAX` (inline objects) by iterating
-    /// the objects keyspace without collecting into a Vec.
+    /// the objects keyspace without collecting into a Vec. Delete markers and
+    /// tombstones share that file id and hold no data, so they are not counted.
     ///
     /// Uses O(1) memory vs O(n) for `list_objects("", usize::MAX)` which
     /// allocates a Vec of all records. CPU cost (deserialization) is the same,
@@ -263,7 +508,7 @@ impl IndexDb {
                     guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
                 let record: IndexRecord = bincode::deserialize(&value_bytes)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                if record.file_id == u32::MAX {
+                if record.file_id == u32::MAX && !record.is_delete_marker {
                     count += 1;
                 }
             }
@@ -291,16 +536,28 @@ impl IndexDb {
 }
 
 impl IndexDb {
-    /// Creates or opens an index database with all keyspaces.
-    ///
-    /// On first open this creates six keyspaces. On subsequent opens the
-    /// existing keyspaces are reused. A legacy `"index"` keyspace from Phase 2,
-    /// if present, is **not** deleted — it simply becomes unused.
+    /// Creates or opens an index database with all keyspaces, without version
+    /// digests: [`open`](Self::open) with the default options.
     ///
     /// # Arguments
     ///
     /// * `db_path` - Path to the fjall database directory
     pub fn new(db_path: &Path) -> Result<Self, StorageError> {
+        Self::open(db_path, IndexOptions::default())
+    }
+
+    /// Creates or opens an index database with all keyspaces.
+    ///
+    /// On first open this creates the keyspaces. On subsequent opens the
+    /// existing keyspaces are reused. A legacy `"index"` keyspace from Phase 2,
+    /// if present, is **not** deleted — it simply becomes unused.
+    ///
+    /// With [`IndexOptions::version_digests`] the digests are rebuilt from the
+    /// records before this returns, when they are of another layout or were
+    /// not kept by every write ([`version_digests_opening`](Self::version_digests_opening)
+    /// says which). Without it, digests and the tombstone horizon left by an
+    /// earlier open are dropped.
+    pub fn open(db_path: &Path, options: IndexOptions) -> Result<Self, StorageError> {
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).map_err(StorageError::Io)?;
         }
@@ -308,6 +565,9 @@ impl IndexDb {
         let db = Database::builder(db_path)
             .open()
             .map_err(|e| StorageError::Database(e.to_string()))?;
+        // Neither the keyspaces nor the legacy one they migrate from: this
+        // open creates the index
+        let created = !db.keyspace_exists("objects") && !db.keyspace_exists("index");
 
         let open_ks = |name: &str| -> Result<Keyspace, StorageError> {
             db.keyspace(name, KeyspaceCreateOptions::default)
@@ -334,6 +594,55 @@ impl IndexDb {
             }
         }
 
+        let digests_seal = digests_seal_path(db_path);
+        let (digest_keyspaces, digests_opening) = if options.version_digests {
+            // A marker beside a keyspace that is gone describes nothing.
+            let digests_existed = db.keyspace_exists(VERSION_DIGESTS_KEYSPACE);
+            // Only an unchanged, readable seal attests that every write kept
+            // digests and tombstones. Without it, a crash and writes by a
+            // release that keeps neither cannot be distinguished.
+            let seal_matches = read_digests_seal(&digests_seal) == Some(db.seqno());
+            let keyspaces = DigestKeyspaces {
+                digests: open_ks(VERSION_DIGESTS_KEYSPACE)?,
+                meta: open_ks(CLUSTER_META_KEYSPACE)?,
+            };
+            if created {
+                keyspaces.meta.insert(BORN_WITH_DIGESTS_KEY, [1]).map_err(db_error)?;
+                db.persist(PersistMode::SyncAll).map_err(db_error)?;
+            } else if !seal_matches {
+                Self::forget_digest_history(&db, &keyspaces.meta, digests_existed)?;
+            } else if !keyspaces
+                .meta
+                .contains_key(BUCKET_CONFIG_HISTORY_CHECK_KEY)
+                .map_err(db_error)?
+                && (keyspaces.meta.contains_key(BUCKET_CONFIGS_ADOPTED_KEY).map_err(db_error)?
+                    || keyspaces
+                        .meta
+                        .contains_key(BUCKET_CONFIG_QUORUM_READS_KEY)
+                        .map_err(db_error)?)
+            {
+                // Preserve evidence written by earlier digest-aware builds
+                // before one of those builds can erase its older markers.
+                keyspaces.meta.insert(BUCKET_CONFIG_HISTORY_CHECK_KEY, [1]).map_err(db_error)?;
+                db.persist(PersistMode::SyncAll).map_err(db_error)?;
+            }
+            let opening = Self::settle_digests(
+                &db,
+                &objects,
+                &buckets,
+                &iam,
+                &keyspaces,
+                digests_existed && seal_matches,
+            )?;
+            (Some(keyspaces), Some(opening))
+        } else {
+            Self::forget_digests(&db)?;
+            (None, None)
+        };
+
+        // Keep single-origin evidence until migration completion: a failed
+        // bootstrap may already have created the persistent node identity.
+
         Ok(Self {
             db,
             objects,
@@ -346,7 +655,204 @@ impl IndexDb {
             multipart_parts,
             blob_refs,
             rmw_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            digest_keyspaces,
+            digests_opening,
+            digests_seal,
         })
+    }
+
+    /// Records that the version digests match the records as the index stands
+    /// now, its writes on disk: the last thing a node does before it stops.
+    /// The next open keeps the digests only while nothing has written to the
+    /// index since — a crash or a release without digests running on this
+    /// data both rebuild them there.
+    ///
+    /// # Errors
+    ///
+    /// The index or its seal could not be written to disk. The next open
+    /// rebuilds the digests and forgets its history guarantees unless an
+    /// earlier readable seal still matches the index.
+    pub fn seal_version_digests(&self) -> Result<(), StorageError> {
+        if self.digest_keyspaces.is_none() {
+            return Ok(());
+        }
+        // Capture before syncing: a concurrent write may make the seal old,
+        // but it must never attest to a sequence not yet persisted. The
+        // server calls this only after its writers have stopped.
+        let seqno = self.db.seqno();
+        self.db.persist(PersistMode::SyncAll).map_err(db_error)?;
+        let tmp = self.digests_seal.with_extension("tmp");
+        let mut file = std::fs::File::create(&tmp).map_err(StorageError::Io)?;
+        write!(file, "{seqno}").map_err(StorageError::Io)?;
+        file.sync_all().map_err(StorageError::Io)?;
+        drop(file);
+        std::fs::rename(&tmp, &self.digests_seal).map_err(StorageError::Io)?;
+        Ok(())
+    }
+
+    /// Keeps the stored digests when they are of the current layout and were
+    /// kept by every write, rebuilds them otherwise.
+    fn settle_digests(
+        db: &Database,
+        objects: &Keyspace,
+        buckets: &Keyspace,
+        iam: &Keyspace,
+        keyspaces: &DigestKeyspaces,
+        digests_existed: bool,
+    ) -> Result<VersionDigestsOpening, StorageError> {
+        let stored_format = keyspaces
+            .meta
+            .get(DIGESTS_FORMAT_KEY)
+            .map_err(db_error)?
+            .map(|value| {
+                <[u8; 4]>::try_from(&value[..]).map(u32::from_be_bytes).map_err(|_| {
+                    StorageError::Serialization("a digest format of the wrong size".into())
+                })
+            })
+            .transpose()?;
+        let previous_format = stored_format.filter(|_| digests_existed);
+        if previous_format == Some(VERSION_DIGESTS_FORMAT) {
+            return Ok(VersionDigestsOpening::Current);
+        }
+        let started = Instant::now();
+        let records = Self::rebuild_digests(db, objects, buckets, iam, keyspaces)?;
+        Ok(VersionDigestsOpening::Rebuilt {
+            records,
+            elapsed: started.elapsed(),
+            previous_format,
+        })
+    }
+
+    /// Writes the digest of every record anew.
+    ///
+    /// The layout marker goes first and comes back last: a rebuild cut short
+    /// leaves none, and the next open rebuilds again. Records written while
+    /// it runs could be overwritten by their older digest, so it runs only
+    /// where nothing else writes: while the index opens, and inside a restore.
+    fn rebuild_digests(
+        db: &Database,
+        objects: &Keyspace,
+        buckets: &Keyspace,
+        iam: &Keyspace,
+        keyspaces: &DigestKeyspaces,
+    ) -> Result<u64, StorageError> {
+        keyspaces.meta.remove(DIGESTS_FORMAT_KEY).map_err(db_error)?;
+        db.persist(PersistMode::SyncAll).map_err(db_error)?;
+        keyspaces.digests.clear().map_err(db_error)?;
+
+        let mut records = 0u64;
+        let mut batch = db.batch();
+        for (source, keyspace) in [
+            (DigestSource::Objects, objects),
+            (DigestSource::Buckets, buckets),
+            (DigestSource::Iam, iam),
+        ] {
+            for guard in keyspace.iter() {
+                let (key, value) = guard.into_inner().map_err(db_error)?;
+                if let Some((digest_key, Some(digest))) = digest_change(source, &key, Some(&value))?
+                {
+                    batch.insert(&keyspaces.digests, digest_key, digest);
+                    records += 1;
+                    if batch.len() >= REBUILD_BATCH {
+                        batch.commit().map_err(db_error)?;
+                        batch = db.batch();
+                    }
+                }
+            }
+        }
+        batch.commit().map_err(db_error)?;
+        db.persist(PersistMode::SyncAll).map_err(db_error)?;
+
+        keyspaces
+            .meta
+            .insert(DIGESTS_FORMAT_KEY, VERSION_DIGESTS_FORMAT.to_be_bytes())
+            .map_err(db_error)?;
+        db.persist(PersistMode::SyncAll).map_err(db_error)?;
+        Ok(records)
+    }
+
+    /// Forgets guarantees that depend on every previous write keeping digests
+    /// and tombstones. Persisted as one batch before rebuilding digests, so an
+    /// interrupted rebuild cannot leave trusted history behind. Placement,
+    /// rebalance progress, the monotone purge horizon and the pool's switch
+    /// to quorum configuration reads are independent and remain recorded.
+    fn forget_digest_history(
+        db: &Database,
+        meta: &Keyspace,
+        had_digests: bool,
+    ) -> Result<(), StorageError> {
+        let mut batch = db.batch();
+        // Keep the old boundary as a floor: clock corrections cannot make
+        // the next settled history stronger than the previous one.
+        if let Some(stored) = meta.get(TOMBSTONE_HORIZON_KEY).map_err(db_error)? {
+            let mut floor = TombstoneHorizon::decode(&stored)?;
+            if let Some(stored) = meta.get(TOMBSTONE_HORIZON_FLOOR_KEY).map_err(db_error)? {
+                floor = floor.max(TombstoneHorizon::decode(&stored)?);
+            }
+            batch.insert(meta, TOMBSTONE_HORIZON_FLOOR_KEY, floor.encode());
+        }
+        // A configuration-digest-aware start may have completed adoption even if the
+        // pool's final cutover marker was never recorded (or an older build
+        // erased it). Only the very first legacy adoption can trust a lone
+        // local copy without checking its owners' history.
+        let predates_config_digests = meta
+            .get(DIGESTS_FORMAT_KEY)
+            .map_err(db_error)?
+            .and_then(|value| <[u8; 4]>::try_from(value.as_ref()).ok())
+            .map(u32::from_be_bytes)
+            .is_some_and(|format| (1..=3).contains(&format));
+        if (had_digests && !predates_config_digests)
+            || meta.contains_key(BUCKET_CONFIGS_ADOPTED_KEY).map_err(db_error)?
+            || meta.contains_key(BUCKET_CONFIG_QUORUM_READS_KEY).map_err(db_error)?
+        {
+            batch.insert(meta, BUCKET_CONFIG_HISTORY_CHECK_KEY, [1]);
+        }
+        for key in [
+            TOMBSTONE_HORIZON_KEY,
+            BORN_WITH_DIGESTS_KEY,
+            BUCKET_CONFIGS_ADOPTED_KEY,
+            IAM_ADOPTED_KEY,
+            LEGACY_MIGRATION_COMPLETE_KEY,
+        ] {
+            if meta.contains_key(key).map_err(db_error)? {
+                batch.remove(meta, key);
+            }
+        }
+        if !batch.is_empty() {
+            batch.commit().map_err(db_error)?;
+            db.persist(PersistMode::SyncAll).map_err(db_error)?;
+        }
+        Ok(())
+    }
+
+    /// Drops the digests and the tombstone horizon an index opened with
+    /// digests left: writes from now on do not keep the first, and deletes
+    /// leave no tombstones, which the second promises.
+    fn forget_digests(db: &Database) -> Result<(), StorageError> {
+        let mut changed = false;
+        if db.keyspace_exists(CLUSTER_META_KEYSPACE) {
+            let meta = db
+                .keyspace(CLUSTER_META_KEYSPACE, KeyspaceCreateOptions::default)
+                .map_err(db_error)?;
+            Self::forget_digest_history(db, &meta, db.keyspace_exists(VERSION_DIGESTS_KEYSPACE))?;
+            if meta.contains_key(DIGESTS_FORMAT_KEY).map_err(db_error)? {
+                meta.remove(DIGESTS_FORMAT_KEY).map_err(db_error)?;
+                changed = true;
+            }
+        }
+        if db.keyspace_exists(VERSION_DIGESTS_KEYSPACE) {
+            let digests = db
+                .keyspace(VERSION_DIGESTS_KEYSPACE, KeyspaceCreateOptions::default)
+                .map_err(db_error)?;
+            if !digests.is_empty().map_err(db_error)? {
+                digests.clear().map_err(db_error)?;
+                changed = true;
+            }
+        }
+        if changed {
+            db.persist(PersistMode::SyncAll).map_err(db_error)?;
+        }
+        Ok(())
     }
 
     /// Migrates all data from the legacy single "index" keyspace into the new
@@ -424,8 +930,14 @@ impl IndexDb {
         }
     }
 
+    /// The digest source and keyspace a write to `id` changes, when the index
+    /// keeps digests and the keyspace has them.
+    fn digests_for(&self, id: KeyspaceId) -> Option<(DigestSource, Keyspace)> {
+        let keyspaces = self.digest_keyspaces.as_ref()?;
+        digest_source(id).map(|source| (source, keyspaces.digests.clone()))
+    }
+
     /// Returns the keyspace handle for the given [`KeyspaceId`].
-    #[allow(dead_code)]
     fn keyspace_for(&self, id: KeyspaceId) -> &Keyspace {
         match id {
             KeyspaceId::Objects => &self.objects,
@@ -451,16 +963,28 @@ impl IndexDb {
     /// * `key` - Object key (may contain legacy prefixes like `__s4_versions_`)
     /// * `record` - Index record to store
     pub async fn put(&self, key: &str, record: &IndexRecord) -> Result<(), StorageError> {
-        let (ks, stripped) = self.route_key(key);
+        let (ks_id, stripped) = self.route_key_id(key);
         let db = self.db.clone();
-        let ks = ks.clone();
+        let ks = self.keyspace_for(ks_id).clone();
+        let digests = self.digests_for(ks_id);
         let stripped = stripped.to_string();
         let record_bytes =
             bincode::serialize(record).map_err(|e| StorageError::Serialization(e.to_string()))?;
 
         task::spawn_blocking(move || {
-            ks.insert(&stripped, &record_bytes[..])
-                .map_err(|e| StorageError::Database(e.to_string()))?;
+            match digests {
+                Some((source, digests)) => {
+                    let mut batch = db.batch();
+                    if let Some(change) =
+                        digest_change(source, stripped.as_bytes(), Some(&record_bytes))?
+                    {
+                        apply_digest_change(&mut batch, &digests, change);
+                    }
+                    batch.insert(&ks, stripped.as_bytes(), &record_bytes[..]);
+                    batch.commit().map_err(db_error)?;
+                }
+                None => ks.insert(&stripped, &record_bytes[..]).map_err(db_error)?,
+            }
             db.persist(PersistMode::SyncAll)
                 .map_err(|e| StorageError::Database(e.to_string()))?;
             Ok::<(), StorageError>(())
@@ -490,13 +1014,24 @@ impl IndexDb {
 
     /// Deletes an index record, routing to the correct keyspace by key prefix.
     pub async fn delete(&self, key: &str) -> Result<(), StorageError> {
-        let (ks, stripped) = self.route_key(key);
+        let (ks_id, stripped) = self.route_key_id(key);
         let db = self.db.clone();
-        let ks = ks.clone();
+        let ks = self.keyspace_for(ks_id).clone();
+        let digests = self.digests_for(ks_id);
         let stripped = stripped.to_string();
 
         task::spawn_blocking(move || {
-            ks.remove(&stripped).map_err(|e| StorageError::Database(e.to_string()))?;
+            match digests {
+                Some((source, digests)) => {
+                    let mut batch = db.batch();
+                    if let Some(change) = digest_change(source, stripped.as_bytes(), None)? {
+                        apply_digest_change(&mut batch, &digests, change);
+                    }
+                    batch.remove(&ks, stripped.as_bytes());
+                    batch.commit().map_err(db_error)?;
+                }
+                None => ks.remove(&stripped).map_err(db_error)?,
+            }
             db.persist(PersistMode::SyncAll)
                 .map_err(|e| StorageError::Database(e.to_string()))?;
             Ok::<(), StorageError>(())
@@ -520,11 +1055,36 @@ impl IndexDb {
     ///
     /// If `start_after` is `Some`, only keys lexicographically greater than
     /// `start_after` are returned. The `start_after` key itself is excluded.
+    /// Every record is listed, tombstones included.
     pub async fn list_after(
         &self,
         prefix: &str,
         start_after: Option<&str>,
         max_keys: usize,
+    ) -> Result<Vec<(String, IndexRecord)>, StorageError> {
+        self.scan_after(prefix, start_after, max_keys, false).await
+    }
+
+    /// Lists entries like [`list_after`](Self::list_after), leaving out
+    /// tombstones ([`IndexRecord::is_tombstone`]).
+    ///
+    /// They are left out while scanning, so `max_keys` counts the entries
+    /// returned: a page cut short by tombstones would read as the last one.
+    pub async fn list_live_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<Vec<(String, IndexRecord)>, StorageError> {
+        self.scan_after(prefix, start_after, max_keys, true).await
+    }
+
+    async fn scan_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+        skip_tombstones: bool,
     ) -> Result<Vec<(String, IndexRecord)>, StorageError> {
         let (ks, stripped_prefix) = self.route_key(prefix);
 
@@ -544,15 +1104,27 @@ impl IndexDb {
         task::spawn_blocking(move || {
             let mut results = Vec::new();
 
-            let iter: Box<dyn Iterator<Item = fjall::Guard>> = if stripped_prefix.is_empty() {
-                Box::new(ks.iter())
-            } else {
-                Box::new(ks.prefix(&stripped_prefix))
+            // A scan that resumes inside the prefix starts right after
+            // `start_after` rather than skipping every key before it: a
+            // listing that pages through a long run of tombstones would
+            // otherwise read the whole run again on every page.
+            let iter: Box<dyn Iterator<Item = fjall::Guard>> = match &start_after_owned {
+                Some(sa) if sa.as_str() >= stripped_prefix.as_str() => Box::new(ks.range((
+                    std::ops::Bound::Excluded(sa.as_bytes().to_vec()),
+                    std::ops::Bound::Unbounded,
+                ))),
+                _ if stripped_prefix.is_empty() => Box::new(ks.iter()),
+                _ => Box::new(ks.prefix(&stripped_prefix)),
             };
 
             for guard in iter {
                 let (key_bytes, value_bytes) =
                     guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
+
+                // A range scan runs past the prefix; the keys under it end here
+                if !key_bytes.starts_with(stripped_prefix.as_bytes()) {
+                    break;
+                }
 
                 let key_str = std::str::from_utf8(&key_bytes)
                     .map_err(|e| StorageError::Database(e.to_string()))?;
@@ -570,6 +1142,9 @@ impl IndexDb {
 
                 let record: IndexRecord = bincode::deserialize(&value_bytes)
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                if skip_tombstones && record.is_tombstone() {
+                    continue;
+                }
 
                 results.push((full_key, record));
 
@@ -604,9 +1179,57 @@ impl IndexDb {
     /// The batch is committed with `PersistMode::SyncAll` to guarantee that all
     /// data is durable on disk before this method returns.
     pub async fn batch_write(&self, operations: Vec<BatchOp>) -> Result<(), StorageError> {
+        self.commit(operations, None).await
+    }
+
+    /// Commits `operations` — the removal of tombstones tombstone GC found
+    /// due — and, in the same atomic batch, raises the tombstone purge horizon
+    /// ([`tombstone_purge_horizon`](Self::tombstone_purge_horizon)) to
+    /// `purged_up_to`, the newest HLC among them. A crash can never leave a
+    /// tombstone removed without the horizon that tells peers so.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidOperation`] on an index that keeps no version
+    /// digests: it keeps no tombstones of a replicated pool either.
+    pub async fn purge_tombstones(
+        &self,
+        operations: Vec<BatchOp>,
+        purged_up_to: TombstoneHorizon,
+    ) -> Result<(), StorageError> {
+        self.commit(operations, Some(purged_up_to)).await
+    }
+
+    /// The tombstone purge horizon: the newest HLC of a tombstone tombstone
+    /// GC removed from this index, `None` before the first. A key this node
+    /// holds nothing for may have had a delete up to it whose tombstone is
+    /// gone, so its absence proves nothing about a version older than it.
+    pub async fn tombstone_purge_horizon(&self) -> Result<Option<TombstoneHorizon>, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        task::spawn_blocking(move || {
+            keyspaces
+                .meta
+                .get(TOMBSTONE_PURGE_HORIZON_KEY)
+                .map_err(db_error)?
+                .map(|value| TombstoneHorizon::decode(&value))
+                .transpose()
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    async fn commit(
+        &self,
+        operations: Vec<BatchOp>,
+        purge_horizon: Option<TombstoneHorizon>,
+    ) -> Result<(), StorageError> {
         if operations.is_empty() {
             return Ok(());
         }
+        let purge_meta = match purge_horizon {
+            Some(horizon) => Some((self.digest_keyspaces()?.meta, horizon)),
+            None => None,
+        };
 
         let db = self.db.clone();
         let objects = self.objects.clone();
@@ -619,18 +1242,22 @@ impl IndexDb {
         let multipart_parts = self.multipart_parts.clone();
         let blob_refs = self.blob_refs.clone();
         let rmw_lock = self.rmw_lock.clone();
+        let digests = self.digest_keyspaces.as_ref().map(|keyspaces| keyspaces.digests.clone());
 
         task::spawn_blocking(move || {
-            let has_rmw = operations.iter().any(|op| {
-                matches!(
-                    op.action,
-                    BatchAction::IncrementDedupRef { .. }
-                        | BatchAction::DecrementDedupRef { .. }
-                        | BatchAction::UpdateDedupLocation { .. }
-                )
-            });
+            // Raising the purge horizon reads the stored one first.
+            let has_rmw =
+                purge_meta.is_some() || operations.iter().any(|op| op.action.reads_before_write());
 
-            let _rmw_guard = if has_rmw {
+            // The digest changes depend on the operations alone: worked out
+            // before the lock, they keep its critical section as short as it
+            // was without digests.
+            let digest_changes = match &digests {
+                Some(digests) => Some((digests, batch_digest_changes(&operations)?)),
+                None => None,
+            };
+
+            let rmw_guard = if has_rmw {
                 Some(rmw_lock.lock().unwrap_or_else(|e| e.into_inner()))
             } else {
                 None
@@ -652,24 +1279,32 @@ impl IndexDb {
                 }
             };
 
+            // The reference counts this batch changes, as they stand after
+            // each of its actions: an action reads what the actions before it
+            // in the same batch left, not the value from before the batch,
+            // so two changes of one count both count. Written once at the end.
+            let mut counts = PendingCounts::default();
+
             for op in &operations {
-                let ks = ks_for(op.keyspace);
                 match &op.action {
-                    BatchAction::Put(key, value) => {
-                        batch.insert(ks, &key[..], &value[..]);
-                    }
-                    BatchAction::Delete(key) => {
-                        batch.remove(ks, &key[..]);
-                    }
+                    BatchAction::Put(key, value) => match op.keyspace {
+                        KeyspaceId::Dedup | KeyspaceId::BlobRefs => {
+                            counts.set(op.keyspace, key, Some(value.clone()));
+                        }
+                        _ => batch.insert(ks_for(op.keyspace), &key[..], &value[..]),
+                    },
+                    BatchAction::Delete(key) => match op.keyspace {
+                        KeyspaceId::Dedup | KeyspaceId::BlobRefs => {
+                            counts.set(op.keyspace, key, None);
+                        }
+                        _ => batch.remove(ks_for(op.keyspace), &key[..]),
+                    },
                     BatchAction::IncrementDedupRef {
                         key,
                         volume_id,
                         offset,
                     } => {
-                        let current = dedup
-                            .get(&key[..])
-                            .map_err(|e| StorageError::Database(e.to_string()))?;
-                        let new_entry = match current {
+                        let new_entry = match counts.get(KeyspaceId::Dedup, &dedup, key)? {
                             Some(bytes) => {
                                 let mut entry: DedupEntry = bincode::deserialize(&bytes)
                                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
@@ -697,22 +1332,19 @@ impl IndexDb {
                         };
                         let value = bincode::serialize(&new_entry)
                             .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                        batch.insert(&dedup, &key[..], &value[..]);
+                        counts.set(KeyspaceId::Dedup, key, Some(value));
                     }
                     BatchAction::DecrementDedupRef { key } => {
-                        if let Some(bytes) = dedup
-                            .get(&key[..])
-                            .map_err(|e| StorageError::Database(e.to_string()))?
-                        {
+                        if let Some(bytes) = counts.get(KeyspaceId::Dedup, &dedup, key)? {
                             let mut entry: DedupEntry = bincode::deserialize(&bytes)
                                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
                             if entry.ref_count <= 1 {
-                                batch.remove(&dedup, &key[..]);
+                                counts.set(KeyspaceId::Dedup, key, None);
                             } else {
                                 entry.ref_count -= 1;
                                 let value = bincode::serialize(&entry)
                                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                                batch.insert(&dedup, &key[..], &value[..]);
+                                counts.set(KeyspaceId::Dedup, key, Some(value));
                             }
                         }
                     }
@@ -721,23 +1353,100 @@ impl IndexDb {
                         new_volume_id,
                         new_offset,
                     } => {
-                        if let Some(bytes) = dedup
-                            .get(&key[..])
-                            .map_err(|e| StorageError::Database(e.to_string()))?
-                        {
+                        if let Some(bytes) = counts.get(KeyspaceId::Dedup, &dedup, key)? {
                             let mut entry: DedupEntry = bincode::deserialize(&bytes)
                                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
                             entry.volume_id = *new_volume_id;
                             entry.offset = *new_offset;
                             let value = bincode::serialize(&entry)
                                 .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                            batch.insert(&dedup, &key[..], &value[..]);
+                            counts.set(KeyspaceId::Dedup, key, Some(value));
+                        }
+                    }
+                    BatchAction::AdjustBlobRef {
+                        blob_id,
+                        committed,
+                        staged,
+                        location,
+                    } => {
+                        let entry = match counts.get(KeyspaceId::BlobRefs, &blob_refs, blob_id)? {
+                            Some(bytes) => Some(
+                                bincode::deserialize::<BlobRefEntry>(&bytes)
+                                    .map_err(|e| StorageError::Serialization(e.to_string()))?,
+                            ),
+                            None => location.map(|(volume_id, offset)| BlobRefEntry {
+                                location: BlobLocation { volume_id, offset },
+                                ref_count_committed: 0,
+                                ref_count_staged: 0,
+                            }),
+                        };
+                        let Some(mut entry) = entry else {
+                            if *committed > 0 || *staged > 0 {
+                                return Err(StorageError::BlobRefNotFound {
+                                    blob_id: hex_id(blob_id),
+                                });
+                            }
+                            continue;
+                        };
+                        entry.ref_count_committed = adjust(entry.ref_count_committed, *committed);
+                        entry.ref_count_staged = adjust(entry.ref_count_staged, *staged);
+                        let value = bincode::serialize(&entry)
+                            .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                        counts.set(KeyspaceId::BlobRefs, blob_id, Some(value));
+                    }
+                    BatchAction::RelocateBlobRef {
+                        blob_id,
+                        volume_id,
+                        offset,
+                    } => {
+                        if let Some(bytes) =
+                            counts.get(KeyspaceId::BlobRefs, &blob_refs, blob_id)?
+                        {
+                            let mut entry: BlobRefEntry = bincode::deserialize(&bytes)
+                                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                            entry.location = BlobLocation {
+                                volume_id: *volume_id,
+                                offset: *offset,
+                            };
+                            let value = bincode::serialize(&entry)
+                                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                            counts.set(KeyspaceId::BlobRefs, blob_id, Some(value));
                         }
                     }
                 }
             }
 
+            for ((id, key), value) in counts.values {
+                match value {
+                    Some(value) => batch.insert(ks_for(id), &key[..], &value[..]),
+                    None => batch.remove(ks_for(id), &key[..]),
+                }
+            }
+
+            if let Some((digests, changes)) = digest_changes {
+                for change in changes {
+                    apply_digest_change(&mut batch, digests, change);
+                }
+            }
+
+            if let Some((meta, horizon)) = &purge_meta {
+                let stored = meta
+                    .get(TOMBSTONE_PURGE_HORIZON_KEY)
+                    .map_err(db_error)?
+                    .map(|value| TombstoneHorizon::decode(&value))
+                    .transpose()?;
+                let raised = stored.map_or(*horizon, |stored| stored.max(*horizon));
+                batch.insert(meta, TOMBSTONE_PURGE_HORIZON_KEY, raised.encode());
+            }
+
             batch.commit().map_err(|e| StorageError::Database(e.to_string()))?;
+            // The next batch that reads these counts may go on: it reads them
+            // committed. fjall keeps one journal for the whole database and
+            // appends batches in seqno order, so the fsync below — or the
+            // next batch's, whichever comes first — makes this batch durable
+            // before any batch that read it. This batch still answers only
+            // after its fsync.
+            drop(rmw_guard);
             db.persist(PersistMode::SyncAll)
                 .map_err(|e| StorageError::Database(e.to_string()))?;
 
@@ -968,6 +1677,7 @@ impl IndexDb {
         let multipart_sessions = self.multipart_sessions.clone();
         let multipart_parts = self.multipart_parts.clone();
         let blob_refs = self.blob_refs.clone();
+        let digest_keyspaces = self.digest_keyspaces.clone();
 
         task::spawn_blocking(move || {
             let resolve_ks = |name: &str| -> Option<&Keyspace> {
@@ -1011,11 +1721,644 @@ impl IndexDb {
             db.persist(PersistMode::SyncAll)
                 .map_err(|e| StorageError::Database(e.to_string()))?;
 
+            // The restored records bypassed the digests: describe them anew.
+            // They also bring a history this index did not see, so a horizon
+            // not yet settled is no longer zero.
+            if let Some(keyspaces) = &digest_keyspaces {
+                keyspaces.meta.remove(BORN_WITH_DIGESTS_KEY).map_err(db_error)?;
+                keyspaces.meta.remove(LEGACY_MIGRATION_COMPLETE_KEY).map_err(db_error)?;
+                db.persist(PersistMode::SyncAll).map_err(db_error)?;
+                Self::rebuild_digests(&db, &objects, &buckets, &iam, keyspaces)?;
+            }
+
             Ok::<(), StorageError>(())
         })
         .await
         .map_err(|e| StorageError::Database(e.to_string()))?
     }
+
+    // ========================================================================
+    // Version digests and the tombstone horizon (cluster mode)
+    // ========================================================================
+
+    /// Whether this index keeps version digests ([`IndexOptions::version_digests`]).
+    pub fn keeps_version_digests(&self) -> bool {
+        self.digest_keyspaces.is_some()
+    }
+
+    /// What opening the index found about the version digests; `None` when
+    /// the index does not keep them.
+    pub fn version_digests_opening(&self) -> Option<&VersionDigestsOpening> {
+        self.digests_opening.as_ref()
+    }
+
+    fn digest_keyspaces(&self) -> Result<DigestKeyspaces, StorageError> {
+        self.digest_keyspaces.clone().ok_or_else(|| StorageError::InvalidOperation {
+            operation: "version digests".to_string(),
+            reason: "the index was opened without them".to_string(),
+        })
+    }
+
+    /// Rebuilds every version digest from the records.
+    ///
+    /// Only where nothing else writes to the index: a write that lands while
+    /// it runs could get its older digest back.
+    pub(crate) async fn rebuild_version_digests(&self) -> Result<u64, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        let db = self.db.clone();
+        let objects = self.objects.clone();
+        let buckets = self.buckets.clone();
+        let iam = self.iam.clone();
+        task::spawn_blocking(move || {
+            Self::rebuild_digests(&db, &objects, &buckets, &iam, &keyspaces)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Every stored version digest, in ring order.
+    ///
+    /// Reads the whole keyspace into memory: for checks and diagnostics.
+    pub async fn version_digests(&self) -> Result<Vec<VersionDigestEntry>, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        task::spawn_blocking(move || {
+            keyspaces
+                .digests
+                .iter()
+                .map(|guard| {
+                    let (key, value) = guard.into_inner().map_err(db_error)?;
+                    VersionDigestEntry::decode(&key, &value)
+                })
+                .collect()
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// A page of the stored version digests in ring order: those whose ring
+    /// position is at least `from` and below `to` (`None` for the end of the
+    /// ring), and that come after the key `after` when given, at most
+    /// `limit` of them. An `after` past the range gives an empty page.
+    ///
+    /// Anti-entropy reads its pages this way, so a pass over the whole
+    /// keyspace never holds more than one page in memory. Each page is read
+    /// on its own: writes between two pages show in the later one.
+    pub async fn version_digests_in(
+        &self,
+        from: u64,
+        to: Option<u64>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<VersionDigestEntry>, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        // Every key of a position below `from` sorts before `from`'s eight
+        // bytes, and every key at `from` or beyond after them; so for `to`.
+        let lowest = from.to_be_bytes().to_vec();
+        let start = match after.map(digest_key_of) {
+            Some(after) if after >= lowest => Bound::Excluded(after),
+            _ => Bound::Included(lowest),
+        };
+        let end = match to {
+            Some(to) => Bound::Excluded(to.to_be_bytes().to_vec()),
+            None => Bound::Unbounded,
+        };
+        if let (Bound::Included(first) | Bound::Excluded(first), Bound::Excluded(last)) =
+            (&start, &end)
+        {
+            // A range that starts at or past its end holds nothing, and the
+            // keyspace is not asked for one.
+            if first >= last {
+                return Ok(Vec::new());
+            }
+        }
+        task::spawn_blocking(move || {
+            keyspaces
+                .digests
+                .range((start, end))
+                .take(limit)
+                .map(|guard| {
+                    let (key, value) = guard.into_inner().map_err(db_error)?;
+                    VersionDigestEntry::decode(&key, &value)
+                })
+                .collect()
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Compares the stored version digests with the ones the records give, in
+    /// one consistent snapshot of the index.
+    ///
+    /// Holds every expected digest in memory: for checks and diagnostics.
+    pub async fn verify_version_digests(&self) -> Result<VersionDigestCheck, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        let db = self.db.clone();
+        let objects = self.objects.clone();
+        let buckets = self.buckets.clone();
+        let iam = self.iam.clone();
+        task::spawn_blocking(move || {
+            let snapshot = db.snapshot();
+            let mut expected = BTreeMap::new();
+            for (source, keyspace) in [
+                (DigestSource::Objects, &objects),
+                (DigestSource::Buckets, &buckets),
+                (DigestSource::Iam, &iam),
+            ] {
+                for guard in snapshot.iter(keyspace) {
+                    let (key, value) = guard.into_inner().map_err(db_error)?;
+                    if let Some((digest_key, Some(digest))) =
+                        digest_change(source, &key, Some(&value))?
+                    {
+                        expected.insert(digest_key, digest);
+                    }
+                }
+            }
+
+            let mut check = VersionDigestCheck {
+                expected: expected.len() as u64,
+                ..VersionDigestCheck::default()
+            };
+            let name_of =
+                |key: &[u8]| String::from_utf8_lossy(key.get(8..).unwrap_or(key)).into_owned();
+            for guard in snapshot.iter(&keyspaces.digests) {
+                let (key, value) = guard.into_inner().map_err(db_error)?;
+                check.stored += 1;
+                if expected.remove(&key[..]).as_deref() != Some(&value[..]) {
+                    check.mismatched_keys.push(name_of(&key));
+                }
+            }
+            check.mismatched_keys.extend(expected.keys().map(|key| name_of(key)));
+            Ok(check)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// The tombstone horizon of this node, once settled
+    /// ([`settle_tombstone_horizon`](Self::settle_tombstone_horizon)).
+    pub async fn tombstone_horizon(&self) -> Result<Option<TombstoneHorizon>, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        task::spawn_blocking(move || {
+            let Some(stored) = keyspaces.meta.get(TOMBSTONE_HORIZON_KEY).map_err(db_error)? else {
+                return Ok(None);
+            };
+            let mut horizon = TombstoneHorizon::decode(&stored)?;
+            if let Some(floor) =
+                keyspaces.meta.get(TOMBSTONE_HORIZON_FLOOR_KEY).map_err(db_error)?
+            {
+                horizon = horizon.max(TombstoneHorizon::decode(&floor)?);
+            }
+            Ok(Some(horizon))
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Settles the tombstone horizon: the HLC from which every delete on this
+    /// node left a tombstone.
+    ///
+    /// The first call decides it and later calls return what it decided. An
+    /// index created by an open with digests, and kept by every open since,
+    /// has no delete without a tombstone in its history, and its horizon is
+    /// zero. Any other index may have one, even with no record left, and its
+    /// horizon is at least `now`: the caller takes it from the cluster clock before the
+    /// node serves any write, ahead of every HLC a peer may have issued
+    /// before. An uncertain open forgets the settled guarantee but retains
+    /// its lower bound: resettling takes their maximum even if the clock went
+    /// backward ([`IndexOptions::version_digests`]).
+    pub async fn settle_tombstone_horizon(
+        &self,
+        now: TombstoneHorizon,
+    ) -> Result<TombstoneHorizon, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        let db = self.db.clone();
+        task::spawn_blocking(move || {
+            let stored = keyspaces
+                .meta
+                .get(TOMBSTONE_HORIZON_KEY)
+                .map_err(db_error)?
+                .map(|value| TombstoneHorizon::decode(&value))
+                .transpose()?;
+            let floor = keyspaces
+                .meta
+                .get(TOMBSTONE_HORIZON_FLOOR_KEY)
+                .map_err(db_error)?
+                .map(|value| TombstoneHorizon::decode(&value))
+                .transpose()?;
+            let horizon = stored
+                .unwrap_or(
+                    if keyspaces.meta.contains_key(BORN_WITH_DIGESTS_KEY).map_err(db_error)? {
+                        TombstoneHorizon::ZERO
+                    } else {
+                        now
+                    },
+                )
+                .max(floor.unwrap_or(TombstoneHorizon::ZERO));
+            if stored == Some(horizon) && floor == Some(horizon) {
+                return Ok(horizon);
+            }
+            let mut batch = db.batch();
+            batch.insert(&keyspaces.meta, TOMBSTONE_HORIZON_KEY, horizon.encode());
+            // Retain the floor permanently: earlier builds can reset the
+            // settled field, but must not erase this lower bound.
+            batch.insert(
+                &keyspaces.meta,
+                TOMBSTONE_HORIZON_FLOOR_KEY,
+                horizon.encode(),
+            );
+            batch.commit().map_err(db_error)?;
+            db.persist(PersistMode::SyncAll).map_err(db_error)?;
+            Ok(horizon)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Durably records an explicit start of a server in single mode.
+    ///
+    /// Called by single-server startup before it serves writes. An engine
+    /// opened without digests for maintenance must not call this method:
+    /// dropping digest history alone is not evidence of a single-server start.
+    /// Cluster startup also calls this after preflight proved that no earlier
+    /// cluster identity exists. The evidence lasts until migration completion,
+    /// so an identity created by a failed bootstrap cannot bypass preflight.
+    pub async fn mark_single_mode_open(&self) -> Result<(), StorageError> {
+        let db = self.db.clone();
+        task::spawn_blocking(move || {
+            let meta = db
+                .keyspace(CLUSTER_META_KEYSPACE, KeyspaceCreateOptions::default)
+                .map_err(db_error)?;
+            meta.insert(LAST_OPEN_SINGLE_KEY, [1]).map_err(db_error)?;
+            db.persist(PersistMode::SyncAll).map_err(db_error)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Durably registers a bounded scan page with one atomic batch and fsync.
+    /// Existing obligations retain their original snapshots.
+    pub async fn track_legacy_migration_page(
+        &self,
+        page: &[(String, IndexRecord)],
+    ) -> Result<(), StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        let db = self.db.clone();
+        let entries = page
+            .iter()
+            .map(|(name, snapshot)| {
+                let key = [LEGACY_MIGRATION_QUEUE_PREFIX, name.as_bytes()].concat();
+                let value = bincode::serialize(snapshot)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                Ok((key, value))
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        task::spawn_blocking(move || {
+            let mut batch = db.batch();
+            for (key, value) in entries {
+                if !keyspaces.meta.contains_key(&key).map_err(db_error)? {
+                    batch.insert(&keyspaces.meta, key, value);
+                }
+            }
+            if !batch.is_empty() {
+                batch.commit().map_err(db_error)?;
+                db.persist(PersistMode::SyncAll).map_err(db_error)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Whether one key still owes confirmation from its owners.
+    pub async fn legacy_migration_key_pending(&self, full_key: &str) -> Result<bool, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        let key = [LEGACY_MIGRATION_QUEUE_PREFIX, full_key.as_bytes()].concat();
+        task::spawn_blocking(move || keyspaces.meta.contains_key(key).map_err(db_error))
+            .await
+            .map_err(db_error)?
+    }
+
+    /// A bounded page of outstanding migration obligations, including keys
+    /// superseded by a client while some owner had not yet acknowledged.
+    pub async fn legacy_migration_queue_page(
+        &self,
+        start_after: Option<&str>,
+        max: usize,
+    ) -> Result<Vec<(String, IndexRecord)>, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        let after = start_after.map(|key| [LEGACY_MIGRATION_QUEUE_PREFIX, key.as_bytes()].concat());
+        task::spawn_blocking(move || {
+            let mut page = Vec::new();
+            if max == 0 {
+                return Ok(page);
+            }
+            let start = after.clone().unwrap_or_else(|| LEGACY_MIGRATION_QUEUE_PREFIX.to_vec());
+            for guard in keyspaces.meta.range(start..) {
+                let (key, value) = guard.into_inner().map_err(db_error)?;
+                if !key.starts_with(LEGACY_MIGRATION_QUEUE_PREFIX) {
+                    break;
+                }
+                if after.as_ref().is_some_and(|after| key.as_ref() <= after.as_slice()) {
+                    continue;
+                }
+                let name = std::str::from_utf8(&key[LEGACY_MIGRATION_QUEUE_PREFIX.len()..])
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                let snapshot = bincode::deserialize(&value)
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                page.push((name.to_string(), snapshot));
+                if page.len() == max {
+                    break;
+                }
+            }
+            Ok(page)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Durably removes an obligation after every current owner was confirmed.
+    pub async fn finish_legacy_migration_key(&self, full_key: &str) -> Result<(), StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        let db = self.db.clone();
+        let key = [LEGACY_MIGRATION_QUEUE_PREFIX, full_key.as_bytes()].concat();
+        task::spawn_blocking(move || {
+            keyspaces.meta.remove(key).map_err(db_error)?;
+            db.persist(PersistMode::SyncAll).map_err(db_error)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// A page of unversioned live records stored without an HLC.
+    ///
+    /// `markers` selects bucket markers; false selects user objects. System
+    /// configurations, IAM, EC records, version history, tombstones and staged
+    /// multipart state are excluded. Keys are full `{bucket}/{key}` keys in
+    /// ascending order, strictly past `start_after`. A short page is the end.
+    /// Reads at most one result page into memory; callers scan markers first.
+    pub async fn legacy_migration_page(
+        &self,
+        markers: bool,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<Vec<(String, IndexRecord)>, StorageError> {
+        if max_keys == 0 {
+            return Ok(Vec::new());
+        }
+        let (ks, restore) = if markers {
+            (self.buckets.clone(), "__system__/__s4_bucket_marker_")
+        } else {
+            (self.objects.clone(), "")
+        };
+        let after = start_after.map(|s| s.strip_prefix(restore).unwrap_or(s).as_bytes().to_vec());
+        task::spawn_blocking(move || {
+            let iter: Box<dyn Iterator<Item = fjall::Guard>> = match after {
+                Some(after) => Box::new(ks.range((Bound::Excluded(after), Bound::Unbounded))),
+                None => Box::new(ks.iter()),
+            };
+            let mut result = Vec::new();
+            for guard in iter {
+                let (key, value) = guard.into_inner().map_err(db_error)?;
+                let key = std::str::from_utf8(&key).map_err(db_error)?;
+                let full_key = format!("{restore}{key}");
+                // Some objects-keyspace entries (e.g. old multipart state)
+                // need not be IndexRecords. Reject system keys before decoding.
+                if !markers && full_key.starts_with("__system__/") {
+                    continue;
+                }
+                let record: IndexRecord = bincode::deserialize(&value).map_err(db_error)?;
+                if super::migration::is_legacy_migration_record(&full_key, &record) {
+                    result.push((full_key, record));
+                    if result.len() == max_keys {
+                        break;
+                    }
+                }
+            }
+            Ok(result)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Whether the last complete legacy-object migration is still trusted.
+    /// Single-mode opens, restore and opens without a matching digest seal
+    /// invalidate the marker, so migration scans again after any such event.
+    pub async fn legacy_migration_complete(&self) -> Result<bool, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        task::spawn_blocking(move || {
+            keyspaces.meta.contains_key(LEGACY_MIGRATION_COMPLETE_KEY).map_err(db_error)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Durably records completion after a caller scanned every migration page.
+    /// The caller must finish both marker and object scans and resolve every
+    /// candidate before recording completion, under the external write lock.
+    pub async fn mark_legacy_migration_complete(&self) -> Result<(), StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        let db = self.db.clone();
+        task::spawn_blocking(move || {
+            let mut batch = db.batch();
+            batch.insert(&keyspaces.meta, LEGACY_MIGRATION_COMPLETE_KEY, [1]);
+            batch.remove(&keyspaces.meta, LAST_OPEN_SINGLE_KEY);
+            batch.commit().map_err(db_error)?;
+            db.persist(PersistMode::SyncAll).map_err(db_error)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Whether this node finished adopting the bucket configurations it
+    /// stored before protocol 6 ([`mark_bucket_configs_adopted`](Self::mark_bucket_configs_adopted)),
+    /// and its history has remained trusted ever since.
+    pub async fn bucket_configs_adopted(&self) -> Result<bool, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        task::spawn_blocking(move || {
+            keyspaces.meta.contains_key(BUCKET_CONFIGS_ADOPTED_KEY).map_err(db_error)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Records, durably, that every bucket configuration this node stored
+    /// before protocol 6 is on the replicas of its key. Opening the index
+    /// without digests or without a matching seal forgets it.
+    pub async fn mark_bucket_configs_adopted(&self) -> Result<(), StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        let db = self.db.clone();
+        task::spawn_blocking(move || {
+            let mut batch = db.batch();
+            batch.insert(&keyspaces.meta, BUCKET_CONFIGS_ADOPTED_KEY, [1]);
+            batch.insert(&keyspaces.meta, BUCKET_CONFIG_HISTORY_CHECK_KEY, [1]);
+            batch.commit().map_err(db_error)?;
+            db.persist(PersistMode::SyncAll).map_err(db_error)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Whether local configurations require confirmation of their owners'
+    /// deletion history before readoption. Unlike adoption completion, this
+    /// marker survives every restart and opens without digests.
+    pub async fn bucket_config_history_requires_confirmation(&self) -> Result<bool, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        task::spawn_blocking(move || {
+            keyspaces.meta.contains_key(BUCKET_CONFIG_HISTORY_CHECK_KEY).map_err(db_error)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Whether this node saw every node of its pool adopt its bucket
+    /// configurations ([`mark_bucket_config_quorum_reads`](Self::mark_bucket_config_quorum_reads)).
+    /// This cutover survives uncertain history and opens without digests.
+    pub async fn bucket_config_quorum_reads(&self) -> Result<bool, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        task::spawn_blocking(move || {
+            keyspaces.meta.contains_key(BUCKET_CONFIG_QUORUM_READS_KEY).map_err(db_error)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Records, durably, that every node of this node's pool adopted its
+    /// bucket configurations: they are read through the quorums from now on,
+    /// across restarts, including ones with uncertain deletion history.
+    pub async fn mark_bucket_config_quorum_reads(&self) -> Result<(), StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        let db = self.db.clone();
+        task::spawn_blocking(move || {
+            let mut batch = db.batch();
+            batch.insert(&keyspaces.meta, BUCKET_CONFIG_QUORUM_READS_KEY, [1]);
+            batch.insert(&keyspaces.meta, BUCKET_CONFIG_HISTORY_CHECK_KEY, [1]);
+            batch.commit().map_err(db_error)?;
+            db.persist(PersistMode::SyncAll).map_err(db_error)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Whether this node saw every node of its pool hold no IAM of its own
+    /// that the pool has not taken over ([`mark_iam_adopted`](Self::mark_iam_adopted)),
+    /// and its history has remained trusted ever since.
+    pub async fn iam_adopted(&self) -> Result<bool, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        task::spawn_blocking(move || keyspaces.meta.contains_key(IAM_ADOPTED_KEY).map_err(db_error))
+            .await
+            .map_err(db_error)?
+    }
+
+    /// Records, durably, that every node of this node's pool holds no IAM of
+    /// its own the pool has not taken over: IAM is changed through the pool
+    /// from now on, across restarts. Opening the index without digests or
+    /// without a matching seal forgets it.
+    pub async fn mark_iam_adopted(&self) -> Result<(), StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        let db = self.db.clone();
+        task::spawn_blocking(move || {
+            keyspaces.meta.insert(IAM_ADOPTED_KEY, [1]).map_err(db_error)?;
+            db.persist(PersistMode::SyncAll).map_err(db_error)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// The record of this node's place in the move of the pool's bucket
+    /// metadata to its replication factor, as last stored
+    /// ([`store_bucket_metadata_placement`](Self::store_bucket_metadata_placement)),
+    /// or `None` when it never was.
+    pub async fn bucket_metadata_placement(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        task::spawn_blocking(move || {
+            Ok(keyspaces
+                .meta
+                .get(BUCKET_METADATA_PLACEMENT_KEY)
+                .map_err(db_error)?
+                .map(|value| value.to_vec()))
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Stores, durably, the record of this node's place in the move of the
+    /// pool's bucket metadata. The caller keeps it from going backwards.
+    pub async fn store_bucket_metadata_placement(
+        &self,
+        record: Vec<u8>,
+    ) -> Result<(), StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        let db = self.db.clone();
+        task::spawn_blocking(move || {
+            keyspaces.meta.insert(BUCKET_METADATA_PLACEMENT_KEY, record).map_err(db_error)?;
+            db.persist(PersistMode::SyncAll).map_err(db_error)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// The opaque pool generation record, or none before its first cluster start.
+    pub async fn pool_generation(&self) -> Result<Option<Vec<u8>>, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        task::spawn_blocking(move || {
+            Ok(keyspaces.meta.get(POOL_GENERATION_KEY).map_err(db_error)?.map(|v| v.to_vec()))
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Stores pool membership durably. The cluster layer validates its evolution.
+    pub async fn store_pool_generation(&self, record: Vec<u8>) -> Result<(), StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        let db = self.db.clone();
+        task::spawn_blocking(move || {
+            keyspaces.meta.insert(POOL_GENERATION_KEY, record).map_err(db_error)?;
+            db.persist(PersistMode::SyncAll).map_err(db_error)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Every record of this node's progress in moving the pool's keys to a
+    /// grown generation, by name, in name order
+    /// ([`store_rebalance_entry`](Self::store_rebalance_entry)).
+    pub async fn rebalance_entries(&self) -> Result<Vec<(String, Vec<u8>)>, StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        task::spawn_blocking(move || {
+            keyspaces
+                .meta
+                .prefix(REBALANCE_PREFIX)
+                .map(|guard| {
+                    let (key, value) = guard.into_inner().map_err(db_error)?;
+                    let name = std::str::from_utf8(&key[REBALANCE_PREFIX.len()..])
+                        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                    Ok((name.to_string(), value.to_vec()))
+                })
+                .collect()
+        })
+        .await
+        .map_err(db_error)?
+    }
+
+    /// Stores, durably, one record of this node's progress in moving the
+    /// pool's keys. The caller keeps it from going backwards.
+    pub async fn store_rebalance_entry(
+        &self,
+        name: &str,
+        record: Vec<u8>,
+    ) -> Result<(), StorageError> {
+        let keyspaces = self.digest_keyspaces()?;
+        let db = self.db.clone();
+        let mut key = REBALANCE_PREFIX.to_vec();
+        key.extend_from_slice(name.as_bytes());
+        task::spawn_blocking(move || {
+            keyspaces.meta.insert(key, record).map_err(db_error)?;
+            db.persist(PersistMode::SyncAll).map_err(db_error)
+        })
+        .await
+        .map_err(db_error)?
+    }
+
     // ========================================================================
     // Tombstone scanning (Phase 8: Distributed GC)
     // ========================================================================
@@ -1024,42 +2367,43 @@ impl IndexDb {
     ///
     /// Used by distributed GC (Phase 8) to scan for tombstones and live
     /// objects without going through the string-prefix routing layer.
+    /// A write through it goes around the version digests: write through the
+    /// methods of `IndexDb`.
     pub fn objects_keyspace(&self) -> Keyspace {
         self.objects.clone()
     }
 
-    /// Scans the objects keyspace and returns all tombstone (delete marker) records.
-    ///
-    /// A tombstone is an [`IndexRecord`] with `is_delete_marker == true`.
-    /// Returns `(key, record)` pairs for all tombstones found.
+    /// The keys of every tombstone ([`IndexRecord::is_tombstone`]) in the
+    /// objects and buckets keyspaces, in the form [`get`](Self::get) takes
+    /// them: a bucket marker's with its `__system__/__s4_bucket_marker_`
+    /// prefix restored.
     ///
     /// # Performance
     ///
-    /// Full scan of the objects keyspace. Intended for periodic background GC,
-    /// not hot-path usage.
-    pub async fn scan_tombstones(&self) -> Result<Vec<(String, IndexRecord)>, StorageError> {
+    /// Full scan of both keyspaces; memory grows with the tombstones found,
+    /// not with the keys scanned.
+    pub async fn tombstone_keys(&self) -> Result<Vec<String>, StorageError> {
         let objects = self.objects.clone();
+        let buckets = self.buckets.clone();
 
         task::spawn_blocking(move || {
-            let mut results = Vec::new();
-
-            for guard in objects.iter() {
-                let (key_bytes, value_bytes) =
-                    guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
-
-                let record: IndexRecord = bincode::deserialize(&value_bytes)
-                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
-
-                if record.is_delete_marker {
-                    let key_str = std::str::from_utf8(&key_bytes)
-                        .map_err(|e| StorageError::Database(e.to_string()))?
-                        .to_string();
-
-                    results.push((key_str, record));
+            let mut keys = Vec::new();
+            for (keyspace, restore_prefix) in
+                [(&objects, ""), (&buckets, "__system__/__s4_bucket_marker_")]
+            {
+                for guard in keyspace.iter() {
+                    let (key_bytes, value_bytes) =
+                        guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
+                    let record: IndexRecord = bincode::deserialize(&value_bytes)
+                        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                    if record.is_tombstone() {
+                        let key = std::str::from_utf8(&key_bytes)
+                            .map_err(|e| StorageError::Database(e.to_string()))?;
+                        keys.push(format!("{restore_prefix}{key}"));
+                    }
                 }
             }
-
-            Ok(results)
+            Ok(keys)
         })
         .await
         .map_err(|e| StorageError::Database(e.to_string()))?
@@ -1117,6 +2461,7 @@ impl IndexDb {
         &self,
     ) -> Result<(HashSet<[u8; 32]>, HashSet<BlobId>), StorageError> {
         let objects = self.objects.clone();
+        let buckets = self.buckets.clone();
         let iam = self.iam.clone();
 
         task::spawn_blocking(move || {
@@ -1159,12 +2504,54 @@ impl IndexDb {
             };
 
             scan_ks(&objects, &mut content_hashes, &mut manifest_blob_ids)?;
+            scan_ks(&buckets, &mut content_hashes, &mut manifest_blob_ids)?;
             scan_ks(&iam, &mut content_hashes, &mut manifest_blob_ids)?;
 
             Ok((content_hashes, manifest_blob_ids))
         })
         .await
         .map_err(|e| StorageError::Database(e.to_string()))?
+    }
+
+    /// Where the live records of the index keep their data in the volumes:
+    /// each plain object's blob by location, with its content hash, and
+    /// each composite object's manifest by blob id, with its location.
+    ///
+    /// The compactor keeps these whatever the reference counts say: a count
+    /// that drifted low must not cost a live object its bytes. Delete
+    /// markers, erasure-coded entries and inline objects keep no data in a
+    /// volume.
+    pub async fn scan_live_data_refs(&self) -> Result<LiveDataRefs, StorageError> {
+        let keyspaces = [self.objects.clone(), self.buckets.clone(), self.iam.clone()];
+        task::spawn_blocking(move || {
+            let mut refs = LiveDataRefs::default();
+            for keyspace in &keyspaces {
+                for guard in keyspace.iter() {
+                    let (_, value) = guard.into_inner().map_err(db_error)?;
+                    let record: IndexRecord = bincode::deserialize(&value)
+                        .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                    if record.is_delete_marker
+                        || record.is_erasure_coded()
+                        || record.file_id == u32::MAX
+                        || record.file_id == crate::types::EXTERNAL_DATA_FILE_ID
+                    {
+                        continue;
+                    }
+                    let location = (record.file_id, record.offset);
+                    match record.composite_manifest_blob_id() {
+                        Some(manifest) => {
+                            refs.manifests.insert(manifest, location);
+                        }
+                        None => {
+                            refs.blobs.insert(location, record.content_hash);
+                        }
+                    }
+                }
+            }
+            Ok(refs)
+        })
+        .await
+        .map_err(db_error)?
     }
 
     /// Scans the objects keyspace and returns all records stored in the given volume.
@@ -1174,7 +2561,9 @@ impl IndexDb {
     /// Inline objects (`file_id == u32::MAX`) are always excluded.
     ///
     /// Scans **all** keyspaces that store [`IndexRecord`]s pointing to volume
-    /// blobs — currently `objects` and `iam`.  The returned [`KeyspaceId`]
+    /// blobs — `objects`, `buckets` (the bucket markers) and `iam`, the same
+    /// ones [`Self::scan_live_data_refs`] keeps alive: a blob kept alive whose
+    /// record is not moved with it is lost with its old volume. The returned [`KeyspaceId`]
     /// tells the caller which keyspace the record belongs to so that updates
     /// are written back to the correct keyspace.
     ///
@@ -1183,13 +2572,14 @@ impl IndexDb {
     ///
     /// # Performance
     ///
-    /// Full keyspace scan over objects + iam. Call from a blocking thread for
+    /// Full keyspace scan over objects, buckets and iam. Call from a blocking thread for
     /// large datasets.
     pub async fn scan_objects_by_volume(
         &self,
         volume_id: u32,
     ) -> Result<Vec<(KeyspaceId, String, IndexRecord)>, StorageError> {
         let objects = self.objects.clone();
+        let buckets = self.buckets.clone();
         let iam = self.iam.clone();
 
         task::spawn_blocking(move || {
@@ -1222,6 +2612,7 @@ impl IndexDb {
             };
 
             scan_ks(&objects, KeyspaceId::Objects, &mut results)?;
+            scan_ks(&buckets, KeyspaceId::Buckets, &mut results)?;
             scan_ks(&iam, KeyspaceId::Iam, &mut results)?;
 
             Ok(results)
@@ -1231,10 +2622,220 @@ impl IndexDb {
     }
 }
 
+/// What the live records of an index keep in the volumes
+/// ([`IndexDb::scan_live_data_refs`]).
+#[derive(Debug, Default)]
+pub struct LiveDataRefs {
+    /// Each plain object's blob: its location `(volume_id, offset)` and its
+    /// content hash.
+    pub blobs: std::collections::HashMap<(u32, u64), [u8; 32]>,
+    /// Each composite object's manifest blob, with its location.
+    pub manifests: std::collections::HashMap<BlobId, (u32, u64)>,
+}
+
+/// The reference counts a batch changes, by keyspace and key, as the
+/// actions of the batch leave them: `None` for a removed entry.
+#[derive(Default)]
+struct PendingCounts {
+    values: BTreeMap<(KeyspaceId, Vec<u8>), Option<Vec<u8>>>,
+}
+
+impl PendingCounts {
+    /// The entry of `key` as the batch stands: what an earlier action of the
+    /// batch left, or what `keyspace` holds.
+    fn get(
+        &self,
+        id: KeyspaceId,
+        keyspace: &Keyspace,
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        match self.values.get(&(id, key.to_vec())) {
+            Some(value) => Ok(value.clone()),
+            None => Ok(keyspace.get(key).map_err(db_error)?.map(|value| value.to_vec())),
+        }
+    }
+
+    fn set(&mut self, id: KeyspaceId, key: &[u8], value: Option<Vec<u8>>) {
+        self.values.insert((id, key.to_vec()), value);
+    }
+}
+
+/// `count` changed by `delta`, never below zero or past `u32::MAX`.
+fn adjust(count: u32, delta: i64) -> u32 {
+    (i64::from(count) + delta).clamp(0, i64::from(u32::MAX)) as u32
+}
+
+/// A blob id as an error names it.
+fn hex_id(blob_id: &[u8]) -> String {
+    blob_id.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Two changes of one count in one batch both count: each reads what the
+    /// one before it left, not the value from before the batch.
+    #[tokio::test]
+    async fn two_changes_of_one_count_in_a_batch_both_count() {
+        let temp_dir = TempDir::new().unwrap();
+        let index_db = IndexDb::new(&temp_dir.path().join("test_db")).unwrap();
+        let increment = || BatchOp {
+            keyspace: KeyspaceId::Dedup,
+            action: BatchAction::IncrementDedupRef {
+                key: b"hash".to_vec(),
+                volume_id: 1,
+                offset: 0,
+            },
+        };
+        let blob = |committed, staged| BatchOp {
+            keyspace: KeyspaceId::BlobRefs,
+            action: BatchAction::AdjustBlobRef {
+                blob_id: b"blob".to_vec(),
+                committed,
+                staged,
+                location: Some((1, 0)),
+            },
+        };
+        index_db
+            .batch_write(vec![
+                increment(),
+                increment(),
+                blob(0, 1),
+                blob(1, -1),
+                blob(1, 0),
+            ])
+            .await
+            .unwrap();
+
+        let dedup: DedupEntry =
+            bincode::deserialize(&index_db.dedup.get(b"hash").unwrap().unwrap()).unwrap();
+        assert_eq!(dedup.ref_count, 2);
+        let blob_ref: BlobRefEntry =
+            bincode::deserialize(&index_db.blob_refs.get(b"blob").unwrap().unwrap()).unwrap();
+        assert_eq!(
+            (blob_ref.ref_count_committed, blob_ref.ref_count_staged),
+            (2, 0)
+        );
+
+        // A count the blob is expected to have, and has not, is an error
+        let missing = BatchOp {
+            keyspace: KeyspaceId::BlobRefs,
+            action: BatchAction::AdjustBlobRef {
+                blob_id: b"missing".to_vec(),
+                committed: 1,
+                staged: 0,
+                location: None,
+            },
+        };
+        assert!(matches!(
+            index_db.batch_write(vec![missing]).await,
+            Err(StorageError::BlobRefNotFound { .. })
+        ));
+    }
+
+    /// A scan after a key returns the keys of the prefix past it, wherever
+    /// that key lies: inside the prefix, before it, past it, or with no
+    /// prefix at all.
+    #[tokio::test]
+    async fn a_scan_resumes_right_after_its_start_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let index_db =
+            IndexDb::open(&temp_dir.path().join("test_db"), IndexOptions::default()).unwrap();
+        let record = IndexRecord::new(
+            1,
+            0,
+            4,
+            [1; 32],
+            "etag".to_string(),
+            "text/plain".to_string(),
+        );
+        for key in ["a/1", "a/2", "a/3", "ab/1", "b/1"] {
+            index_db.put(key, &record).await.unwrap();
+        }
+        let scan = |prefix: &'static str, start_after: Option<&'static str>| {
+            let index_db = &index_db;
+            async move {
+                index_db
+                    .list_after(prefix, start_after, 10)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|(key, _)| key)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        assert_eq!(scan("a/", Some("a/1")).await, ["a/2", "a/3"]);
+        assert_eq!(scan("a/", Some("a/15")).await, ["a/2", "a/3"]);
+        assert_eq!(scan("a/", Some("0")).await, ["a/1", "a/2", "a/3"]);
+        assert_eq!(scan("a/", Some("a/3")).await, Vec::<String>::new());
+        assert_eq!(scan("a/", Some("aa")).await, Vec::<String>::new());
+        assert_eq!(scan("", Some("a/3")).await, ["ab/1", "b/1"]);
+        assert_eq!(scan("a", Some("a/2")).await, ["a/3", "ab/1"]);
+    }
+
+    /// The paths a batch of the storage engine does not take keep the digests
+    /// too: single puts and deletes (journal replay, recovery, GC) in both
+    /// keyspaces that have digests, and a restore, which bypasses them.
+    #[tokio::test]
+    async fn single_writes_and_restores_keep_the_version_digests() {
+        let temp_dir = TempDir::new().unwrap();
+        let index_db = IndexDb::open(
+            &temp_dir.path().join("test_db"),
+            IndexOptions {
+                version_digests: true,
+            },
+        )
+        .unwrap();
+        let at = |wall: u64| {
+            let mut record = IndexRecord::new(
+                1,
+                0,
+                4,
+                [wall as u8; 32],
+                "etag".to_string(),
+                "text/plain".to_string(),
+            );
+            record.hlc_timestamp = wall;
+            record
+        };
+        let consistent = |check: VersionDigestCheck| {
+            assert!(check.is_consistent(), "{check:?}");
+            check.stored
+        };
+
+        index_db.put("photos/a", &at(1)).await.unwrap();
+        index_db.put("photos/b", &at(2)).await.unwrap();
+        index_db.put("photos/a", &at(3)).await.unwrap();
+        index_db.put("__system__/__s4_bucket_marker_photos", &at(4)).await.unwrap();
+        index_db.put("__system__/cors/photos", &at(5)).await.unwrap();
+        index_db.put("__system__/__s4_iam_user_admin", &at(6)).await.unwrap();
+        assert_eq!(
+            consistent(index_db.verify_version_digests().await.unwrap()),
+            3
+        );
+
+        index_db.delete("photos/b").await.unwrap();
+        index_db.delete("__system__/__s4_bucket_marker_photos").await.unwrap();
+        assert_eq!(
+            consistent(index_db.verify_version_digests().await.unwrap()),
+            1
+        );
+
+        let snapshot = index_db.dump_keyspaces().await.unwrap();
+        index_db.put("photos/c", &at(7)).await.unwrap();
+        index_db.restore_keyspaces(snapshot).await.unwrap();
+        assert_eq!(
+            consistent(index_db.verify_version_digests().await.unwrap()),
+            1,
+            "the restore brought back the index without photos/c"
+        );
+        let digests = index_db.version_digests().await.unwrap();
+        assert_eq!(digests[0].key, "photos/a");
+        assert_eq!(digests[0].digest.hlc_timestamp, 3);
+    }
 
     #[tokio::test]
     async fn test_index_db_put_and_get() {

@@ -1,3 +1,33 @@
+# v1.3.0-anti-entropy
+
+# Anti-Entropy, Shared Cluster State and Online Pool Growth
+
+**Release Overview**
+Replicas now recover missed changes through anti-entropy, while bucket settings and IAM state are shared across the cluster. Enterprise pools can grow with verified, resumable rebalancing.
+
+## 🚀 New Features (All Editions)
+* **Anti-entropy and safe deletion:** Replicas recover missed writes and deletes after hints expire. Deletion history is retained until repair confirms it is safe to collect.
+* **Shared bucket configuration:** CORS, lifecycle, policy and encryption settings are stored and read through cluster quorums. Lifecycle rules run on every node holding object copies.
+* **Cluster IAM:** Users, roles, S3 credentials and revocations are shared across nodes. S3 secrets are encrypted at rest and during replication; admin sessions follow the account's current permissions.
+* **Single-to-cluster migration:** Existing buckets, objects and multipart ETags are automatically copied into a replicated cluster.
+
+## 🏢 Enterprise Edition
+* **Online pool growth:** Append nodes and let verified, resumable rebalancing move existing objects and active multipart uploads. Progress and pause/resume controls are available in the cluster admin API.
+* **Resilient bucket metadata:** In an EC 4+2 pool, bucket existence records and settings survive any two node failures once their automatic migration completes.
+
+## 🐛 Bug Fixes
+* **Cluster recovery and listings:** Crashes, returning replicas and concurrent placement changes no longer lose newer writes or cause intermittent listing failures when quorum is available.
+* **EC deletion and promotion:** DELETE refuses a missing namespace quorum instead of confirming an uncommitted deletion. Repairs made obsolete by a confirmed promotion no longer appear as permanent failures.
+
+## ⚠️ Upgrade Notes
+* **Rolling upgrade:** Upgrade one node at a time, preserving quorum, and finish the whole pool before expecting background repair and metadata migration. Cluster protocol is now 9; do not downgrade after metadata migration or a pool move begins.
+* **IAM:** Log in again after upgrading. Review and adopt existing per-node accounts through `/api/admin/iam/adoption` before IAM changes resume. Keep existing shared secrets unchanged and identical across nodes; root is configured through the environment.
+* **Load balancers:** Route clients using `/minio/health/ready`; keep `/health` or `/minio/health/live` for liveness. For single-to-cluster migration, wait for `migration_pending_records` to reach zero on every node before switching clients; versioned sources and EC destinations are refused.
+* **Cluster feature support:** Configuration writes for versioning and Object Lock now return `501` instead of accepting protection that cluster mode does not enforce.
+* **Tombstone retention:** Custom `S4_GC_GRACE_DAYS` must cover the configured rejoin and repair window; unsafe values refuse startup.
+* **EC availability:** Hot objects and their namespace still use RF=3. Losing two of a key's namespace owners can make PUT, DELETE and LIST return `503`, even when EC shards remain recoverable.
+
+
 # v1.2.0-extended-metrics
 
 # Cluster Observability, Hint Delivery and Gossip Rejoin

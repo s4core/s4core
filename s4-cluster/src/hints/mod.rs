@@ -49,9 +49,12 @@
 //! segment meanwhile. For each hint the newest version of the key is read from
 //! every replica except the target ([`KeyStateSource`]) and the target is
 //! brought to it: the copy is written to it with its own HLC, so the target's
-//! LWW keeps anything newer it already has; a key that no replica holds any
-//! more is removed from the target only if the target's record is no newer
-//! than the operation it missed, and only by that record's exact HLC.
+//! LWW keeps anything newer it already has; a tombstone is sent the same way, a
+//! delete at its HLC that the target keeps as its own tombstone, to a target at
+//! protocol 4 or above. A target older than that keeps no tombstones and would
+//! delete whatever it holds: it loses its record only if that is no newer than
+//! the tombstone, and only by that record's exact HLC — as does any target when
+//! no replica holds the key at all and the operation it missed was a write.
 //!
 //! A record written without an HLC is ordered by the HLC every node makes up
 //! for it, as a quorum read orders it ([`HlcTimestamp::of_record`]). Its copy
@@ -60,13 +63,16 @@
 //! record without one is removed by a conditional delete on the zero HLC, which
 //! matches only a record that still stores none.
 //!
-//! Without tombstones a replica that took a delete simply has no key, which
-//! cannot be told from one that never got the write. So a copy is spread only
-//! when that cannot matter — no other replica reported the key absent, or as
-//! many of them hold the copy as a confirmed write leaves behind. Otherwise the
-//! copy may be one that missed a delete the absent replicas took, and writing
-//! it would bring the deleted key back: nothing is written, and the hint is
-//! dropped as `ambiguous` unless the target already holds that version.
+//! A replica that keeps tombstones holds the delete it took, newer than the
+//! copy that missed it, and the newest version is that tombstone. A replica
+//! before protocol 4 that took a delete simply has no key, which cannot be told
+//! from one that never got the write. So a copy is spread only when that
+//! cannot matter — no such replica reported the key absent, or as many of the
+//! other replicas hold the copy as a confirmed write leaves behind. Otherwise
+//! the copy may be one that missed a delete the absent replicas took, and
+//! writing it would bring the deleted key back: nothing is written, and the
+//! hint is dropped as `ambiguous` unless the target already holds that version
+//! or a newer one.
 //!
 //! A hint whose key cannot be settled now — another replica did not answer,
 //! or the write it names may still be landing — waits for a later pass
@@ -77,9 +83,10 @@
 //! any of this is safe, because delivery only ever brings the target to the
 //! current state.
 //!
-//! One window stays open, the same one read repair has: a key deleted between
-//! reading its current state and writing it to the target comes back on the
-//! target. Closing it takes tombstones with an HLC on the replicas.
+//! A key deleted between reading its current state and writing the copy to
+//! the target does not come back there: the delete leaves its tombstone on the
+//! target, newer than the copy, and the target's LWW refuses the copy. A target
+//! before protocol 4 keeps no tombstone, and the window stays open on it.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -102,8 +109,7 @@ use crate::error::ClusterError;
 use crate::gossip::GossipHandle;
 use crate::hlc::HlcTimestamp;
 use crate::identity::{NodeId, NodeStatus};
-use crate::protocol::CONDITIONAL_DELETE_MIN_PROTOCOL_VERSION;
-use crate::rpc::proto;
+use crate::repair::reconcile::{KeyRef, Outcome, Reconciler};
 use crate::rpc::NodeClient;
 
 /// Default hint TTL: 3 hours.
@@ -149,7 +155,7 @@ pub struct HintEntry {
 }
 
 /// What delivering a hint has to do.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HintKind {
     /// A write the target missed: the key on the target is to be brought to
     /// its current state on the other replicas.
@@ -165,9 +171,27 @@ pub enum HintKind {
         /// The generation to remove.
         expected: HlcTimestamp,
     },
+    /// Outstanding native multipart session and part catch-up. Appended to
+    /// preserve the bincode discriminants of existing hint records.
+    Multipart {
+        /// Upload whose native state must be copied, independently of the object.
+        upload_id: String,
+    },
 }
 
 impl HintEntry {
+    /// Outstanding native multipart catch-up for one upload.
+    pub fn multipart(bucket: &str, key: &str, upload_id: &str, hlc: HlcTimestamp) -> Self {
+        Self::taken_now(
+            bucket,
+            key,
+            hlc,
+            HintKind::Multipart {
+                upload_id: upload_id.to_string(),
+            },
+        )
+    }
+
     /// A hint, taken now, for a write of `bucket/key` at `hlc`.
     pub fn written(bucket: &str, key: &str, hlc: HlcTimestamp) -> Self {
         Self::taken_now(bucket, key, hlc, HintKind::Written)
@@ -195,105 +219,18 @@ impl HintEntry {
     }
 }
 
-/// The newest version of a key on its replicas other than a hint's target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NewestVersion {
-    /// `node` holds a copy of it.
-    Copy {
-        /// Its HLC.
-        hlc: HlcTimestamp,
-        /// A replica that holds it.
-        node: NodeId,
-        /// Whether the copy may be spread: no other replica reported the key
-        /// absent, or at least as many of them hold exactly this version as
-        /// the write quorum asks for (all of them, when the write quorum
-        /// counts the target too). A copy that is neither may be one that
-        /// missed a delete the absent replicas took.
-        confirmed: bool,
-    },
-    /// It is erasure coded: no replica holds a copy of its bytes.
-    ErasureCoded {
-        /// Its HLC.
-        hlc: HlcTimestamp,
-    },
-    /// None of the other replicas holds the key.
-    Absent,
-    /// The target is no longer a replica of the key, or it is the only one:
-    /// there is nothing to bring it to.
-    NotAReplica,
-}
-
-/// One copy of an object, as a replica holds it.
-#[derive(Debug, Clone)]
-pub struct StoredCopy {
-    /// Its HLC, made up for a record written without one
-    /// ([`HlcTimestamp::of_record`]); `None` when the replica reported no HLC
-    /// at all, which no LWW could weigh against another.
-    pub hlc: Option<HlcTimestamp>,
-    /// The object's bytes.
-    pub data: Vec<u8>,
-    /// SHA-256 of the bytes.
-    pub content_hash: Vec<u8>,
-    /// MIME type.
-    pub content_type: String,
-    /// Metadata as the replica stores it.
-    pub metadata: HashMap<String, String>,
-    /// Version ID, if any.
-    pub version_id: Option<String>,
-}
-
-/// Where hint delivery learns the current state of a key.
-#[async_trait::async_trait]
-pub trait KeyStateSource: Send + Sync {
-    /// The newest version of `bucket/key` among its replicas other than
-    /// `target`. Every one of them has to answer: one that does not makes this
-    /// an error, never "absent", because it may be the one holding the newest
-    /// version. Reads nothing into the replicas and repairs nothing.
-    async fn newest_version(
-        &self,
-        bucket: &str,
-        key: &str,
-        target: NodeId,
-    ) -> Result<NewestVersion, ClusterError>;
-
-    /// The copy of `bucket/key` that `node` holds.
-    async fn read_copy(
-        &self,
-        bucket: &str,
-        key: &str,
-        node: NodeId,
-    ) -> Result<StoredCopy, ClusterError>;
-}
+pub use crate::repair::reconcile::{KeyStateSource, NewestVersion, StoredCopy};
 
 /// What delivering hints needs besides the log: where the current state of a
 /// key is read, and how targets are reached.
 pub struct HintDelivery {
-    source: Arc<dyn KeyStateSource>,
-    rpc_client: Arc<NodeClient>,
+    reconciler: Reconciler,
     gossip: Arc<GossipHandle>,
-    local_node_id: NodeId,
-    topology_epoch: u64,
-    /// How long one call to a target may take before the pass gives up on it.
-    call_timeout: Duration,
     /// How long after a hint the write it names may still be landing on the
     /// other replicas: the coordinator's `replica_write_timeout`.
     settle_time: Duration,
-}
-
-/// What became of one hint handed to its target.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Outcome {
-    /// The target is at the key's current state now, or already was.
-    Delivered,
-    /// The key has left replication — erasure coded, or placed elsewhere.
-    Superseded,
-    /// The target refused, or cannot take, what delivery would send it.
-    Rejected(String),
-    /// The other replicas disagree in a way only tombstones could settle:
-    /// the newest copy may be one that missed a delete. Nothing was written.
-    Ambiguous(String),
-    /// The key cannot be settled now; the hint waits for a later pass.
-    Later(String),
+    /// Hands this node's open uploads to a replica that missed them.
+    multipart: Option<Arc<crate::rebalance::MultipartTransfer>>,
 }
 
 impl HintDelivery {
@@ -307,14 +244,27 @@ impl HintDelivery {
         topology_epoch: u64,
     ) -> Self {
         Self {
-            source,
-            rpc_client,
+            reconciler: Reconciler::new(
+                source,
+                rpc_client,
+                gossip.clone(),
+                local_node_id,
+                topology_epoch,
+            ),
             gossip,
-            local_node_id,
-            topology_epoch,
-            call_timeout: Duration::from_secs(60),
             settle_time: crate::WriteTimeouts::default().replica_write_timeout,
+            multipart: None,
         }
+    }
+
+    /// The same delivery, handing over native multipart uploads this node
+    /// holds through `transfer`.
+    pub fn with_multipart_transfer(
+        mut self,
+        transfer: Arc<crate::rebalance::MultipartTransfer>,
+    ) -> Self {
+        self.multipart = Some(transfer);
+        self
     }
 
     /// The same delivery for coordinators whose replica writes may take up to
@@ -331,38 +281,47 @@ impl HintDelivery {
             .is_some_and(|state| state.status == NodeStatus::Alive)
     }
 
-    /// Whether `target` understands a delete of one exact generation; a node
-    /// that does not would take it for an unconditional delete. `Err` while
-    /// the target has not announced its protocol yet — a node that has just
-    /// come back is known by gossip a moment before its metadata arrives.
-    fn takes_conditional_deletes(&self, target: NodeId) -> Result<bool, ClusterError> {
-        match self.gossip.get_node(&target).map(|state| state.meta.protocol_version) {
-            Some(0) | None => Err(ClusterError::Unavailable(format!(
-                "{target} has not announced its protocol yet"
-            ))),
-            Some(version) => Ok(version >= CONDITIONAL_DELETE_MIN_PROTOCOL_VERSION),
-        }
-    }
-
     /// Brings `target` to the current state of `hint`'s key. `Err` means the
     /// target itself did not answer, and the pass over its hints stops; a key
     /// the other replicas cannot settle now is [`Outcome::Later`].
     async fn deliver(&self, target: NodeId, hint: &HintEntry) -> Result<Outcome, ClusterError> {
-        if let HintKind::Purge { expected } = hint.kind {
-            return self.remove_generation(target, hint, expected).await;
+        if let HintKind::Multipart { upload_id } = &hint.kind {
+            return Ok(self.deliver_upload(target, hint, upload_id).await);
         }
-        let newest = match self.source.newest_version(&hint.bucket, &hint.key, target).await {
-            Ok(newest) => newest,
-            // The replica that did not answer may hold the newest version.
-            Err(e) => return Ok(Outcome::Later(e.to_string())),
+        let key = KeyRef {
+            bucket: &hint.bucket,
+            key: &hint.key,
         };
-        let newest = match (hint.kind, newest) {
-            // Older than the delete the target missed: a copy that missed it
-            // too, and the key is gone.
+        if let HintKind::Purge { expected } = &hint.kind {
+            return self.reconciler.remove_generation(target, key, *expected, hint.hlc).await;
+        }
+        let newest =
+            match self.reconciler.source().newest_version(&hint.bucket, &hint.key, target).await {
+                Ok(newest) => newest,
+                // The replica that did not answer may hold the newest version.
+                Err(e) => return Ok(Outcome::Later(e.to_string())),
+            };
+        let leaves_tombstone = crate::replica::delete_leaves_tombstone(&hint.bucket, &hint.key);
+        let newest = match (&hint.kind, newest) {
+            // Older than the delete the target missed, or nothing at all: the
+            // others missed it too, and the delete itself is the newest
+            // version of the key — or, for a key that keeps no tombstones,
+            // the key is gone.
             (
                 HintKind::Deleted,
-                NewestVersion::Copy { hlc, .. } | NewestVersion::ErasureCoded { hlc },
-            ) if hlc < hint.hlc => NewestVersion::Absent,
+                NewestVersion::Copy { hlc, .. }
+                | NewestVersion::ErasureCoded { hlc }
+                | NewestVersion::Tombstone { hlc },
+            ) if hlc < hint.hlc => {
+                if leaves_tombstone {
+                    NewestVersion::Tombstone { hlc: hint.hlc }
+                } else {
+                    NewestVersion::Absent
+                }
+            }
+            (HintKind::Deleted, NewestVersion::Absent) if leaves_tombstone => {
+                NewestVersion::Tombstone { hlc: hint.hlc }
+            }
             (_, newest) => newest,
         };
         if self.may_still_be_landing(hint, newest) {
@@ -370,24 +329,45 @@ impl HintDelivery {
                 "the write it names may still be landing on the other replicas".into(),
             ));
         }
-        match newest {
-            NewestVersion::NotAReplica | NewestVersion::ErasureCoded { .. } => {
-                Ok(Outcome::Superseded)
+        self.reconciler.bring(target, key, newest, hint.hlc).await
+    }
+
+    /// Brings `target` to the upload `upload_id` as its replicas hold it.
+    ///
+    /// The upload lives while a write quorum of either generation holds it
+    /// ([`crate::rebalance::MultipartTransfer::standing`]). A target holding
+    /// a session of a live upload needs nothing; one lacking it gets it from
+    /// this node, or from a replica holding it ([`crate::rebalance::MultipartTransfer::bring_to`]).
+    /// A closed upload — completed, its completion reaching the target as the
+    /// object's own write, or aborted — leaves nothing to deliver, except a
+    /// stale session the target still holds, which is aborted there: handed
+    /// over in a move, it would bring the closed upload back.
+    async fn deliver_upload(&self, target: NodeId, hint: &HintEntry, upload_id: &str) -> Outcome {
+        use crate::rebalance::{UploadHandedOver, UploadStanding};
+        let Some(transfer) = &self.multipart else {
+            return Outcome::Later("this node cannot hand native multipart uploads over".into());
+        };
+        match transfer.standing(&hint.bucket, &hint.key, upload_id).await {
+            UploadStanding::Unknown(why) => Outcome::Later(why),
+            UploadStanding::Closed { stale } if stale.contains(&target) => {
+                match transfer.abort_stale(target, &hint.bucket, &hint.key, upload_id).await {
+                    Ok(()) => Outcome::Delivered,
+                    Err(e) => Outcome::Later(e.to_string()),
+                }
             }
-            NewestVersion::Copy {
-                node,
-                confirmed: true,
-                ..
-            } => match self.source.read_copy(&hint.bucket, &hint.key, node).await {
-                Ok(copy) => self.write_copy(target, hint, copy).await,
-                Err(e) => Ok(Outcome::Later(e.to_string())),
-            },
-            NewestVersion::Copy {
-                hlc,
-                confirmed: false,
-                ..
-            } => self.settle_unconfirmed(target, hint, hlc).await,
-            NewestVersion::Absent => self.remove_stale(target, hint).await,
+            UploadStanding::Closed { .. } => Outcome::Superseded,
+            UploadStanding::Open { lacking, .. } if !lacking.contains(&target) => {
+                Outcome::Delivered
+            }
+            UploadStanding::Open { .. } => {
+                match transfer.bring_to(&hint.bucket, &hint.key, upload_id, Some(&[target])).await {
+                    UploadHandedOver::InStep { .. } => Outcome::Delivered,
+                    UploadHandedOver::Gone => Outcome::Superseded,
+                    UploadHandedOver::Failed(why) | UploadHandedOver::Damaged(why) => {
+                        Outcome::Later(why)
+                    }
+                }
+            }
         }
     }
 
@@ -402,225 +382,13 @@ impl HintDelivery {
         }
         let older = match newest {
             NewestVersion::Absent => true,
-            NewestVersion::Copy { hlc, .. } | NewestVersion::ErasureCoded { hlc } => hlc < hint.hlc,
+            NewestVersion::Copy { hlc, .. }
+            | NewestVersion::ErasureCoded { hlc }
+            | NewestVersion::Tombstone { hlc } => hlc < hint.hlc,
             NewestVersion::NotAReplica => false,
         };
         let settle = u64::try_from(self.settle_time.as_millis()).unwrap_or(u64::MAX);
         older && now_millis() < hint.created_at.saturating_add(settle)
-    }
-
-    /// The newest copy is held by fewer of the other replicas than a
-    /// confirmed write leaves behind, while another of them has no key: it
-    /// may be a copy that missed a delete the others took, and spreading it
-    /// would bring the deleted key back. Nothing is written. The hint counts
-    /// as delivered when the target already holds that version or a newer
-    /// one, and as ambiguous otherwise.
-    async fn settle_unconfirmed(
-        &self,
-        target: NodeId,
-        hint: &HintEntry,
-        newest: HlcTimestamp,
-    ) -> Result<Outcome, ClusterError> {
-        let head = self.head(target, hint).await?;
-        if head.epoch_mismatch {
-            return Ok(Outcome::Rejected(
-                "the target is on another topology epoch".into(),
-            ));
-        }
-        let held = head
-            .hlc
-            .as_ref()
-            .filter(|_| head.exists)
-            .map(HlcTimestamp::from_proto)
-            // A record without an HLC is reported with a made-up one.
-            .filter(|held| !held.is_made_up());
-        Ok(match held {
-            Some(held) if held >= newest => Outcome::Delivered,
-            _ => Outcome::Ambiguous(
-                "the newest copy is on fewer replicas than a confirmed write leaves, and another \
-                 replica has no key: it may have missed a delete"
-                    .into(),
-            ),
-        })
-    }
-
-    async fn head(
-        &self,
-        target: NodeId,
-        hint: &HintEntry,
-    ) -> Result<proto::HeadObjectResponse, ClusterError> {
-        let request = proto::HeadObjectRequest {
-            bucket: hint.bucket.clone(),
-            key: hint.key.clone(),
-            version_id: None,
-            topology_epoch: self.topology_epoch,
-        };
-        self.call(self.rpc_client.send_head(target, request)).await
-    }
-
-    async fn write_copy(
-        &self,
-        target: NodeId,
-        hint: &HintEntry,
-        copy: StoredCopy,
-    ) -> Result<Outcome, ClusterError> {
-        let Some(hlc) = copy.hlc else {
-            // The target's LWW weighs HLCs: a copy without one has no place
-            // among the target's versions.
-            return Ok(Outcome::Rejected("the current copy carries no HLC".into()));
-        };
-        if hlc.is_made_up() {
-            // The target's LWW weighs only a record that has an HLC, and would
-            // let this copy over the target's own record without one whatever
-            // its age. Ordered as a quorum read orders them, a target holding
-            // this version or a newer one is current.
-            let head = self.head(target, hint).await?;
-            if head.epoch_mismatch {
-                return Ok(Outcome::Rejected(
-                    "the target is on another topology epoch".into(),
-                ));
-            }
-            let held = head.hlc.as_ref().filter(|_| head.exists).map(HlcTimestamp::from_proto);
-            if held.is_some_and(|held| held >= hlc) {
-                return Ok(Outcome::Delivered);
-            }
-        }
-        let request = proto::WriteBlobRequest {
-            bucket: hint.bucket.clone(),
-            key: hint.key.clone(),
-            data: copy.data,
-            content_hash: copy.content_hash,
-            content_type: copy.content_type,
-            metadata: copy.metadata,
-            hlc: Some(hlc.to_proto()),
-            version_id: copy.version_id,
-            coordinator_id: self.local_node_id.to_bytes().to_vec(),
-            operation_id: uuid::Uuid::new_v4().as_u128().to_be_bytes().to_vec(),
-            topology_epoch: self.topology_epoch,
-        };
-        let response = self.call(self.rpc_client.send_write(target, request)).await?;
-        Ok(if response.success {
-            Outcome::Delivered
-        } else if response.epoch_mismatch {
-            Outcome::Rejected("the target is on another topology epoch".into())
-        } else {
-            Outcome::Rejected(response.error)
-        })
-    }
-
-    /// The key is gone from the other replicas: the target's record goes too,
-    /// if it is no newer than the operation the target missed.
-    async fn remove_stale(
-        &self,
-        target: NodeId,
-        hint: &HintEntry,
-    ) -> Result<Outcome, ClusterError> {
-        let head = self.head(target, hint).await?;
-        if head.epoch_mismatch {
-            return Ok(Outcome::Rejected(
-                "the target is on another topology epoch".into(),
-            ));
-        }
-        if !head.exists {
-            return Ok(Outcome::Delivered);
-        }
-        if head.erasure_coded {
-            return Ok(Outcome::Superseded);
-        }
-        let Some(generation) = head.hlc.as_ref().map(HlcTimestamp::from_proto) else {
-            return Ok(Outcome::Rejected("the target reported no HLC".into()));
-        };
-        if generation.is_made_up() {
-            return self.remove_made_up(target, hint, generation).await;
-        }
-        if generation > hint.hlc {
-            // Written after the operation it missed: the target is current.
-            return Ok(Outcome::Delivered);
-        }
-        self.remove_generation(target, hint, generation).await
-    }
-
-    /// The target's record is reported with a made-up HLC. Either it is a
-    /// copy repaired from a record written without an HLC, which stores the
-    /// made-up one and is removed by it like any other generation, or it
-    /// stores none, and the zero HLC matches it — and only it, so a write that
-    /// reaches the target meanwhile, carrying an HLC, is not touched. The
-    /// replica answers a conditional delete the same way whether it matched or
-    /// not: a second look tells whether the record is gone. A made-up HLC
-    /// orders a record only roughly; one newer than the missed operation is
-    /// left alone and not counted as current.
-    async fn remove_made_up(
-        &self,
-        target: NodeId,
-        hint: &HintEntry,
-        generation: HlcTimestamp,
-    ) -> Result<Outcome, ClusterError> {
-        if generation > hint.hlc {
-            return Ok(Outcome::Rejected(
-                "the target's record has a made-up HLC newer than the operation it missed".into(),
-            ));
-        }
-        for stored in [generation, HlcTimestamp::zero()] {
-            match self.remove_generation(target, hint, stored).await? {
-                Outcome::Delivered => {}
-                other => return Ok(other),
-            }
-            let head = self.head(target, hint).await?;
-            if head.epoch_mismatch {
-                return Ok(Outcome::Rejected(
-                    "the target is on another topology epoch".into(),
-                ));
-            }
-            let left =
-                head.exists && head.hlc.as_ref().map(HlcTimestamp::from_proto) == Some(generation);
-            if !left {
-                return Ok(Outcome::Delivered);
-            }
-        }
-        Ok(Outcome::Rejected(
-            "the target's record without an HLC stayed after a delete matching it".into(),
-        ))
-    }
-
-    /// Removes the target's record if it is exactly `generation`.
-    async fn remove_generation(
-        &self,
-        target: NodeId,
-        hint: &HintEntry,
-        generation: HlcTimestamp,
-    ) -> Result<Outcome, ClusterError> {
-        if !self.takes_conditional_deletes(target)? {
-            return Ok(Outcome::Rejected(
-                "the target is too old to delete one generation only".into(),
-            ));
-        }
-        let request = proto::DeleteBlobRequest {
-            bucket: hint.bucket.clone(),
-            key: hint.key.clone(),
-            hlc: Some(hint.hlc.to_proto()),
-            coordinator_id: self.local_node_id.to_bytes().to_vec(),
-            operation_id: uuid::Uuid::new_v4().as_u128().to_be_bytes().to_vec(),
-            topology_epoch: self.topology_epoch,
-            version_id: None,
-            expected_source_hlc: Some(generation.to_proto()),
-        };
-        let response = self.call(self.rpc_client.send_delete(target, request)).await?;
-        Ok(if response.success {
-            Outcome::Delivered
-        } else if response.epoch_mismatch {
-            Outcome::Rejected("the target is on another topology epoch".into())
-        } else {
-            Outcome::Rejected(response.error)
-        })
-    }
-
-    async fn call<T>(
-        &self,
-        call: impl std::future::Future<Output = Result<T, ClusterError>>,
-    ) -> Result<T, ClusterError> {
-        tokio::time::timeout(self.call_timeout, call)
-            .await
-            .map_err(|_| ClusterError::WriteTimeout(self.call_timeout))?
     }
 }
 
@@ -957,8 +725,8 @@ impl HintedHandoffManager {
                 continue;
             }
             let key = (hint.bucket.clone(), hint.key.clone());
-            let repeats_a_key =
-                !matches!(hint.kind, HintKind::Purge { .. }) && delivered_keys.contains(&key);
+            let repeats_a_key = matches!(hint.kind, HintKind::Written | HintKind::Deleted)
+                && delivered_keys.contains(&key);
             if repeats_a_key {
                 // Already brought to a state newer than this hint's operation.
                 counts.delivered += 1;
@@ -977,7 +745,9 @@ impl HintedHandoffManager {
                     if delivered_keys.len() >= MAX_KEYS_REMEMBERED {
                         delivered_keys.clear();
                     }
-                    delivered_keys.insert(key);
+                    if !matches!(hint.kind, HintKind::Multipart { .. }) {
+                        delivered_keys.insert(key);
+                    }
                 }
                 Outcome::Superseded => counts.superseded += 1,
                 Outcome::Rejected(reason) => {
@@ -1059,6 +829,30 @@ impl HintedHandoffManager {
             debug!(%peer, delivered = counts.delivered, "hints delivered");
         }
         stopped.map_or(Ok(()), |(_, e)| Err(e))
+    }
+
+    /// The nodes this node keeps hints for: on disk, or handed to
+    /// [`store`](Self::store) and not yet written. A range of a growing pool
+    /// is verified only once no hint for its new owners waits anywhere.
+    pub async fn targets_with_hints(&self) -> Vec<NodeId> {
+        let mut targets: Vec<NodeId> = self
+            .queue
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .hints
+            .iter()
+            .map(|(target, _)| *target)
+            .collect();
+        let logs = self.logs.lock().await;
+        targets.extend(
+            logs.targets
+                .iter()
+                .filter(|(_, log)| log.pending() > 0)
+                .map(|(target, _)| *target),
+        );
+        targets.sort_unstable_by_key(|node| node.0);
+        targets.dedup();
+        targets
     }
 
     /// Hints waiting on disk for `target`.
@@ -1487,7 +1281,9 @@ mod tests {
     use super::*;
     use crate::cluster_metrics::PeerNames;
     use crate::gossip::GossipHandle;
+    use crate::protocol::CONDITIONAL_DELETE_MIN_PROTOCOL_VERSION;
     use crate::test_metrics::TestMetrics;
+    use s4_core::storage::EtagRank;
 
     const PENDING: &str = "s4_hints_pending";
     const STORED: &str = "s4_hints_stored_total";
@@ -1517,6 +1313,64 @@ mod tests {
 
     fn hint(key: &str) -> HintEntry {
         HintEntry::written("bucket", key, hlc(10))
+    }
+
+    #[test]
+    fn multipart_hint_roundtrips_without_changing_existing_variant_encodings() {
+        #[derive(Serialize)]
+        enum LegacyKind {
+            Written,
+            Deleted,
+            Purge { expected: HlcTimestamp },
+        }
+        for (legacy, current) in [
+            (LegacyKind::Written, HintKind::Written),
+            (LegacyKind::Deleted, HintKind::Deleted),
+            (
+                LegacyKind::Purge { expected: hlc(10) },
+                HintKind::Purge { expected: hlc(10) },
+            ),
+        ] {
+            let bytes = bincode::serialize(&legacy).unwrap();
+            assert_eq!(bincode::deserialize::<HintKind>(&bytes).unwrap(), current);
+            assert_eq!(bincode::serialize(&current).unwrap(), bytes);
+        }
+        let hint = HintEntry::multipart("bucket", "key", "upload-a", hlc(10));
+        assert_eq!(
+            hint.kind,
+            HintKind::Multipart {
+                upload_id: "upload-a".into()
+            }
+        );
+        let encoded = encode_record(&hint).unwrap();
+        assert_eq!(read_records(&encoded), (vec![hint], encoded.len()));
+    }
+
+    #[tokio::test]
+    async fn multipart_hints_survive_object_delivery_and_restart_without_coalescing_uploads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = Target::start(19911, 1).await;
+        let source = ScriptedSource::answering(NewestVersion::Absent);
+        let (manager, delivery) = delivering(tmp.path(), target.state.clone(), source.clone());
+        let delivery = delivery.with_settle_time(Duration::ZERO);
+        manager.store(TARGET, HintEntry::written("bucket", "key", at(10))).await;
+        let first = HintEntry::multipart("bucket", "key", "upload-a", at(10));
+        let second = HintEntry::multipart("bucket", "key", "upload-b", at(20));
+        manager.store(TARGET, first.clone()).await;
+        manager.store(TARGET, second.clone()).await;
+        assert!(
+            matches!(delivery.deliver(TARGET, &first).await.unwrap(), Outcome::Later(reason)
+            if reason.contains("multipart"))
+        );
+        manager.deliver(&delivery).await;
+        assert_eq!(
+            read_log(&config(tmp.path()), 42),
+            vec![first.clone(), second.clone()]
+        );
+        drop(manager);
+        let (restarted, delivery) = delivering(tmp.path(), target.state.clone(), source);
+        restarted.deliver(&delivery).await;
+        assert_eq!(read_log(&config(tmp.path()), 42), vec![first, second]);
     }
 
     /// Every hint the log of `target` holds, oldest segment first.
@@ -1794,7 +1648,7 @@ mod tests {
     use crate::replica::{ReplicaReadHandler, ReplicaWriteHandler};
     use crate::rpc::server::{NodeRpcServer, RpcServerConfig, RpcServerHandle};
     use s4_core::storage::BitcaskStorageEngine;
-    use s4_core::StorageEngine;
+    use s4_core::{KeyVersion, StorageEngine};
 
     const TARGET: NodeId = NodeId(42);
     const DELIVERED: &str = "s4_hints_delivered_total";
@@ -1855,6 +1709,16 @@ mod tests {
             }
             let newest = *self.newest.lock().unwrap();
             newest.ok_or_else(|| ClusterError::Unavailable("replica 7 did not answer".into()))
+        }
+
+        async fn key_versions(
+            &self,
+            _bucket: &str,
+            _key: &str,
+        ) -> Result<crate::repair::reconcile::KeyVersions, ClusterError> {
+            Err(ClusterError::Unavailable(
+                "hint delivery reads newest versions only".into(),
+            ))
         }
 
         async fn read_copy(
@@ -1956,6 +1820,14 @@ mod tests {
             let (data, record) = self.storage.get_object("bucket", key).await.ok()?;
             Some((record.hlc_timestamp, data))
         }
+
+        /// The HLC of the tombstone the target holds for `key`, if any.
+        async fn tombstone_of(&self, key: &str) -> Option<HlcTimestamp> {
+            match self.storage.key_version("bucket", key).await.unwrap() {
+                KeyVersion::Tombstone(record) => Some(HlcTimestamp::of_record(&record)),
+                _ => None,
+            }
+        }
     }
 
     /// A manager and a delivery reaching `target` as gossip describes it,
@@ -1999,6 +1871,7 @@ mod tests {
         StoredCopy {
             hlc: Some(hlc),
             data: data.to_vec(),
+            etag: String::new(),
             content_hash: vec![0u8; 32],
             content_type: "text/plain".into(),
             metadata: HashMap::new(),
@@ -2031,6 +1904,7 @@ mod tests {
         let target = Target::start(19791, 1).await;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2060,6 +1934,7 @@ mod tests {
         target.holds("key", b"version 30", at(30)).await;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2112,6 +1987,7 @@ mod tests {
         target.holds("key", b"version 20", at(20)).await;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2187,6 +2063,7 @@ mod tests {
         let target = Target::start(19797, 2).await;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2229,6 +2106,7 @@ mod tests {
 
         *source.newest.lock().unwrap() = Some(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         });
@@ -2275,6 +2153,7 @@ mod tests {
         dead.status = NodeStatus::Dead;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2298,6 +2177,7 @@ mod tests {
         let target = Target::start(19801, 1).await;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(30),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2324,6 +2204,7 @@ mod tests {
         let target = Target::start(19802, 1).await;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2352,6 +2233,7 @@ mod tests {
         let target = Target::start(19803, 1).await;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2397,6 +2279,7 @@ mod tests {
         let metrics = TestMetrics::install();
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2419,6 +2302,7 @@ mod tests {
         let target = Target::start(19805, 1).await;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2459,9 +2343,9 @@ mod tests {
 
     /// A record written without an HLC — stored before its node joined the
     /// cluster — is reported with one made up from its modification time. One
-    /// no newer than the delete the target missed is removed by the zero HLC,
-    /// which matches only a record that still stores none; a newer one orders
-    /// only roughly, and is left alone.
+    /// no newer than the delete the target missed gives way to the delete's
+    /// tombstone, which turns away an older copy arriving later; a newer one
+    /// orders only roughly, and is left alone.
     #[tokio::test]
     async fn a_target_record_without_an_hlc_is_removed_by_the_delete_it_missed() {
         let metrics = TestMetrics::install();
@@ -2493,6 +2377,13 @@ mod tests {
         manager.deliver(&delivery).await;
 
         assert_eq!(target.copy_of("older").await, None);
+        assert_eq!(target.tombstone_of("older").await, Some(at(u64::MAX / 2)));
+        target.holds("older", b"a copy older than the delete", at(5)).await;
+        assert_eq!(
+            target.copy_of("older").await,
+            None,
+            "the tombstone turns it away"
+        );
         assert!(target.copy_of("newer").await.is_some());
         assert_eq!(metrics.value(DELIVERED, &[]), Some(1.0));
         assert_eq!(metrics.value(DROPPED, &[("reason", "rejected")]), Some(1.0));
@@ -2500,7 +2391,7 @@ mod tests {
     }
 
     /// A copy read repair took from a record written without an HLC stores
-    /// the made-up one, node 0. It is removed by that HLC like any other
+    /// the made-up one, node 0. It gives way to the tombstone like any other
     /// generation when it is no newer than the delete the target missed; a
     /// newer one orders only roughly, and is left alone.
     #[tokio::test]
@@ -2520,6 +2411,7 @@ mod tests {
         manager.deliver(&delivery).await;
 
         assert_eq!(target.copy_of("older").await, None);
+        assert_eq!(target.tombstone_of("older").await, Some(at(30)));
         assert_eq!(
             target.copy_of("newer").await,
             Some((40, b"repaired at 40".to_vec()))
@@ -2555,6 +2447,7 @@ mod tests {
             .unwrap();
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: made_up,
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2592,6 +2485,7 @@ mod tests {
         target.holds("key", b"version 30", at(30)).await;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2644,6 +2538,7 @@ mod tests {
         let target = Target::start(19860, 1).await;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: false,
         })
@@ -2674,6 +2569,7 @@ mod tests {
         target.holds("newer", b"version 30", at(30)).await;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: false,
         });
@@ -2703,6 +2599,7 @@ mod tests {
         let target = Target::start(19862, 1).await;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2751,6 +2648,7 @@ mod tests {
         let target = Target::start(19866, 1).await;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2792,6 +2690,7 @@ mod tests {
         let target = Target::start(19865, 1).await;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2824,6 +2723,7 @@ mod tests {
         let target = Target::start(19863, 1).await;
         let source = ScriptedSource::answering(NewestVersion::Copy {
             hlc: at(20),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         })
@@ -2879,6 +2779,7 @@ mod tests {
         // An older copy is no proof either.
         *source.newest.lock().unwrap() = Some(NewestVersion::Copy {
             hlc: at(10),
+            etag: EtagRank::NONE,
             node: NodeId(7),
             confirmed: true,
         });

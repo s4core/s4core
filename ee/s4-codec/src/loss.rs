@@ -80,6 +80,25 @@ impl LossTolerance {
         usize::from(self.k) + usize::from(self.parity.total_parity())
     }
 
+    /// The most shards a chunk can lose, whichever they are, and still decode.
+    ///
+    /// For Reed-Solomon that is `m`. For LRC the count alone does not decide,
+    /// so every pattern of each count is put to the decoder, from one loss up,
+    /// and the answer is the count before the first pattern it cannot rebuild.
+    /// This is the number of node failures an erasure set of the profile is
+    /// guaranteed to survive, one shard per node.
+    pub fn guaranteed_losses(&self) -> u8 {
+        let total = self.total_shards();
+        let mut guaranteed = 0u8;
+        for count in 1..=total {
+            if !every_pattern_of(total, count, |lost| self.can_decode(lost)) {
+                break;
+            }
+            guaranteed = u8::try_from(count).unwrap_or(u8::MAX);
+        }
+        guaranteed
+    }
+
     /// Whether `decode_chunk` rebuilds a chunk after losing the slots marked
     /// in `lost`.
     ///
@@ -170,10 +189,76 @@ impl LossTolerance {
     }
 }
 
+/// Whether `check` holds for every way of losing `count` of `total` slots.
+fn every_pattern_of(total: usize, count: usize, mut check: impl FnMut(&[bool]) -> bool) -> bool {
+    // The lost slots, in increasing order, stepped through every combination.
+    let mut chosen: Vec<usize> = (0..count).collect();
+    let mut lost = vec![false; total];
+    loop {
+        lost.iter_mut().for_each(|slot| *slot = false);
+        for &slot in &chosen {
+            lost[slot] = true;
+        }
+        if !check(&lost) {
+            return false;
+        }
+        // The rightmost slot that can still move right, and everything after
+        // it packed behind it.
+        let Some(at) = (0..count).rev().find(|&i| chosen[i] < total - count + i) else {
+            return true;
+        };
+        chosen[at] += 1;
+        for i in at + 1..count {
+            chosen[i] = chosen[i - 1] + 1;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::{build_codec, Shard};
+
+    /// Reed-Solomon survives `m` losses; LRC survives one more than its
+    /// global parities, which every pattern of each count proves.
+    #[test]
+    fn the_guaranteed_losses_of_every_standard_profile() {
+        let guaranteed: Vec<(String, u8)> = standard_profiles()
+            .iter()
+            .map(|profile| {
+                (
+                    profile.name.clone(),
+                    LossTolerance::new(profile).unwrap().guaranteed_losses(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            guaranteed,
+            [
+                ("ec-rs-small".to_string(), 2),
+                ("ec-rs-standard".to_string(), 3),
+                ("ec-rs-dense".to_string(), 3),
+                ("ec-lrc-small".to_string(), 2),
+                ("ec-lrc-standard".to_string(), 3),
+                ("ec-lrc-dense".to_string(), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_pattern_is_tried_once() {
+        let mut seen = Vec::new();
+        assert!(every_pattern_of(5, 2, |lost| {
+            seen.push(lost.to_vec());
+            true
+        }));
+        assert_eq!(seen.len(), 10);
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 10);
+        assert!(seen.iter().all(|lost| lost.iter().filter(|l| **l).count() == 2));
+        assert!(!every_pattern_of(4, 1, |lost| !lost[3]));
+    }
 
     fn standard_profiles() -> [EcProfileSnapshot; 6] {
         [

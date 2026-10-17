@@ -21,7 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use s4_core::types::composite::{MultipartPartRecord, MultipartUploadSession};
-use s4_core::{IndexRecord, StorageError};
+use s4_core::{IndexRecord, KeyVersion, StorageError};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio_util::io::StreamReader;
@@ -92,6 +92,42 @@ pub trait MultipartReplicaStorage: Send + Sync {
 
     /// Abort a native multipart upload.
     async fn abort_multipart_native(&self, upload_id: &str) -> Result<(), StorageError>;
+
+    /// What the storage holds for `bucket/key`: an object, a tombstone or
+    /// nothing. A completion is issued with an HLC above the version it
+    /// replaces.
+    async fn current_key_version(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<KeyVersion, StorageError>;
+
+    /// A page of the upload sessions this node holds, in upload ID order,
+    /// after `after` when given. The move of a grown pool hands the open ones
+    /// to their new replicas. A storage that cannot list them says so.
+    async fn list_multipart_sessions_after(
+        &self,
+        _after: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<MultipartUploadSession>, StorageError> {
+        Err(StorageError::InvalidOperation {
+            operation: "list multipart sessions".into(),
+            reason: "not supported by this storage".into(),
+        })
+    }
+
+    /// The bytes of one uploaded part with its record, checked against the
+    /// record's CRC32 and SHA-256. A storage that cannot read them says so.
+    async fn read_multipart_part(
+        &self,
+        _upload_id: &str,
+        _part_number: u32,
+    ) -> Result<(MultipartPartRecord, Vec<u8>), StorageError> {
+        Err(StorageError::InvalidOperation {
+            operation: "read multipart part".into(),
+            reason: "not supported by this storage".into(),
+        })
+    }
 }
 
 /// Handles native multipart operations on a replica node.
@@ -99,6 +135,7 @@ pub struct ReplicaMultipartHandler {
     storage: Arc<dyn MultipartReplicaStorage>,
     idempotency: Arc<IdempotencyTracker>,
     topology_epoch: u64,
+    placement_generation: crate::placement_fence::PlacementFloor,
 }
 
 impl ReplicaMultipartHandler {
@@ -112,7 +149,22 @@ impl ReplicaMultipartHandler {
             storage,
             idempotency,
             topology_epoch,
+            placement_generation: crate::placement_fence::PlacementFloor::default(),
         }
+    }
+
+    /// Set the minimum pool placement generation admitted by this handler.
+    /// Zero preserves legacy admission.
+    pub fn with_placement_generation(mut self, minimum: u64) -> Self {
+        self.placement_generation = crate::placement_fence::PlacementFloor::new(minimum);
+        self
+    }
+
+    /// The handler admitting what `floor` admits, as it rises when the
+    /// pool's move begins.
+    pub fn with_placement_floor(mut self, floor: crate::placement_fence::PlacementFloor) -> Self {
+        self.placement_generation = floor;
+        self
     }
 
     /// Handle a create-session request.
@@ -120,6 +172,14 @@ impl ReplicaMultipartHandler {
         &self,
         request: &proto::CreateMultipartUploadReplicaRequest,
     ) -> Result<proto::CreateMultipartUploadReplicaResponse, ClusterError> {
+        crate::placement_fence::check(
+            self.placement_generation.get(),
+            request.placement_generation,
+            &request.bucket,
+            &request.key,
+            false,
+            None,
+        )?;
         if let Some(err) = self.check_create_epoch(request.topology_epoch) {
             return Ok(err);
         }
@@ -173,6 +233,14 @@ impl ReplicaMultipartHandler {
             }
         };
 
+        crate::placement_fence::check(
+            self.placement_generation.get(),
+            header.placement_generation,
+            "",
+            "",
+            false,
+            None,
+        )?;
         if let Some(err) = self.check_upload_part_epoch(header.topology_epoch) {
             return Ok(err);
         }
@@ -285,6 +353,7 @@ impl ReplicaMultipartHandler {
                     session: Vec::new(),
                     part_records: Vec::new(),
                     epoch_mismatch: false,
+                    key_hlc: None,
                 });
             }
         };
@@ -296,11 +365,19 @@ impl ReplicaMultipartHandler {
                 session: Vec::new(),
                 part_records: Vec::new(),
                 epoch_mismatch: false,
+                key_hlc: None,
             });
         }
 
         let session_bytes =
             bincode::serialize(&session).map_err(|e| ClusterError::Codec(e.to_string()))?;
+        let key_hlc = self
+            .storage
+            .current_key_version(&request.bucket, &request.key)
+            .await
+            .map_err(|e| ClusterError::Storage(e.to_string()))?
+            .record()
+            .map(|record| crate::hlc::HlcTimestamp::of_record(record).to_proto());
         let parts = self
             .storage
             .list_multipart_parts(&request.upload_id)
@@ -317,6 +394,7 @@ impl ReplicaMultipartHandler {
             session: session_bytes,
             part_records,
             epoch_mismatch: false,
+            key_hlc,
         })
     }
 
@@ -325,6 +403,14 @@ impl ReplicaMultipartHandler {
         &self,
         request: &proto::CompleteMultipartUploadReplicaRequest,
     ) -> Result<proto::CompleteMultipartUploadReplicaResponse, ClusterError> {
+        crate::placement_fence::check(
+            self.placement_generation.get(),
+            request.placement_generation,
+            &request.bucket,
+            &request.key,
+            false,
+            None,
+        )?;
         if let Some(err) = self.check_complete_epoch(request.topology_epoch) {
             return Ok(err);
         }
@@ -417,6 +503,14 @@ impl ReplicaMultipartHandler {
         &self,
         request: &proto::AbortMultipartUploadReplicaRequest,
     ) -> Result<proto::AbortMultipartUploadReplicaResponse, ClusterError> {
+        crate::placement_fence::check(
+            self.placement_generation.get(),
+            request.placement_generation,
+            "",
+            "",
+            false,
+            None,
+        )?;
         if let Some(err) = self.check_abort_epoch(request.topology_epoch) {
             return Ok(err);
         }
@@ -516,6 +610,7 @@ impl ReplicaMultipartHandler {
                 session: Vec::new(),
                 part_records: Vec::new(),
                 epoch_mismatch: true,
+                key_hlc: None,
             });
         }
         None
@@ -609,4 +704,100 @@ fn parse_operation_id(bytes: &[u8]) -> Result<u128, ClusterError> {
     Ok(u128::from_be_bytes(bytes.try_into().map_err(|_| {
         ClusterError::Codec("invalid operation_id".to_string())
     })?))
+}
+
+#[cfg(test)]
+pub(crate) mod fencing_tests {
+    use super::*;
+
+    pub(crate) struct UntouchedStorage;
+
+    #[async_trait]
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    impl MultipartReplicaStorage for UntouchedStorage {
+        async fn create_multipart_session(
+            &self,
+            upload_id: &str,
+            bucket: &str,
+            key: &str,
+            content_type: &str,
+            metadata: &HashMap<String, String>,
+        ) -> Result<(), StorageError> {
+            panic!("stale mutation reached storage")
+        }
+        async fn get_multipart_session(
+            &self,
+            upload_id: &str,
+        ) -> Result<MultipartUploadSession, StorageError> {
+            panic!("stale mutation reached storage")
+        }
+        async fn upload_multipart_part_streaming(
+            &self,
+            upload_id: &str,
+            part_number: u32,
+            reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+            content_length: u64,
+        ) -> Result<MultipartPartRecord, StorageError> {
+            panic!("stale mutation reached storage")
+        }
+        async fn list_multipart_parts(
+            &self,
+            upload_id: &str,
+        ) -> Result<Vec<MultipartPartRecord>, StorageError> {
+            panic!("stale mutation reached storage")
+        }
+        async fn mark_session_completing(
+            &self,
+            upload_id: &str,
+        ) -> Result<MultipartUploadSession, StorageError> {
+            panic!("stale mutation reached storage")
+        }
+        async fn revert_session_to_open(&self, upload_id: &str) -> Result<(), StorageError> {
+            panic!("stale mutation reached storage")
+        }
+        async fn complete_multipart_native(
+            &self,
+            bucket: &str,
+            key: &str,
+            upload_id: &str,
+            selected_parts: &[MultipartPartRecord],
+            s3_etag: &str,
+            content_type: &str,
+            metadata: &HashMap<String, String>,
+        ) -> Result<IndexRecord, StorageError> {
+            panic!("stale mutation reached storage")
+        }
+        async fn abort_multipart_native(&self, upload_id: &str) -> Result<(), StorageError> {
+            panic!("stale mutation reached storage")
+        }
+        async fn current_key_version(
+            &self,
+            bucket: &str,
+            key: &str,
+        ) -> Result<KeyVersion, StorageError> {
+            panic!("stale mutation reached storage")
+        }
+    }
+
+    #[tokio::test]
+    async fn placement_fence_refuses_multipart_before_storage_or_idempotency() {
+        let handler = ReplicaMultipartHandler::new(
+            Arc::new(UntouchedStorage),
+            Arc::new(IdempotencyTracker::new()),
+            1,
+        )
+        .with_placement_generation(2);
+        assert!(matches!(
+            handler.handle_create(&Default::default()).await,
+            Err(ClusterError::PlacementGenerationFenced { .. })
+        ));
+        assert!(matches!(
+            handler.handle_complete(&Default::default()).await,
+            Err(ClusterError::PlacementGenerationFenced { .. })
+        ));
+        assert!(matches!(
+            handler.handle_abort(&Default::default()).await,
+            Err(ClusterError::PlacementGenerationFenced { .. })
+        ));
+    }
 }

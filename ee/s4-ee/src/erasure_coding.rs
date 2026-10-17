@@ -345,6 +345,15 @@ impl EcProfile {
         self.k
     }
 
+    /// Node failures an erasure set of this profile is guaranteed to
+    /// survive: the most shards a chunk can lose, whichever they are, and
+    /// still decode, as the profile's decoder answers it.
+    pub fn guaranteed_node_failures(&self) -> Result<u8, EcConfigError> {
+        let tolerance = s4_codec::LossTolerance::new(&self.codec_snapshot())
+            .map_err(|error| invalid_profile(&self.name, error.to_string()))?;
+        Ok(tolerance.guaranteed_losses())
+    }
+
     /// Snapshot used by the runtime-independent EE codec crate.
     pub fn codec_snapshot(&self) -> s4_codec::EcProfileSnapshot {
         s4_codec::EcProfileSnapshot::from(self)
@@ -2369,6 +2378,20 @@ pub struct EcPoolLayout {
     pub builder: ErasureSetBuilder,
 }
 
+impl EcPoolLayout {
+    /// Node failures every erasure set of the pool is guaranteed to survive
+    /// ([`EcProfile::guaranteed_node_failures`]): what the pool promises, and
+    /// what its bucket metadata is placed to survive.
+    pub fn guaranteed_node_failures(&self) -> Result<u8, EcConfigError> {
+        let mut guaranteed: Option<u8> = None;
+        for set in self.sets.sets() {
+            let failures = set.profile.guaranteed_node_failures()?;
+            guaranteed = Some(guaranteed.map_or(failures, |g| g.min(failures)));
+        }
+        Ok(guaranteed.unwrap_or(0))
+    }
+}
+
 /// Validate an EC pool from the process environment.
 ///
 /// `nodes` must preserve the configured pool-node names so topology labels can
@@ -2895,6 +2918,22 @@ mod tests {
         assert_eq!(profile.required_shard_acks_inline(), 9);
         assert_eq!(profile.manifest_quorum(), 5);
         assert_eq!(profile.read_minimum_normal(), 6);
+    }
+
+    #[test]
+    fn the_guaranteed_node_failures_of_the_standard_profiles() {
+        let failures: Vec<u8> = [
+            EcProfile::rs_small(),
+            EcProfile::rs_standard(),
+            EcProfile::rs_dense(),
+            EcProfile::lrc_small(),
+            EcProfile::lrc_standard(),
+            EcProfile::lrc_dense(),
+        ]
+        .iter()
+        .map(|profile| profile.guaranteed_node_failures().unwrap())
+        .collect();
+        assert_eq!(failures, [2, 3, 3, 2, 3, 3]);
     }
 
     #[test]

@@ -16,9 +16,16 @@
 //!
 //! Implements S3-compatible bucket configuration operations:
 //! - CORS (GET/PUT/DELETE /{bucket}?cors)
-//! - Versioning (GET/PUT /{bucket}?versioning)
+//! - Versioning (GET/PUT /{bucket}?versioning; not supported in cluster mode)
 //! - Lifecycle (GET/PUT/DELETE /{bucket}?lifecycle)
+//! - Policy (GET/PUT/DELETE /{bucket}?policy, GET /{bucket}?policyStatus)
+//! - Encryption (GET/PUT/DELETE /{bucket}?encryption)
 //! - Location (GET /{bucket}?location)
+//!
+//! In cluster mode CORS, lifecycle, policy and encryption are written and
+//! read through the quorums, as the bucket itself, and a configuration
+//! belongs to the bucket it was written to: one left from an earlier bucket
+//! of the same name reads as not set (see `read_bucket_config`).
 
 use axum::{
     body::{Body, Bytes},
@@ -26,19 +33,23 @@ use axum::{
     http::{header, StatusCode},
     response::{IntoResponse, Response},
 };
+use s4_cluster::{BucketConfigRead, HlcTimestamp, OwnConfig};
 use s4_core::{StorageEngine, VersioningStatus};
-use s4_features::cors::{cors_to_xml, parse_cors_xml, CORSConfiguration};
-use s4_features::lifecycle::{lifecycle_to_xml, parse_lifecycle_xml, LifecycleConfiguration};
+use s4_features::cors::{cors_to_xml, parse_cors_xml};
+use s4_features::lifecycle::{lifecycle_to_xml, parse_lifecycle_xml};
 use std::collections::HashMap;
 use tracing::{debug, error, info, warn};
 
 use crate::s3::errors::S3Error;
 use crate::server::AppState;
 
-// Storage key prefixes for bucket configurations
-const CORS_CONFIG_PREFIX: &str = "__s4_bucket_cors_";
-const VERSIONING_CONFIG_PREFIX: &str = "__s4_bucket_versioning_";
-const LIFECYCLE_CONFIG_PREFIX: &str = "__s4_bucket_lifecycle_";
+use s4_core::types::{
+    CORS_CONFIG_KEY_PREFIX as CORS_CONFIG_PREFIX,
+    ENCRYPTION_CONFIG_KEY_PREFIX as ENCRYPTION_CONFIG_PREFIX,
+    LIFECYCLE_CONFIG_KEY_PREFIX as LIFECYCLE_CONFIG_PREFIX,
+    POLICY_CONFIG_KEY_PREFIX as POLICY_CONFIG_PREFIX, SYSTEM_BUCKET,
+    VERSIONING_CONFIG_KEY_PREFIX as VERSIONING_CONFIG_PREFIX,
+};
 
 // ============================================================================
 // CORS Handlers
@@ -58,32 +69,10 @@ pub async fn get_bucket_cors(
 ) -> impl IntoResponse {
     debug!("GetBucketCors: {}", bucket);
 
-    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
-        return resp;
-    }
-    let storage = state.storage.read().await;
-
-    // Check if bucket exists (standalone; cluster mode checked above)
-    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
-        return resp;
-    }
-
-    // Get CORS configuration
-    let cors_key = format!("{}{}", CORS_CONFIG_PREFIX, bucket);
-    match storage.get_object("__system__", &cors_key).await {
-        Ok((data, _)) => {
-            // Return stored XML directly
-            let xml = String::from_utf8_lossy(&data).to_string();
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/xml")
-                .body(Body::from(xml))
-                .unwrap()
-        }
-        Err(_) => {
-            // No CORS configuration
-            S3Error::NoSuchCORSConfiguration.into_response()
-        }
+    match read_bucket_config(&state, &bucket, CORS_CONFIG_PREFIX).await {
+        Ok(Some(data)) => config_response(data, "application/xml"),
+        Ok(None) => S3Error::NoSuchCORSConfiguration.into_response(),
+        Err(resp) => resp,
     }
 }
 
@@ -95,6 +84,7 @@ pub async fn get_bucket_cors(
 ///
 /// - 200 OK if CORS configuration saved successfully
 /// - 400 Bad Request if invalid CORS configuration
+#[allow(clippy::result_large_err)]
 pub async fn put_bucket_cors(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
@@ -102,50 +92,26 @@ pub async fn put_bucket_cors(
 ) -> impl IntoResponse {
     info!("PutBucketCors: {}", bucket);
 
-    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+    let stored = write_bucket_config(
+        &state,
+        &bucket,
+        CORS_CONFIG_PREFIX,
+        "application/xml",
+        || {
+            let config = parse_cors_xml(&String::from_utf8_lossy(&body)).map_err(|e| {
+                error!("Failed to parse CORS XML: {:?}", e);
+                S3Error::MalformedXML.into_response()
+            })?;
+            config.validate().map_err(|e| {
+                error!("Invalid CORS configuration: {:?}", e);
+                S3Error::InvalidRequest(e.to_string()).into_response()
+            })?;
+            Ok(cors_to_xml(&config).into_bytes())
+        },
+    )
+    .await;
+    if let Err(resp) = stored {
         return resp;
-    }
-    let storage = state.storage.read().await;
-
-    // Check if bucket exists (standalone; cluster mode checked above)
-    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
-        return resp;
-    }
-
-    // Parse and validate CORS configuration
-    let xml = String::from_utf8_lossy(&body);
-    let config = match parse_cors_xml(&xml) {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to parse CORS XML: {:?}", e);
-            return S3Error::MalformedXML.into_response();
-        }
-    };
-
-    if let Err(e) = config.validate() {
-        error!("Invalid CORS configuration: {:?}", e);
-        return S3Error::InvalidRequest(e.to_string()).into_response();
-    }
-
-    // Store CORS configuration
-    let cors_key = format!("{}{}", CORS_CONFIG_PREFIX, bucket);
-    let cors_xml = cors_to_xml(&config);
-    if let Err(e) = storage
-        .put_object(
-            "__system__",
-            &cors_key,
-            cors_xml.as_bytes(),
-            "application/xml",
-            &HashMap::new(),
-        )
-        .await
-    {
-        error!("Failed to store CORS configuration: {:?}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to store CORS configuration",
-        )
-            .into_response();
     }
 
     info!("CORS configuration saved for bucket: {}", bucket);
@@ -166,19 +132,9 @@ pub async fn delete_bucket_cors(
 ) -> impl IntoResponse {
     info!("DeleteBucketCors: {}", bucket);
 
-    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+    if let Err(resp) = delete_bucket_config(&state, &bucket, CORS_CONFIG_PREFIX).await {
         return resp;
     }
-    let storage = state.storage.read().await;
-
-    // Check if bucket exists (standalone; cluster mode checked above)
-    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
-        return resp;
-    }
-
-    // Delete CORS configuration
-    let cors_key = format!("{}{}", CORS_CONFIG_PREFIX, bucket);
-    let _ = storage.delete_object("__system__", &cors_key).await;
 
     info!("CORS configuration deleted for bucket: {}", bucket);
     StatusCode::NO_CONTENT.into_response()
@@ -197,6 +153,9 @@ pub async fn delete_bucket_cors(
 /// # Returns
 ///
 /// - 200 OK with XML versioning configuration
+///
+/// In cluster mode the configuration is always empty: cluster mode keeps no
+/// versions, whatever a node stored before it refused to turn them on.
 pub async fn get_bucket_versioning(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
@@ -213,7 +172,11 @@ pub async fn get_bucket_versioning(
         return resp;
     }
 
-    let status = get_versioning_status_internal(&*storage, &bucket).await;
+    let status = if state.is_cluster_mode() {
+        VersioningStatus::Unversioned
+    } else {
+        get_versioning_status_internal(&*storage, &bucket).await
+    };
     let xml = versioning_configuration_xml(status);
 
     Response::builder()
@@ -234,6 +197,7 @@ pub async fn get_bucket_versioning(
 ///
 /// - 200 OK if versioning configuration saved successfully
 /// - 400 Bad Request if invalid versioning configuration or trying to disable versioning
+/// - 501 Not Implemented in cluster mode, which keeps no versions
 pub async fn put_bucket_versioning(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
@@ -241,6 +205,12 @@ pub async fn put_bucket_versioning(
 ) -> impl IntoResponse {
     info!("PutBucketVersioning: {}", bucket);
 
+    if let Some(resp) = super::cluster_unsupported::refuse_in_cluster(
+        &state,
+        super::cluster_unsupported::VERSIONING_UNSUPPORTED,
+    ) {
+        return resp;
+    }
     if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
         return resp;
     }
@@ -278,7 +248,7 @@ pub async fn put_bucket_versioning(
             let status_str = new_status.as_xml_status().unwrap_or("Enabled");
             if let Err(e) = storage
                 .put_object(
-                    "__system__",
+                    SYSTEM_BUCKET,
                     &versioning_key,
                     status_str.as_bytes(),
                     "text/plain",
@@ -340,7 +310,7 @@ async fn get_versioning_status_internal(
     bucket: &str,
 ) -> VersioningStatus {
     let versioning_key = format!("{}{}", VERSIONING_CONFIG_PREFIX, bucket);
-    match storage.get_object("__system__", &versioning_key).await {
+    match storage.get_object(SYSTEM_BUCKET, &versioning_key).await {
         Ok((data, _)) => {
             let status_str = String::from_utf8_lossy(&data);
             VersioningStatus::from_xml_status(status_str.trim())
@@ -367,28 +337,10 @@ pub async fn get_bucket_lifecycle(
 ) -> impl IntoResponse {
     debug!("GetBucketLifecycle: {}", bucket);
 
-    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
-        return resp;
-    }
-    let storage = state.storage.read().await;
-
-    // Check if bucket exists (standalone; cluster mode checked above)
-    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
-        return resp;
-    }
-
-    // Get lifecycle configuration
-    let lifecycle_key = format!("{}{}", LIFECYCLE_CONFIG_PREFIX, bucket);
-    match storage.get_object("__system__", &lifecycle_key).await {
-        Ok((data, _)) => {
-            let xml = String::from_utf8_lossy(&data).to_string();
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/xml")
-                .body(Body::from(xml))
-                .unwrap()
-        }
-        Err(_) => S3Error::NoSuchLifecycleConfiguration.into_response(),
+    match read_bucket_config(&state, &bucket, LIFECYCLE_CONFIG_PREFIX).await {
+        Ok(Some(data)) => config_response(data, "application/xml"),
+        Ok(None) => S3Error::NoSuchLifecycleConfiguration.into_response(),
+        Err(resp) => resp,
     }
 }
 
@@ -400,6 +352,7 @@ pub async fn get_bucket_lifecycle(
 ///
 /// - 200 OK if lifecycle configuration saved successfully
 /// - 400 Bad Request if invalid lifecycle configuration
+#[allow(clippy::result_large_err)]
 pub async fn put_bucket_lifecycle(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
@@ -407,56 +360,33 @@ pub async fn put_bucket_lifecycle(
 ) -> impl IntoResponse {
     info!("PutBucketLifecycle: {}", bucket);
 
-    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+    let mut rules = 0;
+    let stored = write_bucket_config(
+        &state,
+        &bucket,
+        LIFECYCLE_CONFIG_PREFIX,
+        "application/xml",
+        || {
+            let config = parse_lifecycle_xml(&String::from_utf8_lossy(&body)).map_err(|e| {
+                error!("Failed to parse lifecycle XML: {:?}", e);
+                S3Error::MalformedXML.into_response()
+            })?;
+            config.validate().map_err(|e| {
+                error!("Invalid lifecycle configuration: {:?}", e);
+                S3Error::InvalidRequest(e.to_string()).into_response()
+            })?;
+            rules = config.rules.len();
+            Ok(lifecycle_to_xml(&config).into_bytes())
+        },
+    )
+    .await;
+    if let Err(resp) = stored {
         return resp;
-    }
-    let storage = state.storage.read().await;
-
-    // Check if bucket exists (standalone; cluster mode checked above)
-    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
-        return resp;
-    }
-
-    // Parse and validate lifecycle configuration
-    let xml = String::from_utf8_lossy(&body);
-    let config = match parse_lifecycle_xml(&xml) {
-        Ok(c) => c,
-        Err(e) => {
-            error!("Failed to parse lifecycle XML: {:?}", e);
-            return S3Error::MalformedXML.into_response();
-        }
-    };
-
-    if let Err(e) = config.validate() {
-        error!("Invalid lifecycle configuration: {:?}", e);
-        return S3Error::InvalidRequest(e.to_string()).into_response();
-    }
-
-    // Store validated lifecycle configuration
-    let lifecycle_key = format!("{}{}", LIFECYCLE_CONFIG_PREFIX, bucket);
-    let validated_xml = lifecycle_to_xml(&config);
-    if let Err(e) = storage
-        .put_object(
-            "__system__",
-            &lifecycle_key,
-            validated_xml.as_bytes(),
-            "application/xml",
-            &HashMap::new(),
-        )
-        .await
-    {
-        error!("Failed to store lifecycle configuration: {:?}", e);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to store lifecycle configuration",
-        )
-            .into_response();
     }
 
     info!(
         "Lifecycle configuration saved for bucket: {} ({} rules)",
-        bucket,
-        config.rules.len()
+        bucket, rules
     );
     StatusCode::OK.into_response()
 }
@@ -475,19 +405,9 @@ pub async fn delete_bucket_lifecycle(
 ) -> impl IntoResponse {
     info!("DeleteBucketLifecycle: {}", bucket);
 
-    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+    if let Err(resp) = delete_bucket_config(&state, &bucket, LIFECYCLE_CONFIG_PREFIX).await {
         return resp;
     }
-    let storage = state.storage.read().await;
-
-    // Check if bucket exists (standalone; cluster mode checked above)
-    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
-        return resp;
-    }
-
-    // Delete lifecycle configuration
-    let lifecycle_key = format!("{}{}", LIFECYCLE_CONFIG_PREFIX, bucket);
-    let _ = storage.delete_object("__system__", &lifecycle_key).await;
 
     info!("Lifecycle configuration deleted for bucket: {}", bucket);
     StatusCode::NO_CONTENT.into_response()
@@ -512,35 +432,163 @@ pub async fn is_versioning_enabled(state: &AppState, bucket: &str) -> bool {
     get_bucket_versioning_status(state, bucket).await == VersioningStatus::Enabled
 }
 
-/// Gets the CORS configuration for a bucket (if any).
-pub async fn get_cors_config(state: &AppState, bucket: &str) -> Option<CORSConfiguration> {
-    let storage = state.storage.read().await;
-    let cors_key = format!("{}{}", CORS_CONFIG_PREFIX, bucket);
+// ============================================================================
+// Configuration Storage
+// ============================================================================
 
-    match storage.get_object("__system__", &cors_key).await {
-        Ok((data, _)) => {
-            let xml = String::from_utf8_lossy(&data);
-            parse_cors_xml(&xml).ok()
-        }
-        Err(_) => None,
-    }
+/// The `__system__` key of the bucket's configuration stored under `prefix`.
+fn config_key(prefix: &str, bucket: &str) -> String {
+    format!("{prefix}{bucket}")
 }
 
-/// Gets the lifecycle configuration for a bucket (if any).
-pub async fn get_lifecycle_config(
+/// A stored configuration as the answer to a GET.
+fn config_response(data: Vec<u8>, content_type: &str) -> Response {
+    let mut response = Response::new(Body::from(data));
+    if let Ok(value) = header::HeaderValue::from_str(content_type) {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
+    response
+}
+
+/// The bucket's configuration stored under `prefix`: `Ok(None)` when it is
+/// not set, and `Err` with the answer to give when the bucket does not exist
+/// or, in cluster mode, too few replicas answered to tell (`503`).
+///
+/// In cluster mode the bucket's marker and the configuration are each read
+/// through a read quorum, so a configuration written through any node is seen
+/// through every other at once. A configuration counts only when it belongs
+/// to the generation of the live marker
+/// ([`config_of_generation`](s4_cluster::config_of_generation)): an older one
+/// belongs to an earlier bucket of the same name — a write that passed its
+/// bucket check before that bucket was deleted and landed after — and reads
+/// as not set.
+///
+/// Until the pool adopted the configurations an earlier release stored on
+/// single nodes ([`AppState::config_read_gate`]), such a configuration may
+/// sit only on this node, which a quorum read would miss: this node's own copy
+/// is then weighed too, by the same rule, and is the answer unless a replica
+/// holds a newer value or its delete
+/// ([`read_bucket_config_with_own`](s4_cluster::QuorumReadCoordinator::read_bucket_config_with_own)).
+#[allow(clippy::result_large_err)]
+pub(crate) async fn read_bucket_config(
     state: &AppState,
     bucket: &str,
-) -> Option<LifecycleConfiguration> {
-    let storage = state.storage.read().await;
-    let lifecycle_key = format!("{}{}", LIFECYCLE_CONFIG_PREFIX, bucket);
-
-    match storage.get_object("__system__", &lifecycle_key).await {
-        Ok((data, _)) => {
-            let xml = String::from_utf8_lossy(&data);
-            parse_lifecycle_xml(&xml).ok()
-        }
-        Err(_) => None,
+    prefix: &str,
+) -> Result<Option<Vec<u8>>, Response> {
+    let key = config_key(prefix, bucket);
+    if let Some(read_coord) = state.read_coordinator.as_ref() {
+        let own = if state.config_read_gate.is_open() {
+            None
+        } else {
+            let storage = state.storage.read().await;
+            storage
+                .get_object(SYSTEM_BUCKET, &key)
+                .await
+                .ok()
+                .map(|(data, record)| OwnConfig {
+                    data,
+                    hlc: HlcTimestamp::of_record(&record),
+                    etag: record.etag,
+                })
+        };
+        return match read_coord.read_bucket_config_with_own(bucket, &key, own).await {
+            Ok(BucketConfigRead::Set(data)) => Ok(Some(data)),
+            Ok(BucketConfigRead::NotSet) => Ok(None),
+            Ok(BucketConfigRead::NoSuchBucket) => Err(S3Error::NoSuchBucket.into_response()),
+            Err(e) => {
+                warn!(bucket, key, error = %e, "bucket configuration could not be read");
+                Err(super::cluster_error_to_response(&e))
+            }
+        };
     }
+
+    let storage = state.storage.read().await;
+    if let Some(resp) = super::check_bucket_standalone(state, &*storage, bucket).await {
+        return Err(resp);
+    }
+    Ok(storage.get_object(SYSTEM_BUCKET, &key).await.ok().map(|(data, _)| data))
+}
+
+/// Stores the bucket's configuration under `prefix`, as `value` makes it once
+/// the bucket is known to exist: its error is the answer to an invalid
+/// configuration, given only for a bucket that exists.
+///
+/// In cluster mode the bucket is checked through a read quorum and the
+/// configuration written through the write quorum; when too few replicas
+/// answer, the answer is `503` and the client may retry. The write's HLC is
+/// newer than the marker the check read, since the check moved this node's
+/// clock past it: the configuration belongs to the bucket it was written to
+/// ([`read_bucket_config`]).
+#[allow(clippy::result_large_err)]
+pub(crate) async fn write_bucket_config(
+    state: &AppState,
+    bucket: &str,
+    prefix: &str,
+    content_type: &str,
+    value: impl FnOnce() -> Result<Vec<u8>, Response>,
+) -> Result<(), Response> {
+    let key = config_key(prefix, bucket);
+    if let Some(write_coord) = state.write_coordinator.as_ref() {
+        if let Some(resp) = super::check_bucket_cluster(state, bucket).await {
+            return Err(resp);
+        }
+        let data = value()?;
+        return write_coord
+            .write(SYSTEM_BUCKET, &key, &data, content_type, &HashMap::new())
+            .await
+            .map(|_| ())
+            .map_err(|e| {
+                error!(bucket, key, error = %e, "failed to replicate bucket configuration");
+                super::cluster_error_to_response(&e)
+            });
+    }
+
+    let storage = state.storage.read().await;
+    if let Some(resp) = super::check_bucket_standalone(state, &*storage, bucket).await {
+        return Err(resp);
+    }
+    let data = value()?;
+    storage
+        .put_object(SYSTEM_BUCKET, &key, &data, content_type, &HashMap::new())
+        .await
+        .map(|_| ())
+        .map_err(|e| {
+            error!(bucket, key, error = %e, "failed to store bucket configuration");
+            S3Error::InternalError("Failed to store bucket configuration".to_string())
+                .into_response()
+        })
+}
+
+/// Deletes the bucket's configuration under `prefix`; deleting one that is
+/// not set succeeds.
+///
+/// In cluster mode the delete goes through the write quorum and leaves a
+/// tombstone on the replicas, so that no replica that missed it brings the
+/// configuration back; when too few replicas answer, the answer is `503`.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn delete_bucket_config(
+    state: &AppState,
+    bucket: &str,
+    prefix: &str,
+) -> Result<(), Response> {
+    let key = config_key(prefix, bucket);
+    if let Some(write_coord) = state.write_coordinator.as_ref() {
+        if let Some(resp) = super::check_bucket_cluster(state, bucket).await {
+            return Err(resp);
+        }
+        return write_coord.delete(SYSTEM_BUCKET, &key).await.map(|_| ()).map_err(|e| {
+            error!(bucket, key, error = %e, "failed to replicate bucket configuration delete");
+            super::cluster_error_to_response(&e)
+        });
+    }
+
+    let storage = state.storage.read().await;
+    if let Some(resp) = super::check_bucket_standalone(state, &*storage, bucket).await {
+        return Err(resp);
+    }
+    // A configuration that is not set is deleted already.
+    let _ = storage.delete_object(SYSTEM_BUCKET, &key).await;
+    Ok(())
 }
 
 // ============================================================================
@@ -580,8 +628,6 @@ pub async fn get_bucket_location(
 // Bucket Policy Handlers
 // ============================================================================
 
-const POLICY_CONFIG_PREFIX: &str = "__s4_bucket_policy_";
-
 /// Gets the bucket policy.
 ///
 /// S3 API: GET /{bucket}?policy
@@ -591,53 +637,43 @@ pub async fn get_bucket_policy(
 ) -> impl IntoResponse {
     debug!("GetBucketPolicy: {}", bucket);
 
-    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
-        return resp;
+    match read_bucket_config(&state, &bucket, POLICY_CONFIG_PREFIX).await {
+        Ok(Some(data)) => config_response(data, "application/json"),
+        Ok(None) => no_such_bucket_policy(&bucket),
+        Err(resp) => resp,
     }
-    let storage = state.storage.read().await;
+}
 
-    // Check if bucket exists (standalone; cluster mode checked above)
-    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
-        return resp;
-    }
-
-    let policy_key = format!("{}{}", POLICY_CONFIG_PREFIX, bucket);
-    match storage.get_object("__system__", &policy_key).await {
-        Ok((data, _)) => {
-            let json = String::from_utf8_lossy(&data).to_string();
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(json))
-                .unwrap()
-        }
-        Err(_) => {
-            // No policy configured — return NoSuchBucketPolicy
-            // S3 returns this as a generic error with code "NoSuchBucketPolicy"
-            let request_id = uuid::Uuid::new_v4().to_string();
-            let xml = format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
+/// `NoSuchBucketPolicy`: the bucket exists and has no policy. S3 returns it
+/// as a generic error with this code.
+fn no_such_bucket_policy(bucket: &str) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <Error>
   <Code>NoSuchBucketPolicy</Code>
   <Message>The bucket policy does not exist</Message>
   <BucketName>{}</BucketName>
   <RequestId>{}</RequestId>
 </Error>"#,
-                bucket, request_id
-            );
-            Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .header(header::CONTENT_TYPE, "application/xml")
-                .header("x-amz-request-id", request_id)
-                .body(Body::from(xml))
-                .unwrap()
-        }
+        bucket, request_id
+    );
+    let mut response = (StatusCode::NOT_FOUND, xml).into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        header::HeaderValue::from_static("application/xml"),
+    );
+    if let Ok(value) = header::HeaderValue::from_str(&request_id) {
+        headers.insert("x-amz-request-id", value);
     }
+    response
 }
 
 /// Sets the bucket policy.
 ///
 /// S3 API: PUT /{bucket}?policy
+#[allow(clippy::result_large_err)]
 pub async fn put_bucket_policy(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
@@ -645,36 +681,21 @@ pub async fn put_bucket_policy(
 ) -> impl IntoResponse {
     info!("PutBucketPolicy: {}", bucket);
 
-    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+    let stored = write_bucket_config(
+        &state,
+        &bucket,
+        POLICY_CONFIG_PREFIX,
+        "application/json",
+        || {
+            if serde_json::from_slice::<serde_json::Value>(&body).is_err() {
+                return Err(S3Error::MalformedXML.into_response());
+            }
+            Ok(body.to_vec())
+        },
+    )
+    .await;
+    if let Err(resp) = stored {
         return resp;
-    }
-    let storage = state.storage.read().await;
-
-    // Check if bucket exists (standalone; cluster mode checked above)
-    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
-        return resp;
-    }
-
-    // Validate JSON
-    let policy_str = String::from_utf8_lossy(&body);
-    if serde_json::from_str::<serde_json::Value>(&policy_str).is_err() {
-        return S3Error::MalformedXML.into_response();
-    }
-
-    // Store policy
-    let policy_key = format!("{}{}", POLICY_CONFIG_PREFIX, bucket);
-    if let Err(e) = storage
-        .put_object(
-            "__system__",
-            &policy_key,
-            &body,
-            "application/json",
-            &HashMap::new(),
-        )
-        .await
-    {
-        error!("Failed to store bucket policy: {:?}", e);
-        return S3Error::InternalError("Failed to store bucket policy".to_string()).into_response();
     }
 
     info!("Bucket policy saved for bucket: {}", bucket);
@@ -690,18 +711,9 @@ pub async fn delete_bucket_policy(
 ) -> impl IntoResponse {
     info!("DeleteBucketPolicy: {}", bucket);
 
-    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
+    if let Err(resp) = delete_bucket_config(&state, &bucket, POLICY_CONFIG_PREFIX).await {
         return resp;
     }
-    let storage = state.storage.read().await;
-
-    // Check if bucket exists (standalone; cluster mode checked above)
-    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
-        return resp;
-    }
-
-    let policy_key = format!("{}{}", POLICY_CONFIG_PREFIX, bucket);
-    let _ = storage.delete_object("__system__", &policy_key).await;
 
     info!("Bucket policy deleted for bucket: {}", bucket);
     StatusCode::NO_CONTENT.into_response()
@@ -761,6 +773,7 @@ const DEFAULT_ENCRYPTION_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 /// Sets bucket encryption configuration (stub — accepts and stores config).
 ///
 /// S3 API: PUT /{bucket}?encryption
+#[allow(clippy::result_large_err)]
 pub async fn put_bucket_encryption(
     State(state): State<AppState>,
     Path(bucket): Path<String>,
@@ -768,40 +781,23 @@ pub async fn put_bucket_encryption(
 ) -> impl IntoResponse {
     debug!("PutBucketEncryption: {}", bucket);
 
-    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
-        return resp;
-    }
-    let storage = state.storage.read().await;
-
-    // Check if bucket exists (standalone; cluster mode checked above)
-    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
-        return resp;
-    }
-
-    // Store encryption config
-    let config_key = format!("__s4_bucket_encryption_{}", bucket);
-    let data = if body.is_empty() {
-        DEFAULT_ENCRYPTION_XML.as_bytes()
-    } else {
-        &body
-    };
-
-    match storage
-        .put_object(
-            "__system__",
-            &config_key,
-            data,
-            "application/xml",
-            &std::collections::HashMap::new(),
-        )
-        .await
-    {
-        Ok(_) => StatusCode::OK.into_response(),
-        Err(e) => {
-            error!("Failed to save encryption config: {:?}", e);
-            crate::s3::errors::S3Error::InternalError("Failed to save encryption config".into())
-                .into_response()
-        }
+    let stored = write_bucket_config(
+        &state,
+        &bucket,
+        ENCRYPTION_CONFIG_PREFIX,
+        "application/xml",
+        || {
+            Ok(if body.is_empty() {
+                DEFAULT_ENCRYPTION_XML.as_bytes().to_vec()
+            } else {
+                body.to_vec()
+            })
+        },
+    )
+    .await;
+    match stored {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(resp) => resp,
     }
 }
 
@@ -814,34 +810,14 @@ pub async fn get_bucket_encryption(
 ) -> impl IntoResponse {
     debug!("GetBucketEncryption: {}", bucket);
 
-    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
-        return resp;
-    }
-    let storage = state.storage.read().await;
-
-    // Check if bucket exists (standalone; cluster mode checked above)
-    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
-        return resp;
-    }
-
-    // Get stored encryption config, or return error if not set
-    let config_key = format!("__s4_bucket_encryption_{}", bucket);
-    match storage.get_object("__system__", &config_key).await {
-        Ok((data, _)) => {
-            let xml = String::from_utf8_lossy(&data).to_string();
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "application/xml")
-                .body(Body::from(xml))
-                .unwrap()
-        }
-        Err(_) => {
-            crate::s3::errors::S3Error::ServerSideEncryptionConfigurationNotFound.into_response()
-        }
+    match read_bucket_config(&state, &bucket, ENCRYPTION_CONFIG_PREFIX).await {
+        Ok(Some(data)) => config_response(data, "application/xml"),
+        Ok(None) => S3Error::ServerSideEncryptionConfigurationNotFound.into_response(),
+        Err(resp) => resp,
     }
 }
 
-/// Deletes bucket encryption configuration (resets to default AES256).
+/// Deletes bucket encryption configuration.
 ///
 /// S3 API: DELETE /{bucket}?encryption
 pub async fn delete_bucket_encryption(
@@ -850,21 +826,10 @@ pub async fn delete_bucket_encryption(
 ) -> impl IntoResponse {
     debug!("DeleteBucketEncryption: {}", bucket);
 
-    if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
-        return resp;
+    match delete_bucket_config(&state, &bucket, ENCRYPTION_CONFIG_PREFIX).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(resp) => resp,
     }
-    let storage = state.storage.read().await;
-
-    // Check if bucket exists (standalone; cluster mode checked above)
-    if let Some(resp) = super::check_bucket_standalone(&state, &*storage, &bucket).await {
-        return resp;
-    }
-
-    // Delete stored config (will return default on next GET)
-    let config_key = format!("__s4_bucket_encryption_{}", bucket);
-    let _ = storage.delete_object("__system__", &config_key).await;
-
-    StatusCode::NO_CONTENT.into_response()
 }
 
 #[cfg(test)]

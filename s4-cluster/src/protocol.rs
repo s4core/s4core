@@ -34,11 +34,22 @@ use crate::error::ClusterError;
 /// auto-tiering migration from RF=3 into erasure coding. Version 3 marks
 /// erasure-set layout records: a node advertising it takes a set's slot order
 /// from the set's record instead of recomputing it from topology labels.
+/// Version 4 marks tombstones: a node advertising it keeps a deleted key as a
+/// tombstone with the delete's HLC and reports it on reads and listings.
+/// Version 5 marks anti-entropy rounds: a node advertising it answers
+/// `AntiEntropyLeaves` and `AntiEntropyKeys`. Version 6 marks replicated
+/// bucket configurations: a node advertising it keeps their digests and
+/// tombstones. Version 7 marks the stages of the move of bucket metadata: a
+/// node advertising it places them by its stage and fences the writes of a
+/// stage too old. Version 8 marks the cluster's control state: a node
+/// advertising it holds the IAM records of version 2 on every node of the
+/// pool, with their digests and tombstones. Version 9 announces durable pool
+/// generations, separating the configured roster from the ring in use.
 ///
 /// A bump must stay backward compatible — see [`MIN_COMPATIBLE_VERSION`]. It is
 /// not a licence to change the wire format; it is a claim that a node can do
 /// everything every lower version could, plus something new.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Minimum protocol version this binary can interoperate with.
 ///
@@ -72,6 +83,64 @@ pub const EC_SET_LAYOUT_MIN_PROTOCOL_VERSION: u32 = 3;
 /// advertises 1 and has not), so hint delivery sends a conditional delete only
 /// to a node at this version or above.
 pub const CONDITIONAL_DELETE_MIN_PROTOCOL_VERSION: u32 = 2;
+
+/// Lowest protocol version whose node keeps tombstones.
+///
+/// Such a node takes a `DeleteBlob` with an HLC and no `expected_source_hlc`
+/// as a tombstone that a write older than the delete cannot replace. A node
+/// below it removes the record whatever it holds, a write newer than the
+/// delete included. So a delete repaired onto a replica after the fact — by
+/// read repair or hint delivery — is sent only to a node at this version or
+/// above; a client's delete reaches every replica as it always did.
+pub const TOMBSTONE_MIN_PROTOCOL_VERSION: u32 = 4;
+
+/// Lowest protocol version whose node answers anti-entropy rounds.
+///
+/// A round asks its peer for the leaves and keys of their shared tree. A node
+/// with tombstones but without rounds (protocol 4, a build of the branch
+/// between the two) would answer `Unimplemented`, so a node starts rounds only
+/// once every node of its pool announces at least this version; until then a
+/// round is skipped and counted as such (plan ANTI-ENTROPY.md, decision 10).
+pub const ANTI_ENTROPY_MIN_PROTOCOL_VERSION: u32 = 5;
+
+/// Lowest protocol version whose node keeps the bucket configurations as
+/// replicated keys: with a version digest, and a tombstone for a delete.
+///
+/// Two nodes on either side of it give a different set of keys a digest, so
+/// the leaves of their shared tree differ wherever a configuration lies, and
+/// a round between them would settle keys one of them does not replicate.
+/// Rounds start only once every node of the pool announces at least this
+/// version, and a node answers rounds only from a node whose digests are of
+/// its own format (plan BUCKET-CONFIG-REPLICATION.md, decision 7).
+pub const BUCKET_CONFIG_MIN_PROTOCOL_VERSION: u32 = 6;
+
+/// Lowest protocol version whose node places bucket metadata by the stages
+/// of their move to the pool's replication factor: it writes and reads them
+/// by the rules of its stage, and its replicas refuse the writes of a stage
+/// too old (plan BUCKET-METADATA-REPLICATION.md, decisions 4 and 6).
+///
+/// The gate of the first stage asks every node of the pool for it: a node of
+/// an earlier release writes bucket metadata to the old layout alone, and
+/// its writes carry no stage a replica could fence them by.
+pub const BUCKET_METADATA_MIN_PROTOCOL_VERSION: u32 = 7;
+
+/// Lowest protocol version whose node holds the cluster's control state: the
+/// IAM records of version 2 (`__system__/__s4_iam_v2_*`) on every node of the
+/// pool, written and read through a majority, with a version digest and a
+/// tombstone for a delete (plan CLUSTER-IAM-REPLICATION.md, decisions 1, 2
+/// and 9).
+///
+/// A node below it keeps such a key as an unreplicated record of `__system__`:
+/// no digest, and a delete that leaves nothing behind. So the coordinators
+/// send the writes, deletes and reads of the class only to nodes that
+/// announced at least this version, and anti-entropy rounds wait until every
+/// live node of the pool does: below it a node gives another set of keys a
+/// digest.
+pub const IAM_REPLICATION_MIN_PROTOCOL_VERSION: u32 = 8;
+
+/// Lowest protocol version that announces and preserves pool generations.
+/// A growth gate requires this capability from every member of the new roster.
+pub const POOL_GENERATION_MIN_PROTOCOL_VERSION: u32 = 9;
 
 /// S4 server version string embedded in gossip metadata.
 pub const S4_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -191,6 +260,60 @@ mod tests {
             assert!(
                 EC_V2_MIN_PROTOCOL_VERSION <= PROTOCOL_VERSION,
                 "this binary implements EC v2 but does not advertise it"
+            )
+        };
+    }
+
+    /// The tombstone floor names a version this binary speaks, and one above
+    /// every version released before tombstones existed.
+    #[test]
+    fn tombstone_capability_is_within_the_supported_range() {
+        const {
+            assert!(
+                TOMBSTONE_MIN_PROTOCOL_VERSION <= PROTOCOL_VERSION,
+                "this binary keeps tombstones but does not advertise it"
+            )
+        };
+        const {
+            assert!(
+                TOMBSTONE_MIN_PROTOCOL_VERSION > EC_SET_LAYOUT_MIN_PROTOCOL_VERSION,
+                "protocol 3 was released without tombstones"
+            )
+        };
+    }
+
+    /// The anti-entropy floor names a version this binary speaks, and one
+    /// above tombstones: a node with tombstones alone answers no round.
+    #[test]
+    fn anti_entropy_capability_is_within_the_supported_range() {
+        const {
+            assert!(
+                ANTI_ENTROPY_MIN_PROTOCOL_VERSION <= PROTOCOL_VERSION,
+                "this binary answers anti-entropy rounds but does not advertise it"
+            )
+        };
+        const {
+            assert!(
+                ANTI_ENTROPY_MIN_PROTOCOL_VERSION > TOMBSTONE_MIN_PROTOCOL_VERSION,
+                "protocol 4 keeps tombstones but answers no round"
+            )
+        };
+    }
+
+    /// The bucket configuration floor names a version this binary speaks, and
+    /// one above anti-entropy rounds: protocol 5 gave configurations no digest.
+    #[test]
+    fn bucket_config_capability_is_within_the_supported_range() {
+        const {
+            assert!(
+                BUCKET_CONFIG_MIN_PROTOCOL_VERSION <= PROTOCOL_VERSION,
+                "this binary replicates bucket configurations but does not advertise it"
+            )
+        };
+        const {
+            assert!(
+                BUCKET_CONFIG_MIN_PROTOCOL_VERSION > ANTI_ENTROPY_MIN_PROTOCOL_VERSION,
+                "protocol 5 runs rounds without the digests of bucket configurations"
             )
         };
     }

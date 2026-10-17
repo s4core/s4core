@@ -21,7 +21,9 @@
 //! - Middleware for auth, metrics, and logging
 
 pub mod auth;
+pub mod cluster_iam;
 pub mod handlers;
+mod iam_test_hooks;
 pub mod middleware;
 pub mod multipart_store;
 pub mod prometheus;

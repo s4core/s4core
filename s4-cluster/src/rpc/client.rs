@@ -65,9 +65,10 @@ impl RetryFailure {
     fn into_cluster_error(self, node_id: NodeId) -> ClusterError {
         match self {
             Self::Cluster(error) => error,
-            Self::Rpc { attempts, status } => ClusterError::Rpc(format!(
-                "RPC to {node_id} failed after {attempts} attempts: {status}"
-            )),
+            Self::Rpc { attempts, status } => rpc_status_error(
+                format!("RPC to {node_id} failed after {attempts} attempts: {status}"),
+                &status,
+            ),
         }
     }
 }
@@ -86,6 +87,7 @@ fn write_blob_chunks(
     let mut chunks = Vec::with_capacity(1 + request.data.len().div_ceil(chunk_size));
     chunks.push(proto::WriteBlobChunk {
         payload: Some(Payload::Header(proto::WriteBlobHeader {
+            placement_generation: request.placement_generation,
             bucket: request.bucket.clone(),
             key: request.key.clone(),
             content_hash: request.content_hash.clone(),
@@ -93,6 +95,10 @@ fn write_blob_chunks(
             metadata: request.metadata.clone(),
             hlc: request.hlc.clone(),
             version_id: request.version_id.clone(),
+            bucket_metadata_stage: request.bucket_metadata_stage,
+            repair_copy: request.repair_copy,
+            iam_lease: request.iam_lease.clone(),
+            etag: request.etag.clone(),
             coordinator_id: request.coordinator_id.clone(),
             operation_id: request.operation_id.clone(),
             topology_epoch: request.topology_epoch,
@@ -195,6 +201,11 @@ impl NodeClient {
     /// The `peer` label of `node_id` in metrics.
     pub(crate) fn peer_label(&self, node_id: NodeId) -> String {
         self.peer_names.label(node_id)
+    }
+
+    /// Deadline for a complete peer request, including a repair's streamed body.
+    pub(crate) fn request_timeout(&self) -> Duration {
+        self.config.request_timeout
     }
 
     /// Opens one call to `node_id` that bypasses the retry loop.
@@ -389,6 +400,8 @@ impl NodeClient {
             version_id: header.version_id,
             content_length: header.content_length,
             epoch_mismatch: false,
+            tombstone: false,
+            etag: header.etag,
         })
     }
 
@@ -401,6 +414,74 @@ impl NodeClient {
         self.with_retry(node_id, |mut client| {
             let req = request.clone();
             async move { client.delete_blob(req).await }
+        })
+        .await
+    }
+
+    /// Ask `node_id` for an epoch of the lease of IAM changes.
+    pub async fn send_iam_lease_acquire(
+        &self,
+        node_id: NodeId,
+        request: proto::IamLeaseAcquireRequest,
+    ) -> Result<proto::IamLeaseAcquireResponse, ClusterError> {
+        self.with_retry(node_id, |mut client| {
+            let req = request.clone();
+            async move { client.iam_lease_acquire(req).await }
+        })
+        .await
+    }
+
+    /// Release an epoch of the lease of IAM changes `node_id` granted.
+    pub async fn send_iam_lease_release(
+        &self,
+        node_id: NodeId,
+        request: proto::IamLeaseReleaseRequest,
+    ) -> Result<proto::IamLeaseReleaseResponse, ClusterError> {
+        self.with_retry(node_id, |mut client| {
+            let req = request.clone();
+            async move { client.iam_lease_release(req).await }
+        })
+        .await
+    }
+
+    /// Read records of the cluster's control state from `node_id` under the
+    /// lease of IAM changes.
+    pub async fn send_iam_lease_read(
+        &self,
+        node_id: NodeId,
+        request: proto::IamLeaseReadRequest,
+    ) -> Result<proto::IamLeaseReadResponse, ClusterError> {
+        self.with_retry(node_id, |mut client| {
+            let req = request.clone();
+            async move { client.iam_lease_read(req).await }
+        })
+        .await
+    }
+
+    /// Read a page of the versions of the cluster's control state `node_id`
+    /// holds, to catch this node's copy of IAM up with it.
+    pub async fn send_iam_versions(
+        &self,
+        node_id: NodeId,
+        request: proto::IamVersionsRequest,
+    ) -> Result<proto::IamVersionsResponse, ClusterError> {
+        self.with_retry(node_id, |mut client| {
+            let req = request.clone();
+            async move { client.iam_versions(req).await }
+        })
+        .await
+    }
+
+    /// Read a page of the user records `node_id` keeps of its own, for the
+    /// report of the pool's adoption of IAM.
+    pub async fn send_iam_own_users(
+        &self,
+        node_id: NodeId,
+        request: proto::IamOwnUsersRequest,
+    ) -> Result<proto::IamOwnUsersResponse, ClusterError> {
+        self.with_retry(node_id, |mut client| {
+            let req = request.clone();
+            async move { client.iam_own_users(req).await }
         })
         .await
     }
@@ -579,6 +660,33 @@ impl NodeClient {
         .await
     }
 
+    /// Asks `node_id` for its part in the pool's growth, handing it what the
+    /// request carries.
+    pub async fn send_pool_move(
+        &self,
+        node_id: NodeId,
+        request: proto::PoolMoveRequest,
+    ) -> Result<proto::PoolMoveResponse, ClusterError> {
+        self.with_retry(node_id, |mut client| {
+            let req = request.clone();
+            async move { client.pool_move(req).await }
+        })
+        .await
+    }
+
+    /// Reads a page of `node_id`'s version digests at a span of the ring.
+    pub async fn send_range_digests(
+        &self,
+        node_id: NodeId,
+        request: proto::RangeDigestsRequest,
+    ) -> Result<proto::RangeDigestsResponse, ClusterError> {
+        self.with_retry(node_id, |mut client| {
+            let req = request.clone();
+            async move { client.range_digests(req).await }
+        })
+        .await
+    }
+
     /// Send a multipart create-session request to a specific node with retry.
     pub async fn send_multipart_create(
         &self,
@@ -602,7 +710,7 @@ impl NodeClient {
         let mut request = Request::new(stream);
         request.set_timeout(self.config.request_timeout);
         finish_call(call, client.upload_multipart_part_replica(request).await)
-            .map_err(|e| ClusterError::Rpc(format!("multipart part stream to {node_id}: {e}")))
+            .map_err(|e| rpc_status_error(format!("multipart part stream to {node_id}: {e}"), &e))
     }
 
     /// Inspect multipart session and part metadata on a specific node.
@@ -720,28 +828,30 @@ impl NodeClient {
         .await
     }
 
-    /// Send an `ExchangeMerkleDigest` request to a specific node with retry.
-    pub async fn send_merkle_digest(
+    /// Ask `node_id` for the leaves of the tree it shares with this node.
+    pub async fn send_anti_entropy_leaves(
         &self,
         node_id: NodeId,
-        request: proto::MerkleDigestRequest,
-    ) -> Result<proto::MerkleDigestResponse, ClusterError> {
+        request: proto::AntiEntropyLeavesRequest,
+    ) -> Result<proto::AntiEntropyLeavesResponse, ClusterError> {
         self.with_retry(node_id, |mut client| {
             let req = request.clone();
-            async move { client.exchange_merkle_digest(req).await }
+            async move { client.anti_entropy_leaves(req).await }
         })
         .await
     }
 
-    /// Send a `RepairSync` request and return the response stream.
-    pub async fn send_repair_sync(
+    /// Ask `node_id` for a page of the keys of some leaves of that tree.
+    pub async fn send_anti_entropy_keys(
         &self,
         node_id: NodeId,
-        request: proto::RepairSyncRequest,
-    ) -> Result<tonic::Streaming<proto::RepairSyncResponse>, ClusterError> {
-        let (call, mut client) = self.open_call(node_id, false).await?;
-        finish_call(call, client.repair_sync(request).await)
-            .map_err(|e| ClusterError::Rpc(format!("repair sync to {node_id}: {e}")))
+        request: proto::AntiEntropyKeysRequest,
+    ) -> Result<proto::AntiEntropyKeysResponse, ClusterError> {
+        self.with_retry(node_id, |mut client| {
+            let req = request.clone();
+            async move { client.anti_entropy_keys(req).await }
+        })
+        .await
     }
 
     /// Start a streaming write to a node (for objects > 8MB).
@@ -752,7 +862,7 @@ impl NodeClient {
     ) -> Result<proto::WriteBlobResponse, ClusterError> {
         let (call, mut client) = self.open_call(node_id, false).await?;
         finish_call(call, client.write_blob_stream(Request::new(stream)).await)
-            .map_err(|e| ClusterError::Rpc(format!("streaming write to {node_id}: {e}")))
+            .map_err(|e| rpc_status_error(format!("streaming write to {node_id}: {e}"), &e))
     }
 
     /// Start a streaming read from a node (for objects > 8MB).
@@ -790,12 +900,7 @@ impl NodeClient {
     {
         self.with_retry_status(node_id, make_call)
             .await
-            .map_err(|failure| match failure {
-                RetryFailure::Cluster(error) => error,
-                RetryFailure::Rpc { attempts, status } => ClusterError::Rpc(format!(
-                    "RPC to {node_id} failed after {attempts} attempts: {status}"
-                )),
-            })
+            .map_err(|failure| failure.into_cluster_error(node_id))
     }
 
     /// [`with_retry`](Self::with_retry), keeping the gRPC status of the call
@@ -954,6 +1059,15 @@ impl NodeClient {
         Ok(())
     }
 
+    /// The protocol version `node_id` announced through gossip; `None` while
+    /// it has announced none, as a node that has just come back has not yet.
+    pub(crate) fn protocol_version(&self, node_id: NodeId) -> Option<u32> {
+        self.gossip
+            .get_node(&node_id)
+            .map(|state| state.meta.protocol_version)
+            .filter(|version| *version > 0)
+    }
+
     /// Whether gossip holds `node_id` dead or gone, so that a call to it would
     /// be skipped without being made.
     pub(crate) fn is_down(&self, node_id: NodeId) -> bool {
@@ -1022,6 +1136,15 @@ pub async fn probe_node_identity(
     NodeId::from_bytes(&response.node_id)
 }
 
+/// Preserve an admission refusal so callers cannot turn it into hinted repair.
+fn rpc_status_error(message: String, status: &Status) -> ClusterError {
+    if status.code() == tonic::Code::FailedPrecondition {
+        ClusterError::ReplicaFenced(message)
+    } else {
+        ClusterError::Rpc(message)
+    }
+}
+
 /// Determine if a gRPC status code is retryable.
 fn is_retryable(status: &Status) -> bool {
     matches!(
@@ -1087,6 +1210,18 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
+    fn failed_precondition_is_typed_and_never_retried() {
+        let status = Status::failed_precondition("admission refused");
+        assert!(!is_retryable(&status));
+        let error = RetryFailure::Rpc {
+            attempts: 1,
+            status: Box::new(status),
+        }
+        .into_cluster_error(NodeId(1));
+        assert!(matches!(error, ClusterError::ReplicaFenced(_)), "{error:?}");
+    }
+
+    #[test]
     fn only_unimplemented_tombstone_probe_enables_legacy_fallback() {
         for code in [
             tonic::Code::Unimplemented,
@@ -1135,6 +1270,8 @@ mod tests {
 
     fn blob_request(size: usize) -> proto::WriteBlobRequest {
         proto::WriteBlobRequest {
+            verify_content: false,
+            placement_generation: 0,
             bucket: "bucket".into(),
             key: "key".into(),
             data: (0..size).map(|idx| (idx % 251) as u8).collect(),
@@ -1146,6 +1283,10 @@ mod tests {
             coordinator_id: vec![1u8; 16],
             operation_id: vec![2u8; 16],
             topology_epoch: 42,
+            etag: "abc-2".into(),
+            bucket_metadata_stage: 2,
+            repair_copy: true,
+            iam_lease: None,
         }
     }
 
@@ -1177,6 +1318,9 @@ mod tests {
         assert_eq!(header.version_id, request.version_id);
         assert_eq!(header.coordinator_id, request.coordinator_id);
         assert_eq!(header.operation_id, request.operation_id);
+        assert_eq!(header.bucket_metadata_stage, request.bucket_metadata_stage);
+        assert_eq!(header.repair_copy, request.repair_copy);
+        assert_eq!(header.etag, request.etag);
         assert_eq!(header.topology_epoch, request.topology_epoch);
 
         let body = chunks[1..]

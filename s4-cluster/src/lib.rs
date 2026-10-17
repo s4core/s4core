@@ -63,12 +63,21 @@ pub mod error;
 pub mod gc;
 pub mod gossip;
 pub mod hints;
+pub mod iam_adoption;
+pub mod iam_catch_up;
+pub mod iam_config;
+pub mod iam_lease;
+pub mod iam_status;
 pub mod idempotency;
 pub mod identity;
 pub mod lifecycle;
+pub mod metadata_placement;
+pub mod migration;
 pub mod peers;
 pub mod placement;
+pub mod pool_generation;
 pub mod protocol;
+pub mod rebalance;
 pub mod repair;
 pub mod replica;
 pub mod rpc;
@@ -94,10 +103,11 @@ pub use config::AntiEntropyConfig;
 pub use config::{ClusterConfig, PoolConfig};
 pub use conflict::{resolve_conflict, ConflictResolution};
 pub use coordinator::{
-    DistributedListCoordinator, DistributedListResult, ListEntry, ListTimeouts, QuorumHeadResult,
-    QuorumMultipartCompleteResult, QuorumMultipartCreateResult, QuorumMultipartListPartsResult,
-    QuorumMultipartPartResult, QuorumReadCoordinator, QuorumReadResult, QuorumReadStreamResult,
-    QuorumWriteCoordinator, ReadTimeouts, WriteTimeouts,
+    config_of_generation, BucketConfigRead, DistributedListCoordinator, DistributedListResult,
+    ListEntry, ListTimeouts, OwnConfig, QuorumHeadResult, QuorumMultipartCompleteResult,
+    QuorumMultipartCreateResult, QuorumMultipartListPartsResult, QuorumMultipartPartResult,
+    QuorumReadCoordinator, QuorumReadResult, QuorumReadStreamResult, QuorumWriteCoordinator,
+    ReadTimeouts, WithHolder, WriteTimeouts, LEGACY_CONFIG_CLOCK_TOLERANCE,
 };
 pub use dedup::{DedupGcConfig, DistributedDedupGc, SweepStats};
 pub use ec_admin::{
@@ -128,6 +138,19 @@ pub use gossip::{
     NodeCapacityReport, NodeState,
 };
 pub use hints::{HintDelivery, HintedHandoffConfig, HintedHandoffManager, KeyStateSource};
+pub use iam_adoption::{
+    pool_adopted as iam_pool_adopted, IamAdoptionCollector, IamAdoptionGate, IamOwnUsers,
+    NodeOwnRecords, OwnRecordSealer,
+};
+pub use iam_catch_up::{
+    IamAnnouncement, IamCatchUp, IamCatchUpConfig, IamCopy, IamFreshness, IamNodeView, IamPoolView,
+    IamRefusal,
+};
+pub use iam_config::{IamConfigCheck, IamConfigKind, IamConfigMismatch, IamConfigPrint};
+pub use iam_lease::{
+    IamLeaseConfig, IamLeaseError, IamLeaseHolder, IamLeaseKeeper, IamMutationLease, LeaseFence,
+};
+pub use iam_status::{IamStatus, IamStatusSource};
 pub use idempotency::IdempotencyTracker;
 pub use identity::{
     get_or_create_node_id, load_node_identity, load_or_adopt_node_id, node_identity_path, Edition,
@@ -136,17 +159,21 @@ pub use identity::{
 };
 pub use peers::{pool_peers_path, PoolPeer, PoolPeerRecord, POOL_PEERS_FORMAT_VERSION};
 pub use placement::{
-    BucketPlacement, ConsistentHashRing, PlacementDecision, PlacementRouter, PlacementStrategy,
+    BucketPlacement, ClassLayout, ConsistentHashRing, PlacementDecision, PlacementRouter,
+    PlacementStrategy, PoolLayout, ReplicationClass,
 };
 pub use repair::{
-    AntiEntropyMetrics, AntiEntropyService, AntiEntropySnapshot, KeyRange, MerkleTree,
-    ReadRepairService, RepairFrontier,
+    AdoptionReport, AntiEntropyGrowth, AntiEntropyMetrics, AntiEntropyResponder, AntiEntropyRounds,
+    AntiEntropyService, AntiEntropySnapshot, ConfigAdoption, ConfigAdoptionPhase,
+    ConfigAdoptionSnapshot, ConfigAdoptionStatus, ConfigReadGate, KeyRange, LocalReplica,
+    MerkleTree, ReadRepairService, Reconciler, RepairFrontier, RoundEnd, RoundReport,
 };
 pub use replica::{
     MultipartReplicaStorage, ReplicaMultipartHandler, ReplicaReadHandler, ReplicaWriteHandler,
 };
 pub use rpc::{
-    probe_node_identity, NodeClient, NodeClientConfig, NodeRpcServer, RpcServerConfig, TlsConfig,
+    probe_node_identity, NodeClient, NodeClientConfig, NodeRpcServer, PoolMoveResponder,
+    PoolMoveSlot, RpcServerConfig, TlsConfig,
 };
 pub use scrubber::{
     deep_verify::{deep_verify_object, VerifyResult},
@@ -160,19 +187,27 @@ pub use traits::{
 
 // Phase 10 re-exports.
 pub use cluster_admin::{
-    health_level, ClusterAdminService, ClusterHealthStatus, ClusterTopology, HealthLevel,
-    NodeClusterAdmin, NodeHealthInfo, NodeTopology, NoopClusterAdminService, PoolShape,
-    PoolTopology, RepairStatus, ScrubberStatus,
+    health_level, BucketMetadataHealth, ClusterAdminService, ClusterHealthStatus, ClusterTopology,
+    HealthLevel, IamAdoptionHealth, IamConfigHealth, NodeClusterAdmin, NodeHealthInfo,
+    NodeTopology, NoopClusterAdminService, PlacementHoldout, PlacementShape, PoolShape,
+    PoolTopology, RepairStatus, RoundCounts, ScrubberStatus,
 };
 pub use cluster_metrics::{
-    describe_metrics, register_cluster_metrics, CatalogEntry, CatalogLabel, MemberStatus,
-    MetricKind, MetricScope, PeerNames, PoolRoster, DURATION_BUCKETS_SECONDS, METRIC_CATALOG,
+    describe_metrics, on_behalf_of_client, register_cluster_metrics, set_iam_records_by_key_id,
+    CatalogEntry, CatalogLabel, MemberStatus, MetricKind, MetricScope, PeerNames, PoolRoster,
+    DURATION_BUCKETS_SECONDS, METRIC_CATALOG,
 };
 pub use lifecycle::{
     graceful_shutdown, InFlightGuard, NodeLifecycle, DEFAULT_DRAIN_TIMEOUT,
     GOSSIP_PROPAGATION_DELAY,
 };
 pub use protocol::{
-    check_compatibility, is_compatible, EC_SET_LAYOUT_MIN_PROTOCOL_VERSION,
-    EC_V2_MIN_PROTOCOL_VERSION, MIN_COMPATIBLE_VERSION, PROTOCOL_VERSION, S4_VERSION,
+    check_compatibility, is_compatible, ANTI_ENTROPY_MIN_PROTOCOL_VERSION,
+    BUCKET_CONFIG_MIN_PROTOCOL_VERSION, BUCKET_METADATA_MIN_PROTOCOL_VERSION,
+    EC_SET_LAYOUT_MIN_PROTOCOL_VERSION, EC_V2_MIN_PROTOCOL_VERSION,
+    IAM_REPLICATION_MIN_PROTOCOL_VERSION, MIN_COMPATIBLE_VERSION, PROTOCOL_VERSION, S4_VERSION,
+    TOMBSTONE_MIN_PROTOCOL_VERSION,
 };
+
+/// Admission of mutations against a pool placement generation.
+pub mod placement_fence;

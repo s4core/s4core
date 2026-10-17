@@ -89,6 +89,38 @@ impl std::fmt::Display for PlacementGroupId {
     }
 }
 
+/// Position of `bucket/key` on the consistent hash ring of a cluster pool.
+///
+/// The first eight bytes of the BLAKE3 hash of `"{bucket}/{key}"`, big-endian.
+/// This is the one definition: placement picks a key's replicas from it, and
+/// the version digests of the storage are ordered by it, so that the keys of a
+/// ring range are one contiguous scan. Changing it moves every key to other
+/// replicas.
+pub fn ring_position(bucket: &str, key: &str) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(bucket.as_bytes());
+    hasher.update(b"/");
+    hasher.update(key.as_bytes());
+    position_of_hash(hasher.finalize())
+}
+
+/// [`ring_position`] of a key already joined as `"{bucket}/{key}"`, the form
+/// the objects keyspace and placement hold it in.
+pub fn ring_position_of(placement_key: &str) -> u64 {
+    ring_position_of_bytes(placement_key.as_bytes())
+}
+
+/// [`ring_position_of`] for a key read back from the index as bytes.
+pub(crate) fn ring_position_of_bytes(placement_key: &[u8]) -> u64 {
+    position_of_hash(blake3::hash(placement_key))
+}
+
+fn position_of_hash(hash: blake3::Hash) -> u64 {
+    let mut position = [0u8; 8];
+    position.copy_from_slice(&hash.as_bytes()[..8]);
+    u64::from_be_bytes(position)
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -96,6 +128,32 @@ impl std::fmt::Display for PlacementGroupId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Values of the hash placement used before it moved here: a changed
+    /// value would move the key to other replicas on every cluster.
+    #[test]
+    fn ring_positions_are_the_ones_placement_always_used() {
+        let known = [
+            ("photos", "cat.jpg", 0x93df_64df_ad8d_ee14_u64),
+            ("bucket", "a", 0x9941_e5f1_e206_5f44),
+            (
+                "__system__",
+                "__s4_bucket_marker_photos",
+                0xb44a_e942_cce5_d990,
+            ),
+            ("b", "ключ с пробелом", 0x4fa8_5b43_f1ee_cf9e),
+            ("bucket", "x#v1", 0xa9b2_a485_5301_a362),
+            ("a", "", 0x6fbf_8949_5ee1_dd0d),
+        ];
+        for (bucket, key, position) in known {
+            assert_eq!(ring_position(bucket, key), position, "{bucket}/{key}");
+            assert_eq!(
+                ring_position_of(&format!("{bucket}/{key}")),
+                position,
+                "{bucket}/{key}"
+            );
+        }
+    }
 
     #[test]
     fn test_local_pg_is_zero() {

@@ -21,9 +21,10 @@
 
 use s4_core::error::StorageError;
 use s4_core::storage::{
-    BatchAction, BatchOp, Deduplicator, IndexDb, KeyspaceId, VolumeReader, VolumeWriter,
+    BatchAction, BatchOp, Deduplicator, IndexDb, JournalEventType, KeyspaceId, MetadataJournal,
+    VolumeReader, VolumeWriter,
 };
-use s4_core::types::{BlobId, BlobLocation, BlobRefEntry, CompositeManifest};
+use s4_core::types::{BlobId, BlobRefEntry, CompositeManifest};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -167,6 +168,7 @@ pub struct VolumeCompactor {
     deduplicator: Deduplicator,
     volume_writer: Arc<RwLock<VolumeWriter>>,
     config: CompactionConfig,
+    journal: Option<Arc<MetadataJournal>>,
 }
 
 impl VolumeCompactor {
@@ -184,7 +186,18 @@ impl VolumeCompactor {
             deduplicator,
             volume_writer,
             config,
+            journal: None,
         }
+    }
+
+    /// The same compactor, journaling every record it moves in `journal` —
+    /// the storage engine's own, so the entries take its sequence. A record
+    /// moved is a mutation of the index like any other: without its entry a
+    /// recovery from the journal would put back the record's old location,
+    /// in a volume the compaction deleted.
+    pub fn with_journal(mut self, journal: Arc<MetadataJournal>) -> Self {
+        self.journal = Some(journal);
+        self
     }
 
     /// Runs a full compaction cycle.
@@ -224,7 +237,7 @@ impl VolumeCompactor {
 
         // Step 2: Build dedup location index (volume_id, offset) -> content_hash
         // This avoids O(n) dedup scan per blob
-        let dedup_index = self.build_dedup_index()?;
+        let mut dedup_index = self.build_dedup_index()?;
         info!(
             "Compactor: built dedup index with {} entries",
             dedup_index.len()
@@ -233,11 +246,16 @@ impl VolumeCompactor {
         // Step 2b: Build blob_ref location index (volume_id, offset) -> Vec<BlobId>
         // This tracks composite manifest blobs and segment blobs that may not
         // have DedupEntry records (e.g., manifest blobs are only in BlobRefs).
-        let blob_ref_index = self.build_blob_ref_index()?;
+        let mut blob_ref_index = self.build_blob_ref_index()?;
         info!(
             "Compactor: built blob_ref index with {} entries",
             blob_ref_index.len()
         );
+
+        // Step 2c: Keep every blob a live record reaches, whatever the counts
+        // say. Without it the run stops: deciding liveness by counts alone is
+        // how a count that drifted low would cost a live object its bytes.
+        self.keep_reachable_blobs(&mut dedup_index, &mut blob_ref_index).await?;
 
         // Step 3: Get current writer volume to skip it (it's being written to)
         let current_volume_id = {
@@ -540,6 +558,101 @@ impl VolumeCompactor {
         Ok(stats.clone())
     }
 
+    /// Adds to the liveness indices every blob a live record of the index
+    /// reaches and they lack: a plain object's blob, a composite object's
+    /// manifest and segments, an open upload's parts.
+    ///
+    /// The counts (dedup entries, blob refs) say which blobs are live, and a
+    /// write keeps them in step with the records. This is the check against
+    /// the records themselves, so that a count that drifted low — a release
+    /// done twice, an update lost — costs space at worst, never data. Each
+    /// blob kept this way is counted, and the drift is logged.
+    ///
+    /// # Errors
+    ///
+    /// A live segment or part whose blob has no reference entry cannot be
+    /// located, so nothing can tell which volume holds it: the run stops
+    /// rather than risk deleting it.
+    async fn keep_reachable_blobs(
+        &self,
+        dedup_index: &mut HashMap<(u32, u64), [u8; 32]>,
+        blob_ref_index: &mut HashMap<(u32, u64), Vec<BlobId>>,
+    ) -> Result<usize, StorageError> {
+        let refs = self.index_db.scan_live_data_refs().await?;
+        let mut kept = 0usize;
+        let mut keep_blob = |location: (u32, u64),
+                             dedup_index: &mut HashMap<(u32, u64), [u8; 32]>,
+                             blob_ref_index: &HashMap<(u32, u64), Vec<BlobId>>,
+                             hash: [u8; 32]| {
+            if !dedup_index.contains_key(&location) && !blob_ref_index.contains_key(&location) {
+                dedup_index.insert(location, hash);
+                kept += 1;
+            }
+        };
+        for (&location, &hash) in &refs.blobs {
+            keep_blob(location, dedup_index, blob_ref_index, hash);
+        }
+
+        let ks = self.index_db.blob_refs_keyspace();
+        let located = |blob_id: &BlobId| -> Result<(u32, u64), StorageError> {
+            let bytes = ks
+                .get(blob_id.as_bytes())
+                .map_err(|e| StorageError::Database(e.to_string()))?
+                .ok_or_else(|| StorageError::BlobRefNotFound {
+                    blob_id: blob_id.to_string(),
+                })?;
+            let entry: BlobRefEntry = bincode::deserialize(&bytes)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            Ok((entry.location.volume_id, entry.location.offset))
+        };
+        let mut referenced: Vec<(BlobId, (u32, u64))> = Vec::new();
+        let reader = VolumeReader::new(&self.volumes_dir);
+        for (&manifest_id, &location) in &refs.manifests {
+            referenced.push((manifest_id, location));
+            let (_header, _key, data) = reader.read_blob(location.0, location.1).await?;
+            let manifest: CompositeManifest = bincode::deserialize(&data)
+                .map_err(|e| StorageError::Serialization(e.to_string()))?;
+            for segment in &manifest.segments {
+                referenced.push((segment.blob_id, located(&segment.blob_id)?));
+            }
+        }
+        let sessions = self.index_db.multipart_sessions_keyspace();
+        for guard in self.index_db.multipart_parts_keyspace().iter() {
+            let (_, value) =
+                guard.into_inner().map_err(|e| StorageError::Database(e.to_string()))?;
+            let Ok(part) = bincode::deserialize::<s4_core::types::MultipartPartRecord>(&value)
+            else {
+                continue;
+            };
+            if sessions
+                .contains_key(part.upload_id.as_bytes())
+                .map_err(|e| StorageError::Database(e.to_string()))?
+            {
+                referenced.push((part.blob_id, located(&part.blob_id)?));
+            }
+        }
+        for (blob_id, location) in referenced {
+            if !dedup_index.contains_key(&location) {
+                let ids = blob_ref_index.entry(location).or_default();
+                if ids.is_empty() {
+                    kept += 1;
+                }
+                if !ids.contains(&blob_id) {
+                    ids.push(blob_id);
+                }
+            }
+        }
+
+        if kept > 0 {
+            warn!(
+                "Compactor: {} live blob(s) had no live reference count; kept because a live \
+                 record reaches them (reference count drift)",
+                kept
+            );
+        }
+        Ok(kept)
+    }
+
     /// Purges orphaned dedup and blob_ref entries that are not referenced
     /// by any live object in the index.
     ///
@@ -577,6 +690,9 @@ impl VolumeCompactor {
         let reader = VolumeReader::new(&self.volumes_dir);
         let blob_refs_ks = self.index_db.blob_refs_keyspace();
 
+        // A live manifest whose segments cannot be read leaves them unknown:
+        // purging blob refs then could take a live segment's.
+        let mut segments_unknown = false;
         for manifest_id in &live_manifest_ids {
             // Look up the manifest's physical location from blob_refs
             match blob_refs_ks.get(manifest_id.as_bytes()) {
@@ -598,6 +714,7 @@ impl VolumeCompactor {
                                         "Compactor: failed to deserialize manifest {}: {}",
                                         manifest_id, e
                                     );
+                                    segments_unknown = true;
                                 }
                             }
                         }
@@ -606,6 +723,7 @@ impl VolumeCompactor {
                                 "Compactor: failed to read manifest blob {}: {}",
                                 manifest_id, e
                             );
+                            segments_unknown = true;
                         }
                     }
                 }
@@ -614,12 +732,14 @@ impl VolumeCompactor {
                         "Compactor: manifest blob {} not found in blob_refs",
                         manifest_id
                     );
+                    segments_unknown = true;
                 }
                 Err(e) => {
                     warn!(
                         "Compactor: failed to look up manifest blob {}: {}",
                         manifest_id, e
                     );
+                    segments_unknown = true;
                 }
             }
         }
@@ -743,6 +863,14 @@ impl VolumeCompactor {
         //   - NOT referenced by any active multipart part (not in active_staged_blob_ids)
         let mut blob_ref_purged = 0usize;
         let mut blob_ref_keys_to_delete: Vec<Vec<u8>> = Vec::new();
+
+        if segments_unknown {
+            warn!(
+                "Compactor: some live manifests could not be read; no blob_ref entry is purged \
+                 in this run"
+            );
+            return Ok((dedup_purged, 0));
+        }
 
         for guard in blob_refs_ks.iter() {
             let (key_bytes, _value_bytes) =
@@ -996,26 +1124,18 @@ impl VolumeCompactor {
                     ops.push(dedup_op);
                 }
 
-                // Update BlobRefEntry locations for all BlobIds pointing to old location
-                let ks = self.index_db.blob_refs_keyspace();
+                // Update BlobRefEntry locations for all BlobIds pointing to old
+                // location: moved inside the batch, so a count a concurrent
+                // batch changes meanwhile is kept.
                 for blob_id in &reloc.blob_ids {
-                    if let Some(ref_bytes) = ks
-                        .get(blob_id.as_bytes())
-                        .map_err(|e| StorageError::Database(e.to_string()))?
-                    {
-                        let mut entry: BlobRefEntry = bincode::deserialize(&ref_bytes)
-                            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                        entry.location = BlobLocation {
+                    ops.push(BatchOp {
+                        keyspace: KeyspaceId::BlobRefs,
+                        action: BatchAction::RelocateBlobRef {
+                            blob_id: blob_id.as_bytes().to_vec(),
                             volume_id: reloc.new_vol_id,
                             offset: reloc.new_offset,
-                        };
-                        let value = bincode::serialize(&entry)
-                            .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                        ops.push(BatchOp {
-                            keyspace: KeyspaceId::BlobRefs,
-                            action: BatchAction::Put(blob_id.as_bytes().to_vec(), value),
-                        });
-                    }
+                        },
+                    });
                 }
 
                 // Find IndexRecords pointing to old location in this volume
@@ -1030,6 +1150,18 @@ impl VolumeCompactor {
                             keyspace: *ks_id,
                             action: BatchAction::Put(rec_key.clone().into_bytes(), value),
                         });
+                        if let Some(journal) = &self.journal {
+                            let (bucket, key, version_id) =
+                                journal_key_of(*ks_id, rec_key, &updated);
+                            ops.push(journal.make_journal_entry_op(
+                                JournalEventType::ObjectPut {
+                                    bucket,
+                                    key,
+                                    version_id,
+                                    record: updated,
+                                },
+                            )?);
+                        }
                     }
                 }
             }
@@ -1063,4 +1195,30 @@ impl VolumeCompactor {
             target_volume_id,
         })
     }
+}
+
+/// The bucket, key and version a record of `keyspace` stored under
+/// `stripped_key` is journaled with, as the storage engine journals a write
+/// of it: the keyspace's prefix put back, the version split off the key.
+fn journal_key_of(
+    keyspace: KeyspaceId,
+    stripped_key: &str,
+    record: &s4_core::types::IndexRecord,
+) -> (String, String, Option<String>) {
+    let full_key = match keyspace {
+        KeyspaceId::Buckets => format!("__system__/__s4_bucket_marker_{stripped_key}"),
+        KeyspaceId::Iam => format!("__system__/__s4_iam_{stripped_key}"),
+        _ => stripped_key.to_string(),
+    };
+    let (bucket, key) = full_key.split_once('/').unwrap_or((full_key.as_str(), ""));
+    if let Some(version) = &record.version_id {
+        if let Some(unversioned) = key.strip_suffix(&format!("#{version}")) {
+            return (
+                bucket.to_string(),
+                unversioned.to_string(),
+                Some(version.clone()),
+            );
+        }
+    }
+    (bucket.to_string(), key.to_string(), None)
 }

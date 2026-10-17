@@ -35,6 +35,18 @@ async fn main() -> Result<()> {
         std::env::var("RUST_LOG").unwrap_or_else(|_| "s4_api=debug,s4_server=info".to_string());
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // A rollback step, run on a stopped node instead of the server: see
+    // `s4_server::rollback::purge_tombstones`.
+    if std::env::args().any(|arg| arg == "--purge-tombstones") {
+        let config = Config::default();
+        let purged = s4_server::rollback::purge_tombstones(&config).await?;
+        println!(
+            "s4-server: removed {purged} tombstone(s) from {}",
+            config.storage.metadata_path.display()
+        );
+        return Ok(());
+    }
+
     info!("S4 Server v{VERSION} starting...");
 
     // Load configuration

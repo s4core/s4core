@@ -47,6 +47,10 @@ pub enum ClusterError {
     #[error("RPC is not implemented by peer: {0}")]
     RpcUnimplemented(String),
 
+    /// The replica explicitly refused admission; replaying it as repair is forbidden.
+    #[error("replica fenced mutation: {0}")]
+    ReplicaFenced(String),
+
     /// TLS configuration error.
     #[error("TLS error: {0}")]
     Tls(String),
@@ -93,6 +97,15 @@ pub enum ClusterError {
         replica: u64,
     },
 
+    /// The coordinator used a pool placement generation below this replica's floor.
+    #[error("placement generation fenced: coordinator={coordinator}, minimum={minimum}")]
+    PlacementGenerationFenced {
+        /// Generation supplied by the coordinator (zero for a legacy sender).
+        coordinator: u64,
+        /// Minimum generation admitted by this replica.
+        minimum: u64,
+    },
+
     /// A quorum read operation timed out waiting for replica responses.
     #[error("read timeout after {0:?}")]
     ReadTimeout(std::time::Duration),
@@ -106,6 +119,24 @@ pub enum ClusterError {
     /// here would send an operator looking for a bug that is not there.
     #[error("{0}")]
     Unavailable(String),
+
+    /// Every replica that answered holds the object as an erasure-coded
+    /// namespace entry, with no bytes of its own: the object was moved into
+    /// an erasure set, and its bytes are read through the EC runtime. A
+    /// caller that took the object for a hot replicated one a moment before
+    /// reads it there.
+    #[error(
+        "{bucket}/{key} is erasure coded on all {replicas} replica(s) that answered; its bytes \
+         must be read through the EC runtime"
+    )]
+    ErasureCodedOnly {
+        /// Bucket name.
+        bucket: String,
+        /// Object key.
+        key: String,
+        /// Replicas that answered.
+        replicas: usize,
+    },
 
     /// Object not found on any replica.
     #[error("object not found: {bucket}/{key}")]

@@ -15,9 +15,11 @@
 //! Declarative cluster configuration.
 //!
 //! A cluster is composed of one or more **server pools**. Each pool is an
-//! immutable set of nodes that share data via quorum replication.
-//! Horizontal scaling is achieved by adding new pools — existing pools
-//! never change membership.
+//! ordered set of nodes that share data via quorum replication. A pool grows
+//! by appending nodes: the grown list prepares the pool's next generation,
+//! and its keys move to their new owners before the grown ring places them
+//! ([`crate::pool_generation`], [`crate::rebalance`]). Nodes are never
+//! removed, replaced or reordered.
 
 use std::net::SocketAddr;
 
@@ -219,9 +221,11 @@ impl ClusterConfig {
 
 /// Configuration for a single server pool.
 ///
-/// A pool is an immutable set of nodes. Once created, its membership
-/// **never changes**. This eliminates the need for data rebalancing
-/// within a pool.
+/// The configured roster may append members to prepare a successor
+/// generation; any other change to it is refused at start. Placement uses the
+/// durable current generation until the move of the pool's keys settles on the
+/// successor (plan ERASURE-CODING-FIXING-POOL-GROWTH-REBALANCE.md): a
+/// configuration change alone never replaces its ring.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolConfig {
     /// Unique pool identifier.
@@ -230,7 +234,7 @@ pub struct PoolConfig {
     /// Human-readable pool name.
     pub name: String,
 
-    /// Nodes belonging to this pool. Fixed after creation.
+    /// Configured members in stable order; growth only appends to this list.
     pub nodes: Vec<NodeAddr>,
 
     /// Override the cluster-level replication factor for this pool.
@@ -294,68 +298,48 @@ impl PoolConfig {
 // AntiEntropyConfig
 // ---------------------------------------------------------------------------
 
-/// Configuration for the background anti-entropy service (Phase 7).
-///
-/// Controls how frequently Merkle tree exchanges happen and the size of
-/// repair batches. The defaults are tuned for the 99.9% SLA: with a
-/// 10-minute interval, divergences are detected within one hour with
-/// probability > 99.9%.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// How this node runs anti-entropy rounds (plan ANTI-ENTROPY.md, decisions 11
+/// and 13).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AntiEntropyConfig {
-    /// Whether anti-entropy is enabled.
+    /// Whether this node starts rounds (`S4_ANTI_ENTROPY_ENABLED`). A node
+    /// that does not still answers the rounds of its peers.
     pub enabled: bool,
 
-    /// Interval between Merkle tree exchange rounds (default: 10 min).
-    ///
-    /// Each round, the node compares its Merkle tree with one random
-    /// replica peer per key range.
+    /// Seconds between two rounds (`S4_ANTI_ENTROPY_INTERVAL_SECS`). Each
+    /// round compares this node with one peer, the peers taken in turn.
     pub interval_secs: u64,
 
-    /// Depth of the Merkle tree (default: 15 → 32768 leaf buckets).
-    ///
-    /// Higher values give finer-grained divergence detection but use
-    /// more memory and storage.
-    pub merkle_depth: u8,
-
-    /// Maximum number of keys to synchronize per repair round.
-    ///
-    /// Limits the amount of data transferred in a single anti-entropy
-    /// cycle to avoid saturating the network.
-    pub max_keys_per_batch: u32,
-
-    /// Maximum number of concurrent repair streams.
-    pub max_concurrent_repairs: u32,
+    /// Most keys one round settles (`S4_ANTI_ENTROPY_MAX_KEYS_PER_ROUND`);
+    /// the rest wait for the next round.
+    pub max_keys_per_round: u32,
 }
 
 impl Default for AntiEntropyConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            interval_secs: 600, // 10 minutes
-            merkle_depth: 15,
-            max_keys_per_batch: 1000,
-            max_concurrent_repairs: 4,
+            interval_secs: 600,
+            max_keys_per_round: 1000,
         }
     }
 }
 
 impl AntiEntropyConfig {
-    /// Validate the configuration.
+    /// Validate the configuration. The interval and the key limit matter
+    /// only to a node that starts rounds: switched off, they are not checked.
     pub fn validate(&self) -> Result<(), ClusterError> {
-        if self.merkle_depth == 0 || self.merkle_depth > 24 {
-            return Err(ClusterError::Config(format!(
-                "merkle_depth must be 1..=24, got {}",
-                self.merkle_depth
-            )));
+        if !self.enabled {
+            return Ok(());
         }
         if self.interval_secs == 0 {
             return Err(ClusterError::Config(
-                "anti-entropy interval must be > 0".into(),
+                "S4_ANTI_ENTROPY_INTERVAL_SECS must be > 0".into(),
             ));
         }
-        if self.max_keys_per_batch == 0 {
+        if self.max_keys_per_round == 0 {
             return Err(ClusterError::Config(
-                "max_keys_per_batch must be > 0".into(),
+                "S4_ANTI_ENTROPY_MAX_KEYS_PER_ROUND must be > 0".into(),
             ));
         }
         Ok(())

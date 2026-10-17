@@ -18,7 +18,7 @@ operational features:
 | Full cluster (1 pool, 3 nodes) | Yes | Yes |
 | Quorum replication (RF=3, W=2, R=2) | Yes | Yes |
 | SWIM Gossip + gRPC | Yes | Yes |
-| Anti-Entropy (Merkle tree repair) | Yes | Yes |
+| Anti-Entropy (rounds by version digests) | Yes | Yes |
 | Background CRC32 Scrubber | Yes | Yes |
 | Unlimited pools and nodes | — | Yes |
 | Deep SHA-256 Scrubber | — | Yes |

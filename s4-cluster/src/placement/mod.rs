@@ -31,18 +31,25 @@
 //! bypassed in favour of a trivial O(1) broadcast to all pool members.
 
 pub mod bucket_placement;
+pub mod class;
 pub mod hash_ring;
 pub mod router;
 
 pub use bucket_placement::BucketPlacement;
-pub use hash_ring::{ConsistentHashRing, PlacementStrategy};
+pub use class::{
+    BucketMetadataMove, ClassLayout, PoolLayout, ReplicationClass, StagedPlacement, TombstoneKeep,
+    WriteRequirement, WriteRule,
+};
+pub use hash_ring::{ConsistentHashRing, PlacementStrategy, RingCover};
 
-/// Compute the ring position for a `"bucket/key"` string using BLAKE3.
-///
-/// This is the same hash used by [`ConsistentHashRing`] to place keys on
-/// the consistent hash ring. Anti-entropy, Merkle trees, and repair use
-/// this to map objects to ring positions.
-pub fn ring_position(bucket: &str, key: &str) -> u64 {
-    ConsistentHashRing::hash_key(&format!("{bucket}/{key}"))
-}
-pub use router::{PlacementDecision, PlacementRouter};
+pub use router::{GenerationOwners, PlacementDecision, PlacementRouter};
+/// The ring position of `bucket/key`: the one definition lives in `s4-core`,
+/// which orders the version digests of the storage by it.
+pub use s4_core::ring_position;
+
+pub mod generation;
+pub use generation::{
+    GenerationPhase, GenerationRange, GenerationRanges, OldReadTicket, RangeCounts, RangeState,
+};
+#[cfg(test)]
+mod generation_model_tests;

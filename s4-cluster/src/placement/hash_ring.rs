@@ -29,7 +29,7 @@ use crate::identity::NodeId;
 ///
 /// 128 vnodes gives good distribution uniformity even with a small
 /// number of physical nodes.
-const DEFAULT_VNODES_PER_NODE: u32 = 128;
+pub(crate) const DEFAULT_VNODES_PER_NODE: u32 = 128;
 
 /// Routing strategy for mapping keys to replica nodes within a pool.
 ///
@@ -107,6 +107,18 @@ impl PlacementStrategy {
         }
     }
 
+    /// The replicas of a key at ring position `position`
+    /// ([`s4_core::ring_position_of`] of the key): what
+    /// [`get_replicas`](Self::get_replicas) answers for it, without hashing
+    /// the key again — for callers that hold its position already, such as a
+    /// version digest.
+    pub fn replicas_at(&self, position: u64) -> Vec<NodeId> {
+        match self {
+            Self::FullReplication { nodes } => nodes.clone(),
+            Self::HashRing(ring) => ring.replicas_at(position),
+        }
+    }
+
     /// Number of replicas returned per key.
     pub fn replication_factor(&self) -> u8 {
         match self {
@@ -129,6 +141,35 @@ impl PlacementStrategy {
             Self::FullReplication { nodes } => nodes,
             Self::HashRing(ring) => ring.all_nodes(),
         }
+    }
+}
+
+/// The index of the first entry of `ring` (sorted by position) at or after
+/// `position`, wrapping to the first past the last.
+fn start_index_in<T>(ring: &[T], position: u64, position_of: impl Fn(&T) -> u64) -> usize {
+    match ring.binary_search_by_key(&position, position_of) {
+        Ok(i) => i,
+        Err(i) => i % ring.len(),
+    }
+}
+
+/// The arcs of a ring on which a set of nodes are all replicas
+/// ([`ConsistentHashRing::cover_of`]).
+#[derive(Debug, Clone)]
+pub struct RingCover {
+    /// The ring's virtual node positions, ascending.
+    positions: Vec<u64>,
+    /// Whether the walk from each virtual node takes every node of the set.
+    covered: Vec<bool>,
+}
+
+impl RingCover {
+    /// Whether every node of the set is a replica of a key at `position`.
+    pub fn covers(&self, position: u64) -> bool {
+        if self.positions.is_empty() {
+            return false;
+        }
+        self.covered[start_index_in(&self.positions, position, |pos| *pos)]
     }
 }
 
@@ -192,17 +233,56 @@ impl ConsistentHashRing {
         })
     }
 
+    /// Sorted positions of virtual nodes, including coincident positions.
+    pub fn vnode_positions(&self) -> Vec<u64> {
+        self.ring.iter().map(|(position, _)| *position).collect()
+    }
+
     /// Select `rf` distinct physical replica nodes for the given key.
     ///
     /// Walks clockwise from the key's hash position, skipping duplicate
     /// physical nodes, until `rf` distinct nodes are collected.
     pub fn get_replicas(&self, key: &str) -> Vec<NodeId> {
-        let hash = Self::hash_key(key);
-        let start = match self.ring.binary_search_by_key(&hash, |&(pos, _)| pos) {
-            Ok(i) => i,
-            Err(i) => i % self.ring.len(),
-        };
+        self.replicas_at(s4_core::ring_position_of(key))
+    }
 
+    /// The replicas of a key at ring position `position`.
+    pub fn replicas_at(&self, position: u64) -> Vec<NodeId> {
+        match self.start_index(position) {
+            Some(start) => self.replicas_from(start),
+            None => Vec::new(),
+        }
+    }
+
+    /// The arcs of the ring on which every node of `nodes` is a replica.
+    ///
+    /// A key's replicas depend only on the first virtual node at or after its
+    /// position, so they are the same along each arc between two virtual
+    /// nodes. Computed once, the cover answers for any position with a binary
+    /// search, without hashing the key or collecting its replicas.
+    pub fn cover_of(&self, nodes: &[NodeId]) -> RingCover {
+        RingCover {
+            positions: self.ring.iter().map(|(position, _)| *position).collect(),
+            covered: (0..self.ring.len())
+                .map(|start| {
+                    let replicas = self.replicas_from(start);
+                    nodes.iter().all(|node| replicas.contains(node))
+                })
+                .collect(),
+        }
+    }
+
+    /// Where the walk for a key at `position` starts; `None` on an empty ring.
+    fn start_index(&self, position: u64) -> Option<usize> {
+        if self.ring.is_empty() {
+            return None;
+        }
+        Some(start_index_in(&self.ring, position, |&(pos, _)| pos))
+    }
+
+    /// The `rf` distinct physical nodes met walking clockwise from virtual
+    /// node `start`.
+    fn replicas_from(&self, start: usize) -> Vec<NodeId> {
         let mut replicas = Vec::with_capacity(self.rf as usize);
         let ring_len = self.ring.len();
 
@@ -240,13 +320,6 @@ impl ConsistentHashRing {
         self.ring.len()
     }
 
-    /// Hash a key to a 64-bit ring position using BLAKE3.
-    pub fn hash_key(key: &str) -> u64 {
-        let hash = blake3::hash(key.as_bytes());
-        let bytes: [u8; 8] = hash.as_bytes()[..8].try_into().expect("8 bytes from 32");
-        u64::from_be_bytes(bytes)
-    }
-
     /// Hash a virtual node to a ring position.
     ///
     /// Input: `BLAKE3(node_id_bytes || vnode_index_bytes)`.
@@ -267,6 +340,30 @@ impl ConsistentHashRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The cover of a pair answers as the replicas of each key do, on rings of
+    /// several sizes and replication factors, for every pair.
+    #[test]
+    fn a_ring_cover_agrees_with_the_replicas_of_every_key() {
+        for (nodes, rf) in [(3u128, 3u8), (5, 2), (7, 3), (12, 3)] {
+            let ids: Vec<NodeId> = (1..=nodes).map(NodeId).collect();
+            let ring = ConsistentHashRing::new(ids.clone(), rf, 64).unwrap();
+            for a in &ids {
+                for b in ids.iter().filter(|b| *b != a) {
+                    let cover = ring.cover_of(&[*a, *b]);
+                    for n in 0..2_000 {
+                        let key = format!("bucket/key-{n}");
+                        let replicas = ring.get_replicas(&key);
+                        assert_eq!(
+                            cover.covers(s4_core::ring_position_of(&key)),
+                            replicas.contains(a) && replicas.contains(b),
+                            "{nodes} nodes, rf {rf}, pair {a}/{b}, {key}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     fn make_nodes(count: usize) -> Vec<NodeId> {
         // Deterministic node IDs for reproducible tests.
@@ -400,6 +497,25 @@ mod tests {
         assert_eq!(strategy.get_replicas("anything"), vec![NodeId(42)]);
     }
 
+    /// Replica sets computed before the ring position moved to `s4-core`:
+    /// placement of existing keys must not shift.
+    #[test]
+    fn hash_ring_places_keys_where_it_always_did() {
+        let strategy = PlacementStrategy::new(make_nodes(6), 3).unwrap();
+        let known: [(&str, [u128; 3]); 6] = [
+            ("photos/cat.jpg", [1, 4, 2]),
+            ("bucket/a", [6, 4, 1]),
+            ("__system__/__s4_bucket_marker_photos", [5, 6, 2]),
+            ("b/ключ с пробелом", [4, 6, 2]),
+            ("bucket/x#v1", [1, 4, 6]),
+            ("a/", [3, 6, 1]),
+        ];
+        for (key, replicas) in known {
+            let expected: Vec<NodeId> = replicas.into_iter().map(NodeId).collect();
+            assert_eq!(strategy.get_replicas(key), expected, "{key}");
+        }
+    }
+
     #[test]
     fn hash_ring_minimal_case() {
         // 2 nodes, RF=1: hash ring with minimal setup.
@@ -430,5 +546,63 @@ mod tests {
         let a = ConsistentHashRing::hash_vnode(NodeId(1), 0);
         let b = ConsistentHashRing::hash_vnode(NodeId(2), 0);
         assert_ne!(a, b);
+    }
+
+    /// More replicas of a key on the same nodes only add to the replicas it
+    /// had (plan BUCKET-METADATA-REPLICATION.md, decision 3): on one ring, the
+    /// replicas at RF 5 start with the replicas at RF 3, in order; when the
+    /// larger factor is the whole pool, they hold every replica at RF 3. A
+    /// change of the replication factor of a class therefore only adds
+    /// replicas to each key and moves none.
+    #[test]
+    fn more_replicas_on_the_same_nodes_keep_the_replicas_a_key_had() {
+        for (nodes, smaller, larger) in [(6u128, 3u8, 5u8), (9, 3, 5), (12, 3, 5), (7, 3, 4)] {
+            let ids: Vec<NodeId> = (1..=nodes).map(NodeId).collect();
+            let small = PlacementStrategy::new(ids.clone(), smaller).unwrap();
+            let large = PlacementStrategy::new(ids, larger).unwrap();
+            for i in 0..10_000 {
+                let key = format!("__system__/__s4_bucket_marker_bucket-{i}");
+                let before = small.get_replicas(&key);
+                let after = large.get_replicas(&key);
+                assert_eq!(after.len(), usize::from(larger), "{key}");
+                assert_eq!(&after[..before.len()], &before[..], "{nodes} nodes, {key}");
+            }
+        }
+        for (nodes, smaller) in [(5u128, 3u8), (6, 3), (4, 3)] {
+            let ids: Vec<NodeId> = (1..=nodes).map(NodeId).collect();
+            let small = PlacementStrategy::new(ids.clone(), smaller).unwrap();
+            let all = PlacementStrategy::new(ids, nodes as u8).unwrap();
+            assert!(matches!(all, PlacementStrategy::FullReplication { .. }));
+            for i in 0..10_000 {
+                let key = format!("__system__/__s4_bucket_marker_bucket-{i}");
+                let after = all.get_replicas(&key);
+                for node in small.get_replicas(&key) {
+                    assert!(
+                        after.contains(&node),
+                        "{nodes} nodes, {key}: {node} dropped"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The replicas at a key's ring position are the key's replicas, on a
+    /// ring and under full replication alike.
+    #[test]
+    fn replicas_at_the_position_of_a_key_are_its_replicas() {
+        let nodes: Vec<NodeId> = (1..=5).map(NodeId).collect();
+        for strategy in [
+            PlacementStrategy::new(nodes.clone(), 3).unwrap(),
+            PlacementStrategy::new(nodes[..3].to_vec(), 3).unwrap(),
+        ] {
+            for i in 0..10_000 {
+                let key = format!("bucket/key-{i}");
+                assert_eq!(
+                    strategy.replicas_at(s4_core::ring_position_of(&key)),
+                    strategy.get_replicas(&key),
+                    "{key}"
+                );
+            }
+        }
     }
 }

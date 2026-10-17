@@ -14,8 +14,8 @@
 
 //! Admin JWT signing secret.
 //!
-//! The admin API trusts the role inside a validly signed token, so whoever knows
-//! the signing secret can mint a SuperUser token. These tests pin down that the
+//! Whoever knows the signing secret can mint a token for any account, root
+//! included. These tests pin down that the
 //! secret is never a value known in advance: without configuration every state
 //! gets its own random secret, and a configured secret is the only one accepted.
 
@@ -25,7 +25,7 @@ use axum::{
 };
 use s4_api::{create_router, AppState};
 use s4_core::storage::BitcaskStorageEngine;
-use s4_features::iam::{models::Role, JwtManager};
+use s4_features::iam::{models::Role, JwtManager, RootAccount};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -157,12 +157,26 @@ async fn configured_secret_signs_and_verifies_tokens() {
 
 #[tokio::test]
 async fn nodes_sharing_a_configured_secret_accept_each_others_tokens() {
+    // A token refers to an account, so the account must be one both nodes know:
+    // root, which every node derives from the same configuration.
     let (first, _t1) = state_with_admin().await;
     let (second, _t2) = state_with_admin().await;
-    let first = first.with_jwt_secret(CONFIGURED_SECRET);
-    let second = second.with_jwt_secret(CONFIGURED_SECRET);
+    let root = || RootAccount::new("root", "root-password-123", CONFIGURED_SECRET).unwrap();
+    let first = first.with_jwt_secret(CONFIGURED_SECRET).with_root_account(root());
+    let second = second.with_jwt_secret(CONFIGURED_SECRET).with_root_account(root());
 
-    let token = login(&first).await;
+    let body = serde_json::json!({ "username": "root", "password": "root-password-123" });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/admin/login")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = create_router(first.clone()).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let token = json["token"].as_str().unwrap().to_string();
 
     assert_eq!(list_users_status(&second, &token).await, StatusCode::OK);
 }

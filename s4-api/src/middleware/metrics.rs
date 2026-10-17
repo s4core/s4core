@@ -28,12 +28,16 @@ use std::time::Instant;
 ///
 /// Path labels are normalized to avoid high cardinality (bucket names and object keys
 /// are replaced with placeholders).
+///
+/// The request runs as one a client sent: every quorum operation it coordinates
+/// is counted in `s4_quorum_operations_total` with `origin="client"`, apart from
+/// the node's own work.
 pub async fn metrics_middleware(request: Request, next: Next) -> Response {
     let method = request.method().to_string();
     let raw_path = request.uri().path().to_string();
     let start = Instant::now();
 
-    let response = next.run(request).await;
+    let response = s4_cluster::on_behalf_of_client(next.run(request)).await;
 
     let duration = start.elapsed().as_secs_f64();
     let status = response.status().as_u16().to_string();
@@ -53,12 +57,16 @@ pub async fn metrics_middleware(request: Request, next: Next) -> Response {
 /// - `/metrics` → `/metrics`
 /// - `/health` → `/health`, not `/{bucket}`: a load balancer's health checks would
 ///   otherwise be counted as bucket listings
+/// - `/minio/health/live` and `/minio/health/ready` retain their own labels
 /// - `/api/admin/...` → `/api/admin`
 /// - `/api/stats` → `/api/stats`
 /// - `/{bucket}` → `/{bucket}`
 /// - `/{bucket}/{key...}` → `/{bucket}/{key}`
 fn normalize_path(path: &str) -> String {
-    if path == "/" || path == "/metrics" || path == "/health" || path == "/api/stats" {
+    if matches!(
+        path,
+        "/" | "/metrics" | "/health" | "/minio/health/live" | "/minio/health/ready" | "/api/stats"
+    ) {
         return path.to_string();
     }
     if path.starts_with("/api/admin") {
@@ -90,6 +98,13 @@ mod tests {
     #[test]
     fn test_normalize_path_health() {
         assert_eq!(normalize_path("/health"), "/health");
+    }
+
+    #[test]
+    fn test_normalize_path_minio_health() {
+        assert_eq!(normalize_path("/minio/health/live"), "/minio/health/live");
+        assert_eq!(normalize_path("/minio/health/ready"), "/minio/health/ready");
+        assert_eq!(normalize_path("/minio/health/other"), "/{bucket}/{key}");
     }
 
     #[test]

@@ -117,14 +117,50 @@ Set up alerts for:
 
 ### Health Checks
 
-Use the health endpoint for liveness and readiness probes:
+Use separate endpoints for process liveness and readiness to receive client traffic:
 
 ```bash
-curl -f http://localhost:9000/health
+curl -f http://localhost:9000/health               # Liveness
+curl -f http://localhost:9000/minio/health/ready   # Readiness
 ```
 
-Returns `200 OK` when the server is running. Do not probe `/api/stats`: it counts every object,
-and on a cluster node every object of the pool.
+`/health` and `/minio/health/live` return `200 OK` once the HTTP server is running.
+Use these endpoints for liveness; waiting for peers or metadata recovery must not
+cause a healthy process to be restarted.
+
+`/minio/health/ready` returns `503 Service Unavailable` with `Retry-After: 1` while
+a cluster node has required local recovery to finish: bucket configuration adoption,
+single-to-cluster migration, or IAM adoption or freshness confirmation. It returns
+`200 OK` when those local conditions allow client traffic. The `X-S4-Readiness` header
+on a refusal gives a fixed reason code; the protected Admin API and server log give
+details. Recovery does not stop inter-node RPC, gossip or the diagnostic API.
+
+Configure your load balancer to send client traffic only to ready nodes, including
+at startup before the first check. The supplied HAProxy configuration starts backends
+unavailable until their readiness checks succeed. Readiness
+is a per-node check, separate from cluster read/write quorum availability; a background
+repair or pool growth does not by itself make a node unready. If adoption requires an
+operator's decision, connect directly to the node's Admin API even while the client
+load balancer excludes it. Do not use readiness failure as a reason to restart it.
+
+For Kubernetes, use separate probes:
+
+```yaml
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 9000
+  periodSeconds: 10
+  timeoutSeconds: 2
+readinessProbe:
+  httpGet:
+    path: /minio/health/ready
+    port: 9000
+  periodSeconds: 5
+  timeoutSeconds: 2
+```
+
+Do not probe `/api/stats`: it counts every object, and on a cluster node every object of the pool.
 
 ## Backup
 

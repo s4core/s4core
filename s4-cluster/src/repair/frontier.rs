@@ -14,22 +14,35 @@
 
 //! Repair frontier — per-replica confirmed reconciliation markers.
 //!
-//! The frontier tracks, for each key range and each replica, the minimum
-//! HLC timestamp up to which reconciliation has been confirmed. This is
-//! the foundation for safe tombstone GC in Phase 8.
+//! The frontier tracks, for each key range and each replica, the HLC up to
+//! which reconciliation with that replica has been confirmed: its cut.
+//!
+//! # Cuts of a replicated pool
+//!
+//! An anti-entropy round compares this node with one peer over every key the
+//! two of them replicate ([`PairScope`](crate::repair::pair_tree::PairScope)).
+//! A round that compared every leaf and settled every divergent key sets the
+//! peer's cut to the HLC the round started at ([`advance_peer`]): the peer
+//! has everything this node held before that moment. The cut covers the whole
+//! ring, since the pair's scope is all of their shared keys. This node never
+//! has a cut of its own.
+//!
+//! The frontier lives in memory: after a restart, tombstones wait for a full
+//! turn of rounds over the peers before they go again, which is safe.
 //!
 //! # Safety Invariant
 //!
-//! A tombstone `T` is safe to purge **only** if for **all** replicas in
-//! the replica set, `confirmed_cut >= T.hlc_timestamp`. A simple per-range
-//! watermark is insufficient because a fresh watermark does not prove that
-//! a specific tombstone has been seen by all replicas.
+//! A tombstone `T` is safe to purge only if every other replica of its key
+//! has a cut past `T`'s HLC
+//! ([`can_purge_tombstone`](crate::gc::can_purge_tombstone)):
 //!
 //! ```text
 //! purgeable(T) ⟺
-//!   age(T) > gc_horizon AND
-//!   repair_frontier(range(T)) >= version(T) FOR ALL replicas
+//!   age(T) > gc_grace AND
+//!   cut(replica) > version(T) FOR ALL replicas other than this node
 //! ```
+//!
+//! [`advance_peer`]: RepairFrontier::advance_peer
 
 use std::collections::HashMap;
 
@@ -82,6 +95,30 @@ impl RepairFrontier {
                 "repair frontier advanced"
             );
         }
+    }
+
+    /// Moves the cut of `peer` over the whole ring to `cut`, never back:
+    /// what a complete anti-entropy round with it confirms.
+    pub fn advance_peer(&mut self, peer: NodeId, cut: HlcTimestamp) {
+        self.advance(&KeyRange::full(), peer, cut);
+    }
+
+    /// The cut of `peer` over the whole ring, if a complete round with it
+    /// set one.
+    pub fn peer_cut(&self, peer: &NodeId) -> Option<HlcTimestamp> {
+        self.get_cut(&KeyRange::full(), peer)
+    }
+
+    /// How far behind `now_millis` the oldest cut of `peers` is, in
+    /// milliseconds. A peer without a cut counts from `since_millis`, when
+    /// this node started keeping the frontier: a peer no round has completed
+    /// with since then lags by as long. Zero without peers.
+    pub fn lag_millis(&self, peers: &[NodeId], since_millis: u64, now_millis: u64) -> u64 {
+        peers
+            .iter()
+            .map(|peer| self.peer_cut(peer).map_or(since_millis, |cut| cut.wall_time))
+            .min()
+            .map_or(0, |oldest| now_millis.saturating_sub(oldest))
     }
 
     /// Check whether a tombstone can be safely purged.
@@ -287,6 +324,30 @@ mod tests {
         assert_eq!(restored.tracked_ranges(), 1);
         assert_eq!(restored.get_cut(&range(), &NodeId(1)), Some(ts(1000, 0)));
         assert_eq!(restored.get_cut(&range(), &NodeId(2)), Some(ts(2000, 0)));
+    }
+
+    #[test]
+    fn a_peer_cut_covers_the_whole_ring_and_only_moves_forward() {
+        let mut f = RepairFrontier::new();
+        assert_eq!(f.peer_cut(&NodeId(2)), None);
+        f.advance_peer(NodeId(2), ts(2000, 0));
+        f.advance_peer(NodeId(2), ts(1000, 0));
+        assert_eq!(f.peer_cut(&NodeId(2)), Some(ts(2000, 0)));
+        assert_eq!(f.get_cut(&KeyRange::full(), &NodeId(2)), Some(ts(2000, 0)));
+        assert_eq!(f.peer_cut(&NodeId(3)), None);
+    }
+
+    #[test]
+    fn the_lag_is_the_age_of_the_oldest_cut_a_peer_without_one_counting_from_the_start() {
+        let mut f = RepairFrontier::new();
+        let peers = [NodeId(2), NodeId(3)];
+        // Neither peer has a cut: both count from the start, at 1000.
+        assert_eq!(f.lag_millis(&peers, 1000, 5000), 4000);
+        f.advance_peer(NodeId(2), ts(4000, 0));
+        assert_eq!(f.lag_millis(&peers, 1000, 5000), 4000);
+        f.advance_peer(NodeId(3), ts(3000, 0));
+        assert_eq!(f.lag_millis(&peers, 1000, 5000), 2000);
+        assert_eq!(f.lag_millis(&[], 1000, 5000), 0);
     }
 
     #[test]

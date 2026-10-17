@@ -662,7 +662,7 @@ fn each_check_fails_on_a_damaged_dashboard() {
         ),
         (
             "a grouping by a label no metric carries",
-            with_query("Quorum operations", replace("by (operation", "by (peer")),
+            with_query("Quorum operations", replace("by (origin", "by (peer")),
             "grouped by peer, which no metric of the query carries",
         ),
         (

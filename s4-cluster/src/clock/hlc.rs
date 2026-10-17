@@ -114,19 +114,14 @@ impl HlcTimestamp {
     /// copy repaired from such a record is written with that same HLC, so it
     /// stays recognisable as made up on every replica it reaches.
     pub fn of_record(record: &s4_core::IndexRecord) -> Self {
-        if record.hlc_timestamp > 0 {
-            Self::from_record(
-                record.hlc_timestamp,
-                record.hlc_logical,
-                record.origin_node_id,
-            )
-        } else {
-            Self {
-                wall_time: record.modified_at / 1_000_000, // nanos → millis
-                logical: 0,
-                node_id: 0,
-            }
-        }
+        let (wall_time, logical, node_id) = record.reported_hlc();
+        Self::from_record(wall_time, logical, node_id)
+    }
+
+    /// As `(wall, logical, node)`, the form a
+    /// [`VersionRank`](s4_core::storage::VersionRank) weighs.
+    pub fn as_tuple(&self) -> (u64, u32, u128) {
+        (self.wall_time, self.logical, self.node_id)
     }
 
     /// Whether no node issued this timestamp: it was made up for a record
@@ -158,6 +153,26 @@ impl HlcTimestamp {
             logical: proto.logical,
             node_id,
         }
+    }
+}
+
+impl From<HlcTimestamp> for s4_core::storage::TombstoneHorizon {
+    fn from(hlc: HlcTimestamp) -> Self {
+        Self {
+            hlc_timestamp: hlc.wall_time,
+            hlc_logical: hlc.logical,
+            origin_node_id: hlc.node_id,
+        }
+    }
+}
+
+impl From<s4_core::storage::TombstoneHorizon> for HlcTimestamp {
+    fn from(horizon: s4_core::storage::TombstoneHorizon) -> Self {
+        Self::from_record(
+            horizon.hlc_timestamp,
+            horizon.hlc_logical,
+            horizon.origin_node_id,
+        )
     }
 }
 
@@ -292,7 +307,7 @@ impl HybridClock {
 }
 
 /// Returns current wall clock time in milliseconds since Unix epoch.
-pub(crate) fn now_millis() -> u64 {
+pub fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

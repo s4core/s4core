@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use s4_cluster::repair::merkle::{record_hash, ring_position as merkle_ring_position};
+use s4_cluster::repair::merkle::record_hash;
 use s4_cluster::repair::{KeyRange, MerkleTree};
 use s4_cluster::NodeId;
 use thiserror::Error;
@@ -1761,7 +1761,7 @@ fn manifest_ring_position(object: &EcObjectVersionKey) -> u64 {
         Some(version_id) => format!("{}?versionId={version_id}", object.key),
         None => object.key.clone(),
     };
-    merkle_ring_position(&object.bucket, &versioned_key)
+    s4_core::ring_position(&object.bucket, &versioned_key)
 }
 
 fn reconstruction_sample_chunks(manifest: &EcObjectManifest, limit: usize) -> Vec<u32> {

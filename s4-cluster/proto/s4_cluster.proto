@@ -127,13 +127,17 @@ service S4Node {
     // question at the old price, not a weaker gate.
     rpc ProbeEcTombstones(ProbeEcTombstonesRequest) returns (ProbeEcTombstonesResponse);
 
-    // === Repair / Anti-entropy ===
+    // === Anti-entropy ===
 
-    // Exchange Merkle tree digests for divergence detection.
-    rpc ExchangeMerkleDigest(MerkleDigestRequest) returns (MerkleDigestResponse);
+    // The leaves of the tree of version digests this node shares with the
+    // caller: the keys both of them replicate. A node too old to know the call
+    // answers UNIMPLEMENTED; rounds start only once every node of the pool
+    // announces a protocol that has it.
+    rpc AntiEntropyLeaves(AntiEntropyLeavesRequest) returns (AntiEntropyLeavesResponse);
 
-    // Request specific keys for repair synchronization.
-    rpc RepairSync(RepairSyncRequest) returns (stream RepairSyncResponse);
+    // The keys and version digests of some leaves of that tree, a page at a
+    // time, in ring order.
+    rpc AntiEntropyKeys(AntiEntropyKeysRequest) returns (AntiEntropyKeysResponse);
 
     // === Cluster management ===
 
@@ -147,6 +151,49 @@ service S4Node {
 
     // Deliver a hinted write to a node that has come back online.
     rpc DeliverHint(HintRequest) returns (HintResponse);
+
+    // === Lease of IAM changes (protocol 8) ===
+
+    // Ask this node for an epoch of the lease of IAM changes. A holder holds
+    // the lease once a majority of the pool granted it the same epoch; the
+    // same holder asking again for the epoch it holds renews it.
+    rpc IamLeaseAcquire(IamLeaseAcquireRequest) returns (IamLeaseAcquireResponse);
+
+    // Release an epoch of the lease: the next holder may ask at once.
+    rpc IamLeaseRelease(IamLeaseReleaseRequest) returns (IamLeaseReleaseResponse);
+
+    // The records of the cluster's control state under a prefix, tombstones
+    // included, read by the holder of the lease for a change's
+    // preconditions. The node takes the reader's epoch first and refuses
+    // every write of an earlier one from then on.
+    rpc IamLeaseRead(IamLeaseReadRequest) returns (IamLeaseReadResponse);
+
+    // The versions of the cluster's control state this node holds,
+    // tombstones included, a page at a time, with the fingerprint of its
+    // live records taken before the page was read. A node whose copy of IAM
+    // differs from the one a peer announces asks the peer, and settles every
+    // key the peer holds in a newer version. Nothing is fenced: the caller
+    // holds no lease.
+    rpc IamVersions(IamVersionsRequest) returns (IamVersionsResponse);
+
+    // The user records this node keeps of its own, a page at a time: those an
+    // earlier release, or the node as a single node, stored on it alone,
+    // which its pool has not taken over. The report of the pool's adoption
+    // of IAM is built from every node's answer.
+    rpc IamOwnUsers(IamOwnUsersRequest) returns (IamOwnUsersResponse);
+
+    // === Pool growth ===
+
+    // This node's part in its pool's move to a grown generation: what the
+    // node verifying the ranges asks before it cuts ranges over and before
+    // the pool settles on its successor, and how it hands the node the
+    // ranges cut over and the pool's settling.
+    rpc PoolMove(PoolMoveRequest) returns (PoolMoveResponse);
+
+    // The keys and version digests this node holds at a span of ring
+    // positions, a page at a time, in ring order: what the verification of a
+    // range compares across both generations.
+    rpc RangeDigests(RangeDigestsRequest) returns (RangeDigestsResponse);
 }
 
 // ============================================================================
@@ -190,6 +237,35 @@ message WriteBlobRequest {
     bytes coordinator_id = 10;      // NodeId (16 bytes UUID)
     bytes operation_id = 11;        // OperationId (16 bytes UUID)
     uint64 topology_epoch = 12;     // Coordinator's current epoch
+    // The ETag of the version a repair copies (read repair, hints,
+    // anti-entropy), which the copy keeps; empty for a client's write, whose
+    // ETag the replica computes. Taken only together with `hlc`. A node that
+    // predates the field computes the ETag of the bytes instead.
+    string etag = 13;
+    // The stage of the move of the pool's bucket metadata the coordinator
+    // placed the key by (protocol 7; 0 from a node that predates it). A
+    // replica at stage s refuses a client's write of bucket metadata placed
+    // by a stage below s - 1 (`stage_fenced` in the answer).
+    uint32 bucket_metadata_stage = 14;
+    // The request carries a copy a repair settles — read repair, hints,
+    // anti-entropy, adoption — not a client's change: its HLC and version
+    // decide by last writer wins at any stage, and it is not fenced. A node
+    // that predates the field sends none.
+    bool repair_copy = 15;
+    // The lease a client's write of the cluster's control state (IAM) is
+    // made under (protocol 8). A replica refuses such a write without one, of
+    // an epoch below the highest it has seen, or with an HLC outside the
+    // epoch's window (`lease_fenced` in the answer). Not set on repair copies.
+    IamLeaseFence iam_lease = 16;
+    // Placement epoch of the coordinator; zero is a legacy sender.
+    uint64 placement_generation = 17;
+    // The replica checks the SHA-256 of `data` against `content_hash` before
+    // it stores the copy, and refuses one that differs (`checksum mismatch`
+    // in `error`). Set on the copies a repair settles, the move of a grown
+    // pool's keys among them; a copy without a whole-object hash (a
+    // multipart object's, all zeros) is not checked. A node that predates
+    // the field stores the copy unchecked.
+    bool verify_content = 18;
 }
 
 message WriteBlobResponse {
@@ -197,6 +273,17 @@ message WriteBlobResponse {
     string error = 2;
     uint64 local_sequence = 3;      // Sequence in the local journal
     bool epoch_mismatch = 4;        // true if replica has a different epoch
+    // The replica holds a newer version of the key, an object or a tombstone,
+    // and did not apply the write: the HLC of that version. `success` is true.
+    // The coordinator raises a client's write above it. Absent from a node
+    // that predates the field.
+    optional HybridTimestamp superseded_by = 5;
+    // The replica refused a client's write of bucket metadata placed by a
+    // stage too old for its own (protocol 7). `success` is false.
+    bool stage_fenced = 6;
+    // The replica refused a write of the cluster's control state made outside
+    // the current lease of IAM changes (protocol 8). `success` is false.
+    bool lease_fenced = 7;
 }
 
 message ReadBlobRequest {
@@ -221,6 +308,12 @@ message ReadBlobResponse {
     optional string version_id = 8;
     uint64 content_length = 9;
     bool epoch_mismatch = 10;
+    // The replica holds the key's tombstone, whose HLC is `hlc`; `success` is
+    // false. Absent (false) from a node before protocol 4, which keeps none.
+    bool tombstone = 11;
+    // The object's ETag as the replica keeps it. A copy repaired onto another
+    // replica keeps it too. Empty from a node before protocol 5.
+    string etag = 12;
 }
 
 message DeleteBlobRequest {
@@ -231,7 +324,24 @@ message DeleteBlobRequest {
     bytes operation_id = 5;         // OperationId (16 bytes UUID)
     uint64 topology_epoch = 6;
     optional string version_id = 7;
-    HybridTimestamp expected_source_hlc = 8; // Optional generation guard for physical GC purges
+    // Optional generation guard for physical GC purges. Without it, a replica
+    // at protocol 4 or above takes the delete as a tombstone at `hlc`.
+    HybridTimestamp expected_source_hlc = 8;
+    // The stage of the move of the pool's bucket metadata the coordinator
+    // placed the key by (protocol 7; 0 from a node that predates it). A
+    // replica at stage s refuses a client's write of bucket metadata placed
+    // by a stage below s - 1 (`stage_fenced` in the answer).
+    uint32 bucket_metadata_stage = 9;
+    // The request carries a copy a repair settles — read repair, hints,
+    // anti-entropy, adoption — not a client's change: its HLC and version
+    // decide by last writer wins at any stage, and it is not fenced. A node
+    // that predates the field sends none.
+    bool repair_copy = 10;
+    // The lease a client's delete of the cluster's control state is made
+    // under, as on a write (protocol 8).
+    IamLeaseFence iam_lease = 11;
+    // Placement epoch of the coordinator; zero is a legacy sender.
+    uint64 placement_generation = 12;
 }
 
 message DeleteBlobResponse {
@@ -239,6 +349,129 @@ message DeleteBlobResponse {
     string error = 2;
     uint64 local_sequence = 3;
     bool epoch_mismatch = 4;
+    // The delete would leave a tombstone, and the replica holds a newer
+    // version of the key, so it left none: the HLC of that version. `success`
+    // is true. Absent from a node that predates the field.
+    optional HybridTimestamp superseded_by = 5;
+    // The replica refused a client's write of bucket metadata placed by a
+    // stage too old for its own (protocol 7). `success` is false.
+    bool stage_fenced = 6;
+    // The replica refused a delete of the cluster's control state made
+    // outside the current lease of IAM changes (protocol 8).
+    bool lease_fenced = 7;
+}
+
+// The epoch of the lease of IAM changes a write is made under, and the HLC
+// window every write of the epoch stays inside: above `floor`, the highest
+// HLC an earlier epoch may have written with, and below `ceiling`.
+message IamLeaseFence {
+    uint64 epoch = 1;
+    bytes holder = 2;               // NodeId (16 bytes UUID)
+    HybridTimestamp floor = 3;
+    HybridTimestamp ceiling = 4;
+}
+
+message IamLeaseAcquireRequest {
+    bytes holder = 1;               // NodeId (16 bytes UUID)
+    uint64 epoch = 2;
+    // The holder's writes of the epoch stay below it.
+    HybridTimestamp ceiling = 3;
+    // How long the node holds the grant, by its own clock.
+    uint64 duration_ms = 4;
+}
+
+message IamLeaseAcquireResponse {
+    bool granted = 1;
+    // Granted: the highest HLC an earlier epoch may have written with.
+    HybridTimestamp floor = 2;
+    // Another holder holds this node's grant for `busy_remaining_ms` more.
+    bool busy = 3;
+    uint64 busy_remaining_ms = 4;
+    // The highest epoch this node has granted or seen.
+    uint64 max_epoch = 5;
+    // The node could not keep the grant: nothing was granted.
+    string error = 6;
+}
+
+message IamLeaseReleaseRequest {
+    bytes holder = 1;               // NodeId (16 bytes UUID)
+    uint64 epoch = 2;
+    // The holder's writes of the epoch stay at or below it.
+    HybridTimestamp closing = 3;
+}
+
+message IamLeaseReleaseResponse {
+    bool released = 1;
+}
+
+message IamLeaseReadRequest {
+    IamLeaseFence fence = 1;
+    string prefix = 2;
+    // Keys after it; empty from the first.
+    string start_after = 3;
+    uint32 max_keys = 4;
+}
+
+message IamLeaseRecord {
+    string key = 1;
+    // Empty for a tombstone.
+    bytes data = 2;
+    HybridTimestamp hlc = 3;
+    bool tombstone = 4;
+    string etag = 5;
+}
+
+message IamLeaseReadResponse {
+    repeated IamLeaseRecord records = 1;
+    // More keys follow the last one.
+    bool is_truncated = 2;
+    // The reader's epoch is behind this node's: nothing was read.
+    bool lease_fenced = 3;
+    string error = 4;
+}
+
+message IamVersionsRequest {
+    // Keys after it; empty from the first.
+    string start_after = 1;
+    uint32 max_keys = 2;
+}
+
+message IamVersion {
+    string key = 1;
+    HybridTimestamp hlc = 2;
+    bool tombstone = 3;
+    // Empty for a tombstone.
+    string etag = 4;
+}
+
+message IamVersionsResponse {
+    repeated IamVersion versions = 1;
+    // More keys follow the last one.
+    bool is_truncated = 2;
+    // The fingerprint of the node's live records (16 bytes), taken before
+    // the page was read: the page holds that state or a later one.
+    bytes digest = 3;
+    // The node has not read its copy of IAM yet: nothing was listed.
+    string error = 4;
+}
+
+message IamOwnUsersRequest {
+    // Keys after it; empty from the first.
+    string start_after = 1;
+    uint32 max_keys = 2;
+}
+
+message IamOwnRecord {
+    string key = 1;
+    bytes data = 2;
+}
+
+message IamOwnUsersResponse {
+    repeated IamOwnRecord records = 1;
+    // More keys follow the last one.
+    bool is_truncated = 2;
+    // The records could not be read: nothing was listed.
+    string error = 3;
 }
 
 message DetachObjectDataRequest {
@@ -250,6 +483,8 @@ message DetachObjectDataRequest {
     HybridTimestamp expected_source_hlc = 6; // Generation guard, always required
     uint64 erasure_set_id = 7;               // Set that owns the shards
     uint64 ec_topology_epoch = 8;            // Topology the object was placed under
+    // Placement epoch of the coordinator; zero is a legacy sender.
+    uint64 placement_generation = 9;
 }
 
 message AttachObjectDataRequest {
@@ -260,6 +495,8 @@ message AttachObjectDataRequest {
     uint64 topology_epoch = 5;
     HybridTimestamp expected_source_hlc = 6; // Generation guard, always required
     bytes data = 7;                          // Full object bytes, decoded from the shards
+    // Placement epoch of the coordinator; zero is a legacy sender.
+    uint64 placement_generation = 8;
 }
 
 message AttachObjectDataResponse {
@@ -280,6 +517,8 @@ message RestoreNamespaceEntryRequest {
     bytes coordinator_id = 4;
     bytes operation_id = 5;
     uint64 topology_epoch = 6;
+    // Placement epoch of the coordinator; zero is a legacy sender.
+    uint64 placement_generation = 7;
 }
 
 message RestoreNamespaceEntryResponse {
@@ -308,6 +547,8 @@ message CreateMultipartUploadReplicaRequest {
     bytes coordinator_id = 6;
     bytes operation_id = 7;
     uint64 topology_epoch = 8;
+    // Placement epoch of the coordinator; zero is a legacy sender.
+    uint64 placement_generation = 9;
 }
 
 message CreateMultipartUploadReplicaResponse {
@@ -323,6 +564,8 @@ message UploadMultipartPartReplicaHeader {
     bytes operation_id = 4;
     uint64 topology_epoch = 5;
     uint64 total_size = 6;
+    // Placement epoch of the coordinator; zero is a legacy sender.
+    uint64 placement_generation = 7;
 }
 
 message UploadMultipartPartReplicaChunk {
@@ -355,6 +598,11 @@ message InspectMultipartUploadReplicaResponse {
     bytes session = 3;             // bincode MultipartUploadSession
     repeated bytes part_records = 4; // bincode MultipartPartRecord
     bool epoch_mismatch = 5;
+    // HLC of the version the replica holds for the upload's key, an object or
+    // a tombstone. The completion is issued with an HLC above every one.
+    // Absent when the replica holds nothing for the key, or predates the
+    // field.
+    optional HybridTimestamp key_hlc = 6;
 }
 
 message CompleteMultipartUploadReplicaRequest {
@@ -369,6 +617,8 @@ message CompleteMultipartUploadReplicaRequest {
     bytes coordinator_id = 9;
     bytes operation_id = 10;
     uint64 topology_epoch = 11;
+    // Placement epoch of the coordinator; zero is a legacy sender.
+    uint64 placement_generation = 12;
 }
 
 message CompleteMultipartUploadReplicaResponse {
@@ -383,6 +633,8 @@ message AbortMultipartUploadReplicaRequest {
     bytes coordinator_id = 2;
     bytes operation_id = 3;
     uint64 topology_epoch = 4;
+    // Placement epoch of the coordinator; zero is a legacy sender.
+    uint64 placement_generation = 5;
 }
 
 message AbortMultipartUploadReplicaResponse {
@@ -414,6 +666,14 @@ message WriteBlobHeader {
     bytes operation_id = 9;
     uint64 topology_epoch = 10;
     uint64 total_size = 11;         // Total data size in bytes
+    uint32 bucket_metadata_stage = 12; // As in WriteBlobRequest
+    bool repair_copy = 13;             // As in WriteBlobRequest
+    // As in WriteBlobRequest: the ETag a repair copies. Absent from a node
+    // that predates the field, whose streamed copy took the ETag of its bytes.
+    string etag = 14;
+    IamLeaseFence iam_lease = 15;      // As in WriteBlobRequest
+    // Placement epoch of the coordinator; zero is a legacy sender.
+    uint64 placement_generation = 16;
 }
 
 message ReadBlobChunk {
@@ -433,6 +693,9 @@ message ReadBlobHeader {
     uint64 total_size = 7;
     optional uint64 range_start = 8;
     optional uint64 range_end = 9;
+    // The object's ETag, as in ReadBlobResponse. Empty from a node before
+    // protocol 5.
+    string etag = 10;
 }
 
 // ============================================================================
@@ -448,6 +711,8 @@ message WriteMetadataRequest {
     bytes operation_id = 6;
     uint64 topology_epoch = 7;
     optional string version_id = 8;
+    // Placement epoch of the coordinator; zero is a legacy sender.
+    uint64 placement_generation = 9;
 }
 
 message WriteMetadataResponse {
@@ -498,6 +763,14 @@ message HeadObjectResponse {
     // SHA-256 of the object content, 32 bytes. Empty from a node too old to
     // send it, which callers must read as "unknown", never as a mismatch.
     bytes content_hash = 11;
+    // The replica holds the key's tombstone, whose HLC is `hlc`; `exists` is
+    // false. Absent (false) from a node before protocol 4, which keeps none.
+    bool tombstone = 12;
+    // The replica holds nothing for the key, and this is its tombstone
+    // horizon: every delete on it since left a tombstone, an older one may
+    // have left nothing. Absent when the replica holds a version, has not
+    // settled its horizon, or predates the field.
+    optional HybridTimestamp tombstone_horizon = 13;
 }
 
 message ListObjectsRequest {
@@ -507,6 +780,9 @@ message ListObjectsRequest {
     uint32 max_keys = 4;
     string continuation_token = 5;
     uint64 topology_epoch = 6;
+    // List tombstones too, marked as such. A node before protocol 4 ignores
+    // the field and lists objects only.
+    bool include_tombstones = 7;
 }
 
 message ListObjectsResponse {
@@ -621,49 +897,8 @@ message ObjectInfo {
     string etag = 4;
     HybridTimestamp hlc = 5;
     optional string version_id = 6;
-}
-
-// ============================================================================
-// Repair / Anti-entropy messages
-// ============================================================================
-
-message MerkleDigestRequest {
-    string bucket = 1;
-    bytes range_start = 2;          // Key range start (inclusive)
-    bytes range_end = 3;            // Key range end (exclusive)
-    uint32 level = 4;               // Tree level (0 = leaf)
-    bytes tree_hash = 5;            // SHA-256 hash at this level
-    uint64 topology_epoch = 6;
-}
-
-message MerkleDigestResponse {
-    bool match = 1;
-    repeated MerkleRange divergent_ranges = 2;
-    bytes tree_hash = 3;
-    bool epoch_mismatch = 4;
-}
-
-message MerkleRange {
-    bytes range_start = 1;
-    bytes range_end = 2;
-    bytes local_hash = 3;
-}
-
-message RepairSyncRequest {
-    string bucket = 1;
-    repeated string keys = 2;       // Keys to synchronize
-    uint64 topology_epoch = 3;
-}
-
-message RepairSyncResponse {
-    string key = 1;
-    bytes data = 2;
-    bytes record = 3;               // Serialized IndexRecord
-    HybridTimestamp hlc = 4;
-    optional string version_id = 5;
-    bytes content_hash = 6;
-    string content_type = 7;
-    map<string, string> metadata = 8;
+    // The entry is a tombstone, listed on `include_tombstones`.
+    bool tombstone = 7;
 }
 
 // ============================================================================
@@ -736,9 +971,158 @@ message HintRequest {
     map<string, string> metadata = 9;
     string content_type = 10;
     HybridTimestamp expected_source_hlc = 11;
+    // Placement epoch of the coordinator; zero is a legacy sender.
+    uint64 placement_generation = 12;
 }
 
 message HintResponse {
     bool accepted = 1;
+    string error = 2;
+}
+
+// ============================================================================
+// Anti-entropy messages
+// ============================================================================
+
+// How a pair compares the keys of bucket metadata, as the caller chose for
+// the round: by a layout of their own, or not at all while the pool moves
+// them. Absent from a node of protocol 6 or earlier, which compares them
+// like the data.
+message BucketMetadataScope {
+    // The keys are left out of the round.
+    bool excluded = 1;
+    // The replication factor of their layout on the pool's ring.
+    uint32 replication_factor = 2;
+}
+
+message AntiEntropyLeavesRequest {
+    uint32 pool_id = 1;
+    // The caller, the other node of the pair (16 bytes).
+    bytes peer_id = 2;
+    uint64 topology_epoch = 3;
+    // The caller's version digest format; 0 from a node of protocol 5, which
+    // does not send it. A node answers only a caller of its own format.
+    uint32 digests_format = 4;
+    optional BucketMetadataScope bucket_metadata = 5;
+}
+
+message AntiEntropyLeavesResponse {
+    // 16 384 leaf hashes of 32 bytes each, leaf 0 first.
+    bytes leaves = 1;
+    bool epoch_mismatch = 2;
+    string error = 3;
+}
+
+// Where a page of keys continues: in `leaf`, after the key `after_key`, or
+// at the leaf's start when it is absent.
+message AntiEntropyCursor {
+    uint32 leaf = 1;
+    optional string after_key = 2;
+}
+
+message AntiEntropyKeysRequest {
+    uint32 pool_id = 1;
+    bytes peer_id = 2;
+    uint64 topology_epoch = 3;
+    // The leaves asked about, ascending.
+    repeated uint32 leaves = 4;
+    optional AntiEntropyCursor cursor = 5;
+    uint32 max_keys = 6;
+    // As in AntiEntropyLeavesRequest.
+    uint32 digests_format = 7;
+    optional BucketMetadataScope bucket_metadata = 8;
+}
+
+message AntiEntropyKeyDigest {
+    uint32 leaf = 1;
+    // The key as the index holds it: `bucket/key`.
+    string key = 2;
+    // The version digest, as the storage encodes it (61 bytes).
+    bytes digest = 3;
+}
+
+message AntiEntropyKeysResponse {
+    repeated AntiEntropyKeyDigest keys = 1;
+    // Absent once the leaves asked about are done.
+    optional AntiEntropyCursor next = 2;
+    bool epoch_mismatch = 3;
+    string error = 4;
+}
+
+// ============================================================================
+// Pool growth
+// ============================================================================
+
+message PoolMoveRequest {
+    uint32 pool_id = 1;
+    // The move asked about: from this epoch to that one.
+    uint64 from_epoch = 2;
+    uint64 to_epoch = 3;
+    // Upper endpoints of arcs verified and cut over, for this node to apply.
+    repeated uint64 cut_over = 4;
+    // The pool settled on the successor generation: its replicated record
+    // says so, and this node is to settle too.
+    bool finished = 5;
+    // Hand this open upload, which this node holds, to these replicas of its
+    // key before answering: a coordinator or a hint needs them to hold it.
+    // Answered whatever epochs the request names.
+    optional UploadHandOver hand_over_upload = 6;
+}
+
+message UploadHandOver {
+    string bucket = 1;
+    string key = 2;
+    string upload_id = 3;
+    // Node identities, 16 bytes each.
+    repeated bytes targets = 4;
+}
+
+message PoolMoveResponse {
+    // 0 prepared, 1 moving, 2 settled on the successor.
+    uint32 phase = 1;
+    // Arcs of the union ring, and those this node reads through the
+    // successor.
+    uint64 ranges_total = 2;
+    uint64 ranges_cut_over = 3;
+    // Placement decisions in flight on this node that read through the old
+    // owners.
+    uint64 old_reads_in_flight = 4;
+    // This node handed over everything it holds of the old generation: its
+    // arcs, its records of `__system__` without digests, its open uploads.
+    // Always true for a node of the successor alone.
+    bool handed_over = 5;
+    // The nodes this node keeps hints for (16 bytes each).
+    repeated bytes hint_targets = 6;
+    // This node is not in the move asked about, or could not answer.
+    string error = 7;
+    // What became of `hand_over_upload`: 0 none was asked, 1 every target
+    // holds the upload, 2 the upload is no longer open, 3 a target could not
+    // be brought to it now, 4 a part arrived damaged.
+    uint32 upload_outcome = 8;
+    // Why, for outcomes 3 and 4.
+    string upload_error = 9;
+}
+
+message RangeDigestsRequest {
+    uint32 pool_id = 1;
+    // Ring positions from `from` up to `to`, the end of the ring when absent.
+    uint64 from = 2;
+    optional uint64 to = 3;
+    // Continue after this key (`bucket/key`), from the start when absent.
+    optional string after_key = 4;
+    uint32 max_keys = 5;
+}
+
+message RangeKeyDigest {
+    // The key as the index holds it: `bucket/key`.
+    string key = 1;
+    // The version digest, as the storage encodes it (61 bytes).
+    bytes digest = 2;
+    // The key's ring position.
+    uint64 ring_position = 3;
+}
+
+message RangeDigestsResponse {
+    repeated RangeKeyDigest keys = 1;
     string error = 2;
 }

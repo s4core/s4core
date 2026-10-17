@@ -34,8 +34,10 @@ use crate::cluster_metrics::{MemberStatus, PoolRoster};
 use crate::gc::service::GcMetrics;
 use crate::gossip::GossipHandle;
 use crate::identity::{NodeMeta, NodeStatus};
+use crate::metadata_placement::{PlacementStatus, QuorumShape};
 use crate::protocol::{PROTOCOL_VERSION, S4_VERSION};
-use crate::repair::AntiEntropyMetrics;
+use crate::rebalance::PoolGrowth;
+use crate::repair::{AntiEntropyMetrics, ConfigAdoptionSnapshot, ConfigAdoptionStatus};
 use crate::scrubber::metrics::{ScrubberMetrics, ScrubberMetricsSnapshot};
 
 /// What the cluster routes of the admin API report.
@@ -57,6 +59,12 @@ pub trait ClusterAdminService: Send + Sync + 'static {
 
     /// The background scrubber of this node.
     fn scrubber_status(&self) -> Option<ScrubberStatus>;
+
+    /// The pool's growth on this node: its state, and the pause of the move
+    /// of its keys. `None` on a node that is not part of a cluster.
+    fn pool_growth(&self) -> Option<Arc<PoolGrowth>> {
+        None
+    }
 }
 
 /// The service of a node that is not part of a cluster.
@@ -122,6 +130,99 @@ pub struct ClusterHealthStatus {
     pub write_quorum: u8,
     /// Replicas a read waits for.
     pub read_quorum: u8,
+    /// Where the move of the pool's bucket metadata to more replicas stands
+    /// on this node.
+    pub bucket_metadata: Option<BucketMetadataHealth>,
+    /// This node's progress adopting its own bucket configurations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_config_adoption: Option<ConfigAdoptionSnapshot>,
+    /// Whether IAM changes wait for the pool to take over the IAM some node
+    /// kept of its own; such a pool is at least `degraded`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iam_adoption: Option<IamAdoptionHealth>,
+    /// Whether the live nodes of the pool are configured alike for IAM; a
+    /// pool where they are not is `critical`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iam_config: Option<IamConfigHealth>,
+    /// Single-to-cluster obligations still awaiting every placement owner.
+    #[serde(default)]
+    pub migration_pending_records: u64,
+}
+
+/// The IAM configuration of the live nodes of the pool compared, as this
+/// node sees it (`s4_iam_config_mismatch`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IamConfigHealth {
+    /// Whether every live node announces the same root, JWT secret and IAM
+    /// encryption key.
+    pub consistent: bool,
+    /// The settings that differ, with the nodes that differ.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mismatches: Vec<crate::iam_config::IamConfigMismatch>,
+}
+
+/// The pool taking over the IAM its nodes kept of their own, as this node
+/// sees it (`s4_iam_adoption_pending`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IamAdoptionHealth {
+    /// Whether IAM changes are refused until it is taken over.
+    pub pending: bool,
+    /// Why, while they are.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The move of a pool's bucket markers and configurations from the replicas
+/// of its data to as many as the pool survives failures for, as this node is
+/// at it. A pool with nothing to move is settled from the start, with `from`
+/// and `to` its data's shape.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BucketMetadataHealth {
+    /// The stage, 0 to 3 (`s4_bucket_metadata_stage`).
+    pub stage: u8,
+    /// `legacy`, `dual_write`, `read_new` or `settled`.
+    pub stage_name: String,
+    /// The layout the move starts from.
+    pub from: PlacementShape,
+    /// The layout it ends at (`s4_bucket_metadata_replication_factor`).
+    pub to: PlacementShape,
+    /// Whether this node brought what it held to the new replicas.
+    pub backfill_complete: bool,
+    /// The nodes the next stage waits for, and why; empty once settled.
+    pub held_by: Vec<PlacementHoldout>,
+    /// How long the next stage has waited, in seconds; `null` when it does
+    /// not wait.
+    pub held_for_secs: Option<u64>,
+}
+
+/// Replicas and quorums of one layout of the bucket metadata.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlacementShape {
+    /// Replicas of each key.
+    pub replication_factor: u8,
+    /// Acknowledgements a write needs.
+    pub write_quorum: u8,
+    /// Answers a read needs.
+    pub read_quorum: u8,
+}
+
+impl From<QuorumShape> for PlacementShape {
+    fn from(shape: QuorumShape) -> Self {
+        Self {
+            replication_factor: shape.replication_factor,
+            write_quorum: shape.write_quorum,
+            read_quorum: shape.read_quorum,
+        }
+    }
+}
+
+/// A node the next stage of the move waits for.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlacementHoldout {
+    /// Its name in `S4_POOL_NODES`, or its identity when it has none.
+    pub node: String,
+    /// Why the gate waits for it.
+    pub reason: String,
 }
 
 /// High-level health classification.
@@ -253,15 +354,37 @@ pub struct RepairStatus {
     pub total_repairs: u64,
     /// When a key was last repaired, RFC 3339; `null` before the first.
     pub last_repair: Option<String>,
-    /// Anti-entropy rounds (`s4_anti_entropy_rounds_total`).
+    /// Anti-entropy rounds that settled every divergent key
+    /// (`s4_anti_entropy_rounds_total{outcome="complete"}`).
     pub rounds_completed: u64,
     /// Keys whose repair failed
     /// (`s4_anti_entropy_repairs_total{outcome="failed"}`).
     pub repairs_failed: u64,
+    /// Keys left as they were because their newest copy may have missed a
+    /// delete (`s4_anti_entropy_repairs_total{outcome="ambiguous"}`).
+    pub repairs_ambiguous: u64,
+    /// Anti-entropy rounds by how they ended
+    /// (`s4_anti_entropy_rounds_total{outcome}`).
+    pub rounds: RoundCounts,
+    /// Whether this node starts anti-entropy rounds
+    /// (`S4_ANTI_ENTROPY_ENABLED`). A node that does not still answers the
+    /// rounds of its peers, and removes no tombstones.
+    pub anti_entropy_enabled: bool,
     /// Tombstones after the last GC pass (`s4_tombstones_active`).
     pub tombstones_active: u64,
     /// Tombstones purged (`s4_tombstones_purged_total`).
     pub tombstones_purged: u64,
+}
+
+/// Anti-entropy rounds of this node by how they ended.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoundCounts {
+    /// Every leaf compared and every divergent key settled.
+    pub complete: u64,
+    /// The round ran but left keys for the next one.
+    pub incomplete: u64,
+    /// The pool was not ready for rounds, or no peer was alive.
+    pub skipped: u64,
 }
 
 /// The background scrubber of this node, since it started.
@@ -319,6 +442,12 @@ pub struct NodeClusterAdmin {
     anti_entropy: Arc<AntiEntropyMetrics>,
     gc: Arc<GcMetrics>,
     scrubber: Arc<ScrubberMetrics>,
+    bucket_metadata: Option<Arc<PlacementStatus>>,
+    config_adoption: Option<ConfigAdoptionStatus>,
+    iam_adoption: Option<crate::iam_adoption::IamAdoptionGate>,
+    iam_config: Option<Arc<crate::iam_config::IamConfigCheck>>,
+    pool_growth: Option<Arc<PoolGrowth>>,
+    migration: Option<Arc<crate::migration::MigrationStatus>>,
 }
 
 impl NodeClusterAdmin {
@@ -339,7 +468,97 @@ impl NodeClusterAdmin {
             anti_entropy,
             gc,
             scrubber,
+            bucket_metadata: None,
+            config_adoption: None,
+            iam_adoption: None,
+            iam_config: None,
+            pool_growth: None,
+            migration: None,
         }
+    }
+
+    /// The same service, reporting local bucket configuration adoption.
+    pub fn with_config_adoption(mut self, status: ConfigAdoptionStatus) -> Self {
+        self.config_adoption = Some(status);
+        self
+    }
+
+    /// The same health service, reporting durable migration obligations.
+    pub fn with_migration(mut self, migration: Arc<crate::migration::MigrationStatus>) -> Self {
+        self.migration = Some(migration);
+        self
+    }
+
+    /// The same service, reporting the pool's growth from `growth`.
+    pub fn with_pool_growth(mut self, growth: Arc<PoolGrowth>) -> Self {
+        self.pool_growth = Some(growth);
+        self
+    }
+
+    /// The same service, reporting whether the pool is configured alike for
+    /// IAM by `check`.
+    pub fn with_iam_config(mut self, check: Arc<crate::iam_config::IamConfigCheck>) -> Self {
+        self.iam_config = Some(check);
+        self
+    }
+
+    fn iam_config_health(&self) -> Option<IamConfigHealth> {
+        let mismatches = self.iam_config.as_ref()?.mismatches();
+        Some(IamConfigHealth {
+            consistent: mismatches.is_empty(),
+            mismatches,
+        })
+    }
+
+    /// The same service, reporting the pool's adoption of IAM by `gate`.
+    pub fn with_iam_adoption(mut self, gate: crate::iam_adoption::IamAdoptionGate) -> Self {
+        self.iam_adoption = Some(gate);
+        self
+    }
+
+    fn iam_adoption_health(&self) -> Option<IamAdoptionHealth> {
+        let gate = self.iam_adoption.as_ref()?;
+        let pending = !gate.is_open();
+        Some(IamAdoptionHealth {
+            pending,
+            reason: pending.then(|| {
+                "IAM changes are refused until every node of the pool announces that it keeps no \
+                 IAM users of its own: see GET /api/admin/iam/adoption"
+                    .to_string()
+            }),
+        })
+    }
+
+    /// The same service, reporting the move of the bucket metadata from
+    /// `status`.
+    pub fn with_bucket_metadata(mut self, status: Arc<PlacementStatus>) -> Self {
+        self.bucket_metadata = Some(status);
+        self
+    }
+
+    fn bucket_metadata_health(&self) -> Option<BucketMetadataHealth> {
+        let snapshot = self.bucket_metadata.as_ref()?.snapshot(std::time::Instant::now());
+        let held_by = snapshot
+            .holdouts
+            .iter()
+            .map(|holdout| PlacementHoldout {
+                node: self
+                    .pool
+                    .roster
+                    .name_of(holdout.node)
+                    .map_or_else(|| holdout.node.to_string(), str::to_string),
+                reason: holdout.reason.to_string(),
+            })
+            .collect();
+        Some(BucketMetadataHealth {
+            stage: snapshot.record.stage.number(),
+            stage_name: snapshot.record.stage.as_str().to_string(),
+            from: snapshot.record.from.into(),
+            to: snapshot.record.to.into(),
+            backfill_complete: snapshot.record.backfill_complete,
+            held_by,
+            held_for_secs: snapshot.held_for.map(|held| held.as_secs()),
+        })
     }
 }
 
@@ -358,13 +577,22 @@ impl ClusterAdminService for NodeClusterAdmin {
             |wanted: NodeStatus| statuses.iter().filter(|status| **status == wanted).count() as u64;
         let alive = count(NodeStatus::Alive);
         let total = statuses.len() as u64;
+        let iam_adoption = self.iam_adoption_health();
+        let mut status = health_level(
+            total - alive,
+            self.pool.replication_factor,
+            self.pool.write_quorum,
+            self.pool.read_quorum,
+        );
+        if status == HealthLevel::Healthy && iam_adoption.as_ref().is_some_and(|iam| iam.pending) {
+            status = HealthLevel::Degraded;
+        }
+        let iam_config = self.iam_config_health();
+        if iam_config.as_ref().is_some_and(|config| !config.consistent) {
+            status = HealthLevel::Critical;
+        }
         Some(ClusterHealthStatus {
-            status: health_level(
-                total - alive,
-                self.pool.replication_factor,
-                self.pool.write_quorum,
-                self.pool.read_quorum,
-            ),
+            status,
             nodes_total: total,
             nodes_alive: alive,
             nodes_suspect: count(NodeStatus::Suspect),
@@ -377,6 +605,14 @@ impl ClusterAdminService for NodeClusterAdmin {
             replication_factor: self.pool.replication_factor,
             write_quorum: self.pool.write_quorum,
             read_quorum: self.pool.read_quorum,
+            bucket_metadata: self.bucket_metadata_health(),
+            bucket_config_adoption: self
+                .config_adoption
+                .as_ref()
+                .map(ConfigAdoptionStatus::snapshot),
+            iam_adoption,
+            iam_config,
+            migration_pending_records: self.migration.as_ref().map_or(0, |status| status.pending()),
         })
     }
 
@@ -450,9 +686,20 @@ impl ClusterAdminService for NodeClusterAdmin {
             last_repair,
             rounds_completed: anti_entropy.rounds_completed,
             repairs_failed: anti_entropy.repairs_failed,
+            repairs_ambiguous: anti_entropy.repairs_ambiguous,
+            rounds: RoundCounts {
+                complete: anti_entropy.rounds_completed,
+                incomplete: anti_entropy.rounds_incomplete,
+                skipped: anti_entropy.rounds_skipped,
+            },
+            anti_entropy_enabled: anti_entropy.enabled,
             tombstones_active: self.gc.tombstones_active.load(Ordering::Relaxed),
             tombstones_purged: self.gc.tombstones_purged.load(Ordering::Relaxed),
         })
+    }
+
+    fn pool_growth(&self) -> Option<Arc<PoolGrowth>> {
+        self.pool_growth.clone()
     }
 
     fn scrubber_status(&self) -> Option<ScrubberStatus> {
@@ -531,6 +778,36 @@ mod tests {
             Arc::new(ScrubberMetrics::default()),
         );
         (admin, roster)
+    }
+
+    #[test]
+    fn health_reports_the_initial_migration_pending_count() {
+        let (admin, _) = admin(3, HashMap::new());
+        let migration = Arc::new(crate::migration::MigrationStatus::default());
+        migration.pending_is(17);
+        let health = admin.with_migration(migration).cluster_health().unwrap();
+        assert_eq!(health.migration_pending_records, 17);
+        let serialized = serde_json::to_value(&health).unwrap();
+        assert_eq!(serialized["migration_pending_records"], 17);
+    }
+
+    #[test]
+    fn health_reports_local_bucket_config_adoption() {
+        let (admin, _) = admin(3, HashMap::new());
+        let status = ConfigAdoptionStatus::default();
+        let admin = admin.with_config_adoption(status.clone());
+        let health = || admin.cluster_health().unwrap().bucket_config_adoption.unwrap();
+        assert_eq!(health().phase, crate::ConfigAdoptionPhase::Starting);
+        status.waiting(Some(2), vec!["owner unavailable".into()]);
+        assert_eq!(health(), status.snapshot());
+        status.mark_ready();
+        assert_eq!(health(), status.snapshot());
+        let mut old = serde_json::to_value(admin.cluster_health().unwrap()).unwrap();
+        old.as_object_mut().unwrap().remove("bucket_config_adoption");
+        assert!(serde_json::from_value::<ClusterHealthStatus>(old)
+            .unwrap()
+            .bucket_config_adoption
+            .is_none());
     }
 
     #[test]
@@ -624,6 +901,93 @@ mod tests {
         );
     }
 
+    /// A pool whose IAM some node keeps of its own is degraded, with the
+    /// reason, until the gate opens; a pool with a member down stays as its
+    /// members make it.
+    #[test]
+    fn a_pool_waiting_for_its_iam_to_be_taken_over_is_degraded() {
+        let members = HashMap::from([
+            (NodeId(2), state(2, NodeStatus::Alive)),
+            (NodeId(3), state(3, NodeStatus::Alive)),
+        ]);
+        let gate = crate::iam_adoption::IamAdoptionGate::default();
+        let (admin, _) = admin(3, members);
+        let admin = admin.with_iam_adoption(gate.clone());
+        let health = admin.cluster_health().unwrap();
+        assert_eq!(health.status, HealthLevel::Degraded);
+        let iam = health.iam_adoption.unwrap();
+        assert!(iam.pending);
+        assert!(iam.reason.unwrap().contains("/api/admin/iam/adoption"));
+
+        gate.open();
+        let health = admin.cluster_health().unwrap();
+        assert_eq!(health.status, HealthLevel::Healthy);
+        assert_eq!(
+            health.iam_adoption,
+            Some(IamAdoptionHealth {
+                pending: false,
+                reason: None
+            })
+        );
+    }
+
+    /// A pool whose live nodes are configured differently for IAM is
+    /// critical, naming the node that differs; a node that is down is not
+    /// compared, and a pool configured alike is healthy.
+    #[test]
+    fn a_pool_configured_differently_for_iam_is_critical() {
+        use crate::iam_config::{IamConfigCheck, IamConfigKind, IamConfigPrint};
+        let members = HashMap::from([
+            (NodeId(1), state(1, NodeStatus::Alive)),
+            (NodeId(2), state(2, NodeStatus::Alive)),
+            (NodeId(3), state(3, NodeStatus::Alive)),
+        ]);
+        let gossip = Arc::new(GossipHandle::new_for_testing(members));
+        let (admin, roster) = admin(3, HashMap::new());
+        let mut admin = admin;
+        admin.gossip = gossip.clone();
+        let check = Arc::new(IamConfigCheck::new(
+            NodeId(1),
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+            roster,
+            gossip.clone(),
+        ));
+        let admin = admin.with_iam_config(check.clone());
+        let alike = IamConfigPrint {
+            root: Some([1; 16]),
+            jwt_secret: Some([2; 16]),
+            encryption_key: Some([3; 16]),
+        };
+        for node in 1..=3 {
+            gossip.set_iam_config_for_testing(NodeId(node), Some(alike));
+        }
+        let health = admin.cluster_health().unwrap();
+        assert_eq!(health.status, HealthLevel::Healthy);
+        assert!(health.iam_config.as_ref().unwrap().consistent);
+        assert!(check.pool_shares_encryption_key());
+
+        let other_root = IamConfigPrint {
+            root: Some([9; 16]),
+            ..alike
+        };
+        gossip.set_iam_config_for_testing(NodeId(3), Some(other_root));
+        let health = admin.cluster_health().unwrap();
+        assert_eq!(health.status, HealthLevel::Critical);
+        let config = health.iam_config.unwrap();
+        assert!(!config.consistent);
+        assert_eq!(config.mismatches.len(), 1);
+        assert_eq!(config.mismatches[0].kind, IamConfigKind::Root);
+        assert_eq!(config.mismatches[0].nodes, vec!["node-3".to_string()]);
+        assert!(check.pool_shares_encryption_key());
+
+        let other_key = IamConfigPrint {
+            encryption_key: Some([8; 16]),
+            ..alike
+        };
+        gossip.set_iam_config_for_testing(NodeId(3), Some(other_key));
+        assert!(!check.pool_shares_encryption_key());
+    }
+
     #[test]
     fn topology_lists_every_configured_member_as_gossip_last_heard_it() {
         let mut placeholder = state(3, NodeStatus::Alive);
@@ -715,6 +1079,9 @@ mod tests {
                 last_repair: None,
                 rounds_completed: 0,
                 repairs_failed: 0,
+                repairs_ambiguous: 0,
+                rounds: RoundCounts::default(),
+                anti_entropy_enabled: false,
                 tombstones_active: 0,
                 tombstones_purged: 0,
             }
@@ -726,6 +1093,10 @@ mod tests {
         set(&anti_entropy.divergent_keys_found, 5);
         set(&anti_entropy.repairs_completed, 4);
         set(&anti_entropy.repairs_failed, 1);
+        set(&anti_entropy.repairs_ambiguous, 2);
+        set(&anti_entropy.rounds_incomplete, 3);
+        set(&anti_entropy.rounds_skipped, 4);
+        anti_entropy.enabled.store(true, Ordering::Relaxed);
         set(&anti_entropy.frontier_lag_secs_bits, 12.5f64.to_bits());
         set(&anti_entropy.last_repair_unix_ms, 1_700_000_000_123);
         let gc = Arc::new(GcMetrics::default());
@@ -746,6 +1117,13 @@ mod tests {
                 last_repair: Some("2023-11-14T22:13:20.123Z".to_string()),
                 rounds_completed: 7,
                 repairs_failed: 1,
+                repairs_ambiguous: 2,
+                rounds: RoundCounts {
+                    complete: 7,
+                    incomplete: 3,
+                    skipped: 4,
+                },
+                anti_entropy_enabled: true,
                 tombstones_active: 3,
                 tombstones_purged: 9,
             }

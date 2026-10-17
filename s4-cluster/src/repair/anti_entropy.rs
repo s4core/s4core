@@ -12,72 +12,110 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Background anti-entropy service for maintaining replica consistency.
+//! Anti-entropy rounds: replicas of a pool converge without a client.
 //!
-//! Two-level repair strategy:
+//! Once per interval a node compares itself with one live peer of its pool,
+//! the peers taken in turn in an order shuffled at start, so every peer gets a
+//! round once per "peers × interval". The pair compares the keys both of them
+//! replicate by placement ([`PairScope`]), by the version digests the storage
+//! keeps for every replicated key in the same batch as the record:
 //!
-//! 1. **Active repair** (read repair, Phase 5) — fixes stale replicas on
-//!    every quorum read. Handled by [`super::ReadRepairService`].
+//! 1. both sides compute the 16 384 leaves of their tree in one pass over the
+//!    digests; the peer sends its whole vector ([`AntiEntropyResponder`]);
+//! 2. for each leaf that differs, the keys and digests of both sides are read
+//!    a page at a time and compared; a key whose digests differ, or that one
+//!    side lacks, is divergent;
+//! 3. each divergent key is settled (`Reconciler::settle`): its version is
+//!    read from every replica, the pair's answers required, and every replica
+//!    that answered and is behind is brought to the newest version — a copy
+//!    with its HLC or a tombstone with its HLC. Up to
+//!    `S4_ANTI_ENTROPY_MAX_KEYS_PER_ROUND` keys a round; the rest wait.
 //!
-//! 2. **Background anti-entropy** (this module, Phase 7) — periodic Merkle
-//!    tree exchange with random replica peers. Discovers and repairs
-//!    divergences that read repair cannot catch (e.g., keys that are
-//!    never read, or replicas that missed writes while offline).
+//! A round is `complete` when every leaf was compared and every divergent key
+//! settled; `incomplete` when the peer stopped answering, a key was not
+//! settled or ambiguous, or the key limit was reached; `skipped` when a node
+//! of the pool has not announced protocol 5 yet or no peer is alive.
 //!
-//! # Frequency
+//! A complete round sets the peer's cut of the repair frontier to the moment
+//! the round started, less the window in which the write of a delete may
+//! still bring its tombstone here (replica write timeout and clock skew): the
+//! peer has everything with an HLC before the cut that reached this node so.
+//! Tombstone GC removes a tombstone once the cut of every other replica of its
+//! key is past it ([`DistributedGcService`](crate::gc::DistributedGcService)).
 //!
-//! Every `T = 10 minutes`, each node compares its Merkle tree with one
-//! random replica peer per key range. With this interval, 99.9% of
-//! divergences are detected within one hour.
-//!
-//! # Repair Flow
-//!
-//! ```text
-//! for each key_range this node owns:
-//!   1. Pick a random replica peer
-//!   2. Exchange Merkle root hashes
-//!   3. If roots match → range is consistent, skip
-//!   4. Walk tree top-down to find divergent leaf ranges
-//!   5. Request keys in divergent ranges via RepairSync RPC
-//!   6. Apply LWW conflict resolution
-//!   7. Write winning version to the lagging replica
-//!   8. Advance repair frontier
-//! ```
+//! A node with `S4_ANTI_ENTROPY_ENABLED=false` starts no rounds but answers
+//! the rounds of its peers. The service also holds what the rounds share with
+//! the rest of the node: the repair frontier tombstone GC reads, and the
+//! counters `/cluster/repair-status` reports.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
+use rand::seq::SliceRandom;
 use s4_core::StorageEngine;
-use tokio::sync::RwLock;
+use tokio::sync::{watch, RwLock};
 use tracing::{debug, info, warn};
 
-use crate::clock::hlc::HlcTimestamp;
-use crate::cluster_metrics;
+use crate::clock::hlc::{now_millis, HlcTimestamp};
+use crate::cluster_metrics::{
+    record_anti_entropy_key, record_anti_entropy_round, record_repair_frontier_lag,
+    KeyRepairOutcome, RoundOutcome,
+};
 use crate::config::AntiEntropyConfig;
 use crate::error::ClusterError;
+use crate::gc::tombstone::arrival_window;
 use crate::gossip::GossipHandle;
 use crate::identity::{NodeId, NodeStatus, PoolId};
-use crate::placement;
+use crate::metadata_placement::Stage;
+use crate::metadata_placement::StageCell;
+use crate::placement::{
+    BucketMetadataMove, ClassLayout, GenerationPhase, GenerationRanges, PlacementStrategy,
+    PoolLayout, ReplicationClass,
+};
+use crate::protocol::IAM_REPLICATION_MIN_PROTOCOL_VERSION;
 use crate::repair::frontier::RepairFrontier;
-use crate::repair::merkle::{KeyRange, MerkleTree};
+use crate::repair::pair_tree::{
+    leaf_keys, leaf_of, pair_leaves, LeafCursor, LeafHash, PairScope, LEAF_COUNT, LEAF_HASH_LEN,
+};
+use crate::repair::reconcile::{KeyRef, Reconciler, Settled};
 use crate::rpc::proto;
 use crate::rpc::NodeClient;
+use s4_core::storage::VERSION_DIGESTS_FORMAT;
+
+/// Lowest protocol version every live node of the pool must announce before
+/// rounds start: the version since which every node gives the same keys a
+/// digest. A node of protocol 5 keeps no digests of bucket configurations, a
+/// node of protocol 7 none of the IAM records of version 2, and the leaves of
+/// a pair across that line would differ wherever one lies.
+const ROUNDS_MIN_PROTOCOL_VERSION: u32 = IAM_REPLICATION_MIN_PROTOCOL_VERSION;
+
+/// Most keys one page of `AntiEntropyKeys` carries.
+pub const MAX_KEYS_PER_PAGE: u32 = 1000;
+
+/// Leaves asked about in one `AntiEntropyKeys` request.
+const LEAVES_PER_REQUEST: usize = 64;
 
 /// Metrics collected by the anti-entropy service.
 #[derive(Debug, Default)]
 pub struct AntiEntropyMetrics {
-    /// Number of Merkle exchange rounds completed.
+    /// Rounds that compared every leaf and settled every divergent key.
     pub rounds_completed: AtomicU64,
-    /// Keys found behind on this node: its peer held a newer copy, or this
-    /// node could not tell. Each of them is either repaired or failed.
+    /// Rounds that ran but did not settle every divergent key.
+    pub rounds_incomplete: AtomicU64,
+    /// Rounds skipped: the pool was not ready, or no peer was alive.
+    pub rounds_skipped: AtomicU64,
+    /// Keys found in different versions on this node and its peer. Each of
+    /// them is repaired, failed or ambiguous.
     pub divergent_keys_found: AtomicU64,
-    /// Total keys successfully repaired.
+    /// Divergent keys every replica that answered is at the newest version of.
     pub repairs_completed: AtomicU64,
-    /// Total repair attempts that failed.
+    /// Divergent keys a replica was not brought to the newest version of.
     pub repairs_failed: AtomicU64,
-    /// Total duration of all repair rounds in milliseconds.
+    /// Divergent keys whose newest copy may have missed a delete.
+    pub repairs_ambiguous: AtomicU64,
+    /// Total duration of all rounds that ran, in milliseconds.
     pub total_repair_duration_ms: AtomicU64,
     /// The repair frontier lag at the end of the last round, in seconds, as
     /// the bits of an `f64`: the value `s4_repair_frontier_lag_seconds` was
@@ -86,6 +124,8 @@ pub struct AntiEntropyMetrics {
     /// When a key was last repaired, in Unix milliseconds; zero before the
     /// first repair.
     pub last_repair_unix_ms: AtomicU64,
+    /// Whether this node starts rounds (`S4_ANTI_ENTROPY_ENABLED`).
+    pub enabled: AtomicBool,
 }
 
 impl AntiEntropyMetrics {
@@ -98,121 +138,87 @@ impl AntiEntropyMetrics {
     pub fn snapshot(&self) -> AntiEntropySnapshot {
         AntiEntropySnapshot {
             rounds_completed: self.rounds_completed.load(Ordering::Relaxed),
+            rounds_incomplete: self.rounds_incomplete.load(Ordering::Relaxed),
+            rounds_skipped: self.rounds_skipped.load(Ordering::Relaxed),
             divergent_keys_found: self.divergent_keys_found.load(Ordering::Relaxed),
             repairs_completed: self.repairs_completed.load(Ordering::Relaxed),
             repairs_failed: self.repairs_failed.load(Ordering::Relaxed),
+            repairs_ambiguous: self.repairs_ambiguous.load(Ordering::Relaxed),
             total_repair_duration_ms: self.total_repair_duration_ms.load(Ordering::Relaxed),
             frontier_lag_secs: f64::from_bits(self.frontier_lag_secs_bits.load(Ordering::Relaxed)),
             last_repair_unix_ms: self.last_repair_unix_ms.load(Ordering::Relaxed),
+            enabled: self.enabled.load(Ordering::Relaxed),
         }
+    }
+
+    fn round(&self, outcome: RoundOutcome, took: Duration) {
+        let counter = match outcome {
+            RoundOutcome::Complete => &self.rounds_completed,
+            RoundOutcome::Incomplete => &self.rounds_incomplete,
+            RoundOutcome::Skipped => &self.rounds_skipped,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        if outcome != RoundOutcome::Skipped {
+            let millis = u64::try_from(took.as_millis()).unwrap_or(u64::MAX);
+            self.total_repair_duration_ms.fetch_add(millis, Ordering::Relaxed);
+        }
+        record_anti_entropy_round(outcome, took);
+    }
+
+    fn key(&self, outcome: KeyRepairOutcome) {
+        self.divergent_keys_found.fetch_add(1, Ordering::Relaxed);
+        let counter = match outcome {
+            KeyRepairOutcome::Ok => {
+                self.last_repair_unix_ms.store(now_millis(), Ordering::Relaxed);
+                &self.repairs_completed
+            }
+            KeyRepairOutcome::Failed => &self.repairs_failed,
+            KeyRepairOutcome::Ambiguous => &self.repairs_ambiguous,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        record_anti_entropy_key(outcome);
     }
 }
 
 /// Point-in-time snapshot of anti-entropy metrics.
 #[derive(Debug, Clone, Default)]
 pub struct AntiEntropySnapshot {
-    /// Number of Merkle exchange rounds completed.
+    /// Rounds that settled every divergent key.
     pub rounds_completed: u64,
+    /// Rounds that ran but did not settle every divergent key.
+    pub rounds_incomplete: u64,
+    /// Rounds skipped.
+    pub rounds_skipped: u64,
     /// Total divergent keys discovered.
     pub divergent_keys_found: u64,
-    /// Total keys successfully repaired.
+    /// Divergent keys settled.
     pub repairs_completed: u64,
-    /// Total repair failures.
+    /// Divergent keys not settled.
     pub repairs_failed: u64,
-    /// Total repair duration in milliseconds.
+    /// Divergent keys whose newest copy may have missed a delete.
+    pub repairs_ambiguous: u64,
+    /// Total duration of the rounds that ran, in milliseconds.
     pub total_repair_duration_ms: u64,
     /// The repair frontier lag at the end of the last round, in seconds.
     pub frontier_lag_secs: f64,
     /// When a key was last repaired, in Unix milliseconds; zero before the
     /// first repair.
     pub last_repair_unix_ms: u64,
+    /// Whether this node starts rounds.
+    pub enabled: bool,
 }
 
-/// Wall-clock time in epoch milliseconds, the unit of an HLC's wall time.
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-/// The age, in seconds at `now_ms`, of the oldest cut `frontier` holds for
-/// `peers` over `ranges`. A peer with no cut in a range has had none since
-/// `since_ms`, and ages from there: that is how long tombstones of the range
-/// have been waiting on it. No peers or no ranges: nothing lags, `0`.
-fn frontier_lag_secs(
-    frontier: &RepairFrontier,
-    ranges: &[KeyRange],
-    peers: &[NodeId],
-    since_ms: u64,
-    now_ms: u64,
-) -> f64 {
-    let oldest = ranges
-        .iter()
-        .flat_map(|range| {
-            peers.iter().map(move |peer| {
-                frontier.get_cut(range, peer).map_or(since_ms, |cut| cut.wall_time)
-            })
-        })
-        .min();
-    oldest.map_or(0.0, |oldest| now_ms.saturating_sub(oldest) as f64 / 1000.0)
-}
-
-/// Maps ring position → list of (bucket, key) pairs at that position.
-/// BTreeMap enables efficient range queries for divergent Merkle ranges.
-type KeyRegistry = BTreeMap<u64, Vec<(String, String)>>;
-
-/// Background anti-entropy service.
-///
-/// Manages Merkle trees for each key range this node is responsible for,
-/// and periodically exchanges digests with replica peers to discover and
-/// repair divergences.
-///
-/// The service maintains a `KeyRegistry` — a BTreeMap from ring position
-/// to `(bucket, key)` pairs ��� that enables efficient range lookups when
-/// resolving divergent Merkle tree ranges to actual object keys.
+/// The repair frontier and the counters of anti-entropy.
+#[derive(Debug, Default)]
 pub struct AntiEntropyService {
-    config: AntiEntropyConfig,
-    local_node_id: NodeId,
-    pool_id: PoolId,
-    gossip: Arc<GossipHandle>,
-    rpc_client: Arc<NodeClient>,
-    storage: Arc<dyn StorageEngine>,
-    merkle_trees: Arc<RwLock<HashMap<u64, MerkleTree>>>,
-    key_registry: Arc<RwLock<KeyRegistry>>,
     repair_frontier: Arc<RwLock<RepairFrontier>>,
     metrics: Arc<AntiEntropyMetrics>,
-    pool_nodes: Vec<NodeId>,
-    /// When the service was created, epoch milliseconds: where the frontier of
-    /// a peer it has never moved for starts to age.
-    created_at_ms: u64,
 }
 
 impl AntiEntropyService {
-    /// Create a new anti-entropy service.
-    pub fn new(
-        config: AntiEntropyConfig,
-        local_node_id: NodeId,
-        pool_id: PoolId,
-        pool_nodes: Vec<NodeId>,
-        gossip: Arc<GossipHandle>,
-        rpc_client: Arc<NodeClient>,
-        storage: Arc<dyn StorageEngine>,
-    ) -> Self {
-        Self {
-            config,
-            local_node_id,
-            pool_id,
-            gossip,
-            rpc_client,
-            storage,
-            merkle_trees: Arc::new(RwLock::new(HashMap::new())),
-            key_registry: Arc::new(RwLock::new(BTreeMap::new())),
-            repair_frontier: Arc::new(RwLock::new(RepairFrontier::new())),
-            metrics: Arc::new(AntiEntropyMetrics::new()),
-            pool_nodes,
-            created_at_ms: now_millis(),
-        }
+    /// Create a service with an empty frontier and counters at zero.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Get a reference to the metrics.
@@ -224,853 +230,1029 @@ impl AntiEntropyService {
     pub fn repair_frontier(&self) -> &Arc<RwLock<RepairFrontier>> {
         &self.repair_frontier
     }
+}
 
-    /// Get a reference to the Merkle trees.
-    pub fn merkle_trees(&self) -> &Arc<RwLock<HashMap<u64, MerkleTree>>> {
-        &self.merkle_trees
-    }
+// ---------------------------------------------------------------------------
+// The answering side
+// ---------------------------------------------------------------------------
 
-    /// Scan local storage and build the initial Merkle tree + key registry.
-    ///
-    /// Must be called once at startup, after the storage engine is ready.
-    /// Enumerates all buckets (via `__system__` markers) and all objects
-    /// within each bucket to populate the Merkle tree and the ring
-    /// position → (bucket, key) registry.
-    pub async fn init_from_storage(&self) {
-        let mut entries: Vec<(u64, [u8; 32])> = Vec::new();
-        let mut registry: KeyRegistry = BTreeMap::new();
+/// A pool growing to a successor generation, as anti-entropy sees it (plan
+/// ERASURE-CODING-FIXING-POOL-GROWTH-REBALANCE.md, `EPGR-04-2`): until the
+/// pool settled here, pairs compare by the current ring; from then on by the
+/// successor's, with its bucket metadata layout. Two nodes that announce
+/// different current generations compare nothing: their pairs' keys differ.
+pub struct AntiEntropyGrowth {
+    ranges: Arc<GenerationRanges>,
+    data: PlacementStrategy,
+    bucket_metadata: Arc<BucketMetadataMove>,
+    gossip: Arc<GossipHandle>,
+    local_node_id: NodeId,
+}
 
-        // Discover buckets from __system__ markers.
-        let markers = self
-            .storage
-            .list_objects("__system__", "__s4_bucket_marker_", 10_000)
-            .await
-            .unwrap_or_default();
-
-        let bucket_names: Vec<String> = markers
-            .iter()
-            .filter_map(|(key, _)| key.strip_prefix("__s4_bucket_marker_").map(String::from))
-            .collect();
-
-        let mut total_keys = 0u64;
-
-        for bucket in &bucket_names {
-            let mut start_after = String::new();
-            loop {
-                let batch = if start_after.is_empty() {
-                    self.storage.list_objects(bucket, "", 1000).await
-                } else {
-                    self.storage.list_objects_after(bucket, "", &start_after, 1000).await
-                };
-
-                let objects = match batch {
-                    Ok(objs) => objs,
-                    Err(e) => {
-                        warn!(bucket = %bucket, error = %e, "failed to list objects for merkle init");
-                        break;
-                    }
-                };
-
-                if objects.is_empty() {
-                    break;
-                }
-
-                for (key, record) in &objects {
-                    let ring_pos = placement::ring_position(bucket, key);
-                    entries.push((ring_pos, record.content_hash));
-                    registry.entry(ring_pos).or_default().push((bucket.clone(), key.clone()));
-                    total_keys += 1;
-                }
-
-                start_after = objects.last().map(|(k, _)| k.clone()).unwrap_or_default();
-
-                if objects.len() < 1000 {
-                    break;
-                }
-            }
-        }
-
-        // Build Merkle tree for the full ring range.
-        let range = KeyRange::full();
-        let tree = MerkleTree::build(&entries, range, self.config.merkle_depth);
-        let mut trees = self.merkle_trees.write().await;
-        trees.insert(range.start, tree);
-        drop(trees);
-
-        *self.key_registry.write().await = registry;
-
-        info!(
-            buckets = bucket_names.len(),
-            total_keys, "anti-entropy: merkle tree and key registry initialized from storage"
-        );
-    }
-
-    /// Register a key in the key registry and update the Merkle tree.
-    ///
-    /// Called by `ReplicaWriteHandler` after every successful write.
-    pub async fn register_key(&self, bucket: &str, key: &str, content_hash: [u8; 32]) {
-        let ring_pos = placement::ring_position(bucket, key);
-        let range = KeyRange::full();
-
-        // Update key registry.
-        {
-            let mut registry = self.key_registry.write().await;
-            let entries = registry.entry(ring_pos).or_default();
-            // Avoid duplicates — replace if exists, otherwise insert.
-            if !entries.iter().any(|(b, k)| b == bucket && k == key) {
-                entries.push((bucket.to_string(), key.to_string()));
-            }
-        }
-
-        // Update Merkle tree.
-        let mut trees = self.merkle_trees.write().await;
-        if let Some(tree) = trees.get_mut(&range.start) {
-            tree.insert(ring_pos, content_hash);
+impl AntiEntropyGrowth {
+    /// The growth whose arcs are `ranges` to the `successor` layout, with
+    /// generations as `gossip` announces them for node `local_node_id`.
+    pub fn new(
+        ranges: Arc<GenerationRanges>,
+        successor: &PoolLayout,
+        gossip: Arc<GossipHandle>,
+        local_node_id: NodeId,
+    ) -> Self {
+        let metadata = successor.class(ReplicationClass::BucketMetadata).clone();
+        Self {
+            ranges,
+            data: successor.data().strategy().clone(),
+            bucket_metadata: Arc::new(BucketMetadataMove::new(
+                metadata.clone(),
+                metadata,
+                StageCell::new(Stage::Settled),
+            )),
+            gossip,
+            local_node_id,
         }
     }
 
-    /// Unregister a key from the key registry and update the Merkle tree.
-    ///
-    /// Called by `ReplicaWriteHandler` after every successful delete.
-    pub async fn unregister_key(&self, bucket: &str, key: &str, content_hash: [u8; 32]) {
-        let ring_pos = placement::ring_position(bucket, key);
-        let range = KeyRange::full();
+    fn settled(&self) -> bool {
+        self.ranges.phase() == GenerationPhase::Finished
+    }
 
-        // Update key registry.
-        {
-            let mut registry = self.key_registry.write().await;
-            if let Some(entries) = registry.get_mut(&ring_pos) {
-                entries.retain(|(b, k)| !(b == bucket && k == key));
-                if entries.is_empty() {
-                    registry.remove(&ring_pos);
-                }
-            }
-        }
+    /// Why this node and `peer` compare nothing now, if they do not: they
+    /// announce different current generations.
+    fn apart_from(&self, peer: NodeId) -> Option<String> {
+        let ours = self.gossip.pool_generation(&self.local_node_id)?;
+        let theirs = self.gossip.pool_generation(&peer)?;
+        (ours.current != theirs.current).then(|| {
+            format!(
+                "{peer} announces pool generation {} and this node {}: their pairs differ until \
+                 both settle on the same one",
+                theirs.current.epoch, ours.current.epoch
+            )
+        })
+    }
+}
 
-        // Update Merkle tree.
-        let mut trees = self.merkle_trees.write().await;
-        if let Some(tree) = trees.get_mut(&range.start) {
-            tree.remove(ring_pos, content_hash);
+/// The ring and bucket metadata layout a pair compares by now.
+fn pair_placement<'a>(
+    growth: Option<&'a AntiEntropyGrowth>,
+    placement: &'a PlacementStrategy,
+    bucket_metadata: Option<&'a BucketMetadataMove>,
+) -> (&'a PlacementStrategy, Option<&'a BucketMetadataMove>) {
+    match growth {
+        Some(growth) if growth.settled() => (&growth.data, Some(&*growth.bucket_metadata)),
+        _ => (placement, bucket_metadata),
+    }
+}
+
+/// What this node answers the rounds of its peers with: the leaves and keys
+/// of the tree it shares with the caller. It answers whether or not it starts
+/// rounds itself.
+pub struct AntiEntropyResponder {
+    storage: Arc<dyn StorageEngine>,
+    placement: PlacementStrategy,
+    /// The pool's growth to a successor generation, once known.
+    growth: std::sync::OnceLock<AntiEntropyGrowth>,
+    /// The move of the pool's bucket metadata, whose layouts the caller's
+    /// scope usually names.
+    bucket_metadata: Option<Arc<BucketMetadataMove>>,
+    local_node_id: NodeId,
+    pool_id: PoolId,
+    topology_epoch: u64,
+}
+
+impl AntiEntropyResponder {
+    /// Answers for node `local_node_id` of pool `pool_id`, placed by
+    /// `placement`, from `storage`, on `topology_epoch`.
+    pub fn new(
+        storage: Arc<dyn StorageEngine>,
+        placement: PlacementStrategy,
+        local_node_id: NodeId,
+        pool_id: PoolId,
+        topology_epoch: u64,
+    ) -> Self {
+        Self {
+            storage,
+            placement,
+            growth: std::sync::OnceLock::new(),
+            bucket_metadata: None,
+            local_node_id,
+            pool_id,
+            topology_epoch,
         }
     }
 
-    /// Initialize a Merkle tree for a key range from existing entries.
-    pub async fn init_tree(&self, key_range: KeyRange, entries: &[(u64, [u8; 32])]) {
-        let tree = MerkleTree::build(entries, key_range, self.config.merkle_depth);
-        let mut trees = self.merkle_trees.write().await;
-        trees.insert(key_range.start, tree);
-        debug!(
-            range_start = key_range.start,
-            range_end = key_range.end,
-            entries = entries.len(),
-            "merkle tree initialized"
-        );
+    /// Answers by the successor's ring once the pool's `growth` settled here;
+    /// set once, after the responder began answering.
+    pub fn set_growth(&self, growth: AntiEntropyGrowth) {
+        let _ = self.growth.set(growth);
     }
 
-    /// Update the Merkle tree incrementally when a key is written.
-    pub async fn on_key_write(
+    /// The same responder in a pool that moves its bucket metadata as
+    /// `moving` says.
+    pub fn with_bucket_metadata_move(mut self, moving: BucketMetadataMove) -> Self {
+        self.bucket_metadata = Some(Arc::new(moving));
+        self
+    }
+
+    /// The tree this node shares with the caller, which compares the bucket
+    /// metadata as `bucket_metadata` says, or why there is none.
+    fn scope(
         &self,
-        key_range: &KeyRange,
-        ring_position: u64,
-        old_hash: [u8; 32],
-        new_hash: [u8; 32],
-    ) {
-        let mut trees = self.merkle_trees.write().await;
-        if let Some(tree) = trees.get_mut(&key_range.start) {
-            tree.update(ring_position, old_hash, new_hash);
+        pool_id: u32,
+        peer_id: &[u8],
+        bucket_metadata: Option<&proto::BucketMetadataScope>,
+    ) -> Result<PairScope, String> {
+        if pool_id != self.pool_id.as_u32() {
+            return Err(format!(
+                "this node is in pool {}, not in pool {pool_id}",
+                self.pool_id
+            ));
         }
+        let peer = NodeId::from_bytes(peer_id).map_err(|e| e.to_string())?;
+        let (placement, moving) = pair_placement(
+            self.growth.get(),
+            &self.placement,
+            self.bucket_metadata.as_deref(),
+        );
+        if peer == self.local_node_id || !placement.all_nodes().contains(&peer) {
+            return Err(format!(
+                "{peer} is not another node of pool {}",
+                self.pool_id
+            ));
+        }
+        if let Some(why) = self.growth.get().and_then(|growth| growth.apart_from(peer)) {
+            return Err(why);
+        }
+        let bucket_metadata = bucket_metadata_placement(bucket_metadata, placement, moving)?;
+        Ok(PairScope::by_class(
+            placement,
+            bucket_metadata.as_ref(),
+            self.local_node_id,
+            peer,
+        ))
     }
 
-    /// Update the Merkle tree when a new key is inserted (no old hash).
-    pub async fn on_key_insert(&self, key_range: &KeyRange, ring_position: u64, hash: [u8; 32]) {
-        let mut trees = self.merkle_trees.write().await;
-        if let Some(tree) = trees.get_mut(&key_range.start) {
-            tree.insert(ring_position, hash);
-        }
+    fn other_epoch(&self, epoch: u64) -> bool {
+        epoch != 0 && epoch != self.topology_epoch
     }
 
-    /// Update the Merkle tree when a key is deleted.
-    pub async fn on_key_delete(&self, key_range: &KeyRange, ring_position: u64, hash: [u8; 32]) {
-        let mut trees = self.merkle_trees.write().await;
-        if let Some(tree) = trees.get_mut(&key_range.start) {
-            tree.remove(ring_position, hash);
-        }
+    /// Why a caller whose digests are of `format` gets no answer, if it does
+    /// not: its tree is built over another set of keys, and the keys where
+    /// the two differ are ones the two nodes do not both replicate. A node of
+    /// protocol 5 sends no format, which reads as 0.
+    fn other_format(format: u32) -> Option<String> {
+        (format != VERSION_DIGESTS_FORMAT).then(|| {
+            format!(
+                "the caller keeps version digests of format {format}, this node of format \
+                 {VERSION_DIGESTS_FORMAT}: rounds between them wait for the upgrade to end"
+            )
+        })
     }
 
-    /// Look up actual `"bucket/key"` strings for ring positions in the given ranges.
-    ///
-    /// Uses the BTreeMap key registry for efficient range queries.
-    fn keys_in_ranges(registry: &KeyRegistry, ranges: &[KeyRange]) -> Vec<String> {
-        let mut keys = Vec::new();
-        for range in ranges {
-            for (_pos, bucket_keys) in registry.range(range.start..range.end) {
-                for (bucket, key) in bucket_keys {
-                    keys.push(format!("{bucket}/{key}"));
-                }
+    /// Answers `AntiEntropyLeaves`.
+    pub async fn leaves(
+        &self,
+        request: &proto::AntiEntropyLeavesRequest,
+    ) -> proto::AntiEntropyLeavesResponse {
+        let mut response = proto::AntiEntropyLeavesResponse::default();
+        if self.other_epoch(request.topology_epoch) {
+            response.epoch_mismatch = true;
+            return response;
+        }
+        if let Some(why) = Self::other_format(request.digests_format) {
+            response.error = why;
+            return response;
+        }
+        let leaves = match self.scope(
+            request.pool_id,
+            &request.peer_id,
+            request.bucket_metadata.as_ref(),
+        ) {
+            Ok(scope) => pair_leaves(&*self.storage, &scope).await.map_err(|e| e.to_string()),
+            Err(why) => Err(why),
+        };
+        match leaves {
+            Ok(leaves) => response.leaves = leaves.concat(),
+            Err(why) => response.error = why,
+        }
+        response
+    }
+
+    /// Answers `AntiEntropyKeys`.
+    pub async fn keys(
+        &self,
+        request: &proto::AntiEntropyKeysRequest,
+    ) -> proto::AntiEntropyKeysResponse {
+        let mut response = proto::AntiEntropyKeysResponse::default();
+        if self.other_epoch(request.topology_epoch) {
+            response.epoch_mismatch = true;
+            return response;
+        }
+        if let Some(why) = Self::other_format(request.digests_format) {
+            response.error = why;
+            return response;
+        }
+        let scope = match self.scope(
+            request.pool_id,
+            &request.peer_id,
+            request.bucket_metadata.as_ref(),
+        ) {
+            Ok(scope) => scope,
+            Err(why) => {
+                response.error = why;
+                return response;
+            }
+        };
+        if request.leaves.windows(2).any(|pair| pair[0] >= pair[1])
+            || request.leaves.iter().any(|leaf| *leaf as usize >= LEAF_COUNT)
+        {
+            response.error = "the leaves asked about are not ascending leaves".into();
+            return response;
+        }
+        let cursor = request.cursor.as_ref().map(|cursor| LeafCursor {
+            leaf: cursor.leaf,
+            after: cursor.after_key.clone(),
+        });
+        if let Some(cursor) = &cursor {
+            let leaf_asked = request.leaves.binary_search(&cursor.leaf).is_ok();
+            let key_in_leaf = cursor
+                .after
+                .as_deref()
+                .is_none_or(|after| leaf_of(s4_core::ring_position_of(after)) == cursor.leaf);
+            if !leaf_asked || !key_in_leaf {
+                response.error = "the cursor is not in the leaves asked about".into();
+                return response;
             }
         }
-        keys
+        let limit = request.max_keys.clamp(1, MAX_KEYS_PER_PAGE) as usize;
+        match leaf_keys(&*self.storage, &scope, &request.leaves, cursor, limit).await {
+            Ok((keys, next)) => {
+                response.keys = keys
+                    .into_iter()
+                    .map(|entry| proto::AntiEntropyKeyDigest {
+                        leaf: leaf_of(entry.ring_position),
+                        key: entry.key,
+                        digest: entry.digest.encode().to_vec(),
+                    })
+                    .collect();
+                response.next = next.map(|next| proto::AntiEntropyCursor {
+                    leaf: next.leaf,
+                    after_key: next.after,
+                });
+            }
+            Err(e) => response.error = e.to_string(),
+        }
+        response
+    }
+}
+
+/// How a round compares the bucket metadata of a pool that moves them as
+/// `moving` says, at this node's stage (plan BUCKET-METADATA-REPLICATION.md,
+/// decision 7): by the old layout at stage 0, not at all at stages 1 and 2,
+/// where the backfill brings them to the new replicas, and by the new layout
+/// once settled. `None` — like the data — for a pool that does not move them.
+fn bucket_metadata_scope(
+    moving: Option<&BucketMetadataMove>,
+) -> Option<proto::BucketMetadataScope> {
+    let moving = moving?;
+    let placed = |layout: &ClassLayout| proto::BucketMetadataScope {
+        excluded: false,
+        replication_factor: u32::from(layout.replication_factor()),
+    };
+    Some(match moving.stage_cell().stage() {
+        Stage::Legacy => placed(moving.old()),
+        Stage::DualWrite | Stage::ReadNew => proto::BucketMetadataScope {
+            excluded: true,
+            replication_factor: 0,
+        },
+        Stage::Settled => placed(moving.new_layout()),
+    })
+}
+
+/// The placement of the bucket metadata that `scope` asks a pair to compare
+/// them by, on the ring of `data`; `None` when they are left out. A layout
+/// of `moving`, or the data's, is taken as it is; another replication factor
+/// is placed on the same ring.
+fn bucket_metadata_placement(
+    scope: Option<&proto::BucketMetadataScope>,
+    data: &PlacementStrategy,
+    moving: Option<&BucketMetadataMove>,
+) -> Result<Option<PlacementStrategy>, String> {
+    let Some(scope) = scope else {
+        return Ok(Some(data.clone()));
+    };
+    if scope.excluded {
+        return Ok(None);
+    }
+    let rf = u8::try_from(scope.replication_factor)
+        .ok()
+        .filter(|rf| *rf > 0 && usize::from(*rf) <= data.node_count())
+        .ok_or_else(|| {
+            format!(
+                "bucket metadata on {} replicas cannot be placed on the {} node(s) of the pool",
+                scope.replication_factor,
+                data.node_count()
+            )
+        })?;
+    let known = moving
+        .into_iter()
+        .flat_map(|moving| [moving.old().strategy(), moving.new_layout().strategy()])
+        .chain([data])
+        .find(|placement| placement.replication_factor() == rf);
+    match known {
+        Some(placement) => Ok(Some(placement.clone())),
+        None => PlacementStrategy::new(data.all_nodes().to_vec(), rf)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The rounds
+// ---------------------------------------------------------------------------
+
+/// Everything a round needs, and the order its peers are taken in.
+pub struct AntiEntropyRounds {
+    service: Arc<AntiEntropyService>,
+    config: AntiEntropyConfig,
+    /// A tombstone older than this is not carried to a replica without the key.
+    gc_grace: Duration,
+    storage: Arc<dyn StorageEngine>,
+    placement: PlacementStrategy,
+    /// The move of the pool's bucket metadata, if it moves them.
+    bucket_metadata: Option<Arc<BucketMetadataMove>>,
+    /// The pool's growth to a successor generation, if it grows.
+    growth: Option<AntiEntropyGrowth>,
+    local_node_id: NodeId,
+    pool_id: PoolId,
+    topology_epoch: u64,
+    rpc_client: Arc<NodeClient>,
+    gossip: Arc<GossipHandle>,
+    reconciler: Reconciler,
+    /// The peers in the order they are taken, and the next one's place.
+    turn: Mutex<(Vec<NodeId>, usize)>,
+    /// Per peer, the place `(leaf, key)` of the last divergent key a round
+    /// with it took when its budget ran out: the next round with that peer
+    /// goes on from there, around the ring.
+    resume: Mutex<HashMap<NodeId, (u32, String)>>,
+    /// When these rounds began, in Unix milliseconds: the frontier lag of a
+    /// peer no round has completed with counts from here.
+    began_ms: u64,
+    /// How far before its start a complete round sets the peer's cut: the
+    /// window in which a tombstone may still land on this node through the
+    /// write of its delete ([`arrival_window`]).
+    cut_margin: Duration,
+    /// Called between the leaves and the keys of a round.
+    #[cfg(test)]
+    after_leaves: Option<Box<dyn Fn() + Send + Sync>>,
+}
+
+/// The keys a round compares, and how it asks the peer to compare the
+/// bucket metadata.
+struct RoundScope {
+    pair: PairScope,
+    bucket_metadata: Option<proto::BucketMetadataScope>,
+}
+
+/// The peer a round is to take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NextPeer {
+    /// Alive, with anti-entropy.
+    Ready(NodeId),
+    /// Alive, and its protocol not known yet: it keeps its turn.
+    NotAnnounced(NodeId),
+    /// No peer is alive.
+    None,
+}
+
+/// Which keys of a pass over divergent leaves are taken.
+#[derive(Debug, Clone, Copy)]
+enum KeyWindow<'a> {
+    /// Every key.
+    All,
+    /// In leaf `.0`, only the keys after `.1`; every key of the other leaves.
+    After(u32, &'a str),
+    /// The keys up to `.1`, in leaf `.0`, the only leaf of its pass.
+    UpTo(u32, &'a str),
+}
+
+impl KeyWindow<'_> {
+    fn takes(&self, leaf: u32, key: &str) -> bool {
+        match *self {
+            Self::All => true,
+            Self::After(from, after) => leaf != from || key > after,
+            Self::UpTo(at, up_to) => leaf == at && key <= up_to,
+        }
+    }
+}
+
+/// How a round ended and what it found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoundReport {
+    /// How the round ended.
+    pub outcome: RoundEnd,
+    /// The peer it compared this node with.
+    pub peer: Option<NodeId>,
+    /// Leaves that differed.
+    pub divergent_leaves: usize,
+    /// Divergent keys settled, failed and ambiguous.
+    pub repaired: u64,
+    /// Divergent keys not settled.
+    pub failed: u64,
+    /// Divergent keys whose newest copy may have missed a delete.
+    pub ambiguous: u64,
+}
+
+/// How a round ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RoundEnd {
+    /// Every leaf compared and every divergent key settled.
+    Complete,
+    /// The round ran but left something for the next one, and why.
+    Incomplete(String),
+    /// The round did not run, and why.
+    Skipped(String),
+}
+
+impl AntiEntropyRounds {
+    /// Rounds of node `local_node_id` of pool `pool_id` placed by
+    /// `placement`, comparing `storage` with its peers through `rpc_client`
+    /// and settling keys through `reconciler`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        service: Arc<AntiEntropyService>,
+        config: AntiEntropyConfig,
+        gc_grace: Duration,
+        storage: Arc<dyn StorageEngine>,
+        placement: PlacementStrategy,
+        local_node_id: NodeId,
+        pool_id: PoolId,
+        topology_epoch: u64,
+        rpc_client: Arc<NodeClient>,
+        gossip: Arc<GossipHandle>,
+        reconciler: Reconciler,
+    ) -> Self {
+        let mut peers: Vec<NodeId> = placement
+            .all_nodes()
+            .iter()
+            .copied()
+            .filter(|node| *node != local_node_id)
+            .collect();
+        peers.shuffle(&mut rand::rng());
+        service.metrics().enabled.store(config.enabled, Ordering::Relaxed);
+        Self {
+            service,
+            config,
+            gc_grace,
+            storage,
+            placement,
+            bucket_metadata: None,
+            growth: None,
+            local_node_id,
+            pool_id,
+            topology_epoch,
+            rpc_client,
+            gossip,
+            reconciler,
+            turn: Mutex::new((peers, 0)),
+            resume: Mutex::new(HashMap::new()),
+            began_ms: now_millis(),
+            cut_margin: arrival_window(crate::WriteTimeouts::default().replica_write_timeout),
+            #[cfg(test)]
+            after_leaves: None,
+        }
     }
 
-    /// Run the anti-entropy background loop.
-    ///
-    /// This is the main entry point. Spawns as a tokio task and runs
-    /// until the cancellation token fires or the service is dropped.
-    pub async fn run(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    /// The same rounds in a pool that moves its bucket metadata as `moving`
+    /// says: each round compares them by the layout of this node's stage.
+    pub fn with_bucket_metadata_move(mut self, moving: BucketMetadataMove) -> Self {
+        self.bucket_metadata = Some(Arc::new(moving));
+        self
+    }
+
+    /// The same rounds in a pool growing as `growth` says: once it settled
+    /// here, rounds take the successor's nodes and compare by its ring.
+    pub fn with_growth(mut self, growth: AntiEntropyGrowth) -> Self {
+        self.growth = Some(growth);
+        self
+    }
+
+    /// The same rounds, setting a peer's cut `margin` before the start of a
+    /// complete round: the arrival window of the write coordinator's replica
+    /// write timeout ([`arrival_window`]).
+    pub fn with_cut_margin(mut self, margin: Duration) -> Self {
+        self.cut_margin = margin;
+        self
+    }
+
+    /// The same rounds, calling `hook` between the leaves and the keys of
+    /// each round.
+    #[cfg(test)]
+    fn after_leaves(mut self, hook: impl Fn() + Send + Sync + 'static) -> Self {
+        self.after_leaves = Some(Box::new(hook));
+        self
+    }
+
+    /// The same rounds, taking `peer` first.
+    #[cfg(test)]
+    fn turning_to(self, peer: NodeId) -> Self {
+        {
+            let mut turn = self.turn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let place = turn.0.iter().position(|node| *node == peer).unwrap_or(0);
+            turn.1 = place;
+        }
+        self
+    }
+
+    /// Runs a round every interval until `shutdown` turns true. A node with
+    /// rounds switched off returns at once: it only answers its peers.
+    pub async fn run(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         if !self.config.enabled {
-            info!("anti-entropy service disabled by configuration");
             return;
         }
-
-        let interval = Duration::from_secs(self.config.interval_secs);
-        info!(
-            interval_secs = self.config.interval_secs,
-            merkle_depth = self.config.merkle_depth,
-            pool_id = self.pool_id.as_u32(),
-            "anti-entropy service started"
-        );
-
+        let interval = Duration::from_secs(self.config.interval_secs.max(1));
+        let mut ticks = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {
-                    self.run_round().await;
+                _ = ticks.tick() => {
+                    self.round().await;
                 }
-                _ = shutdown.changed() => {
-                    info!("anti-entropy service shutting down");
-                    return;
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
                 }
             }
         }
     }
 
-    /// Execute a single anti-entropy round.
-    ///
-    /// Iterates over all key ranges this node owns, picks a random alive
-    /// replica peer, and performs a Merkle exchange + repair.
-    async fn run_round(&self) {
-        let start = std::time::Instant::now();
-        let trees = self.merkle_trees.read().await;
-        let ranges: Vec<(u64, KeyRange)> =
-            trees.iter().map(|(&range_id, tree)| (range_id, tree.key_range())).collect();
-        drop(trees);
-
-        for (range_id, key_range) in ranges {
-            let peer = match self.pick_random_alive_peer() {
-                Some(p) => p,
-                None => {
-                    debug!("no alive peers available for anti-entropy");
-                    continue;
-                }
-            };
-
-            if let Err(e) = self.exchange_with_peer(peer, range_id, key_range).await {
-                warn!(
-                    %peer,
-                    range_start = key_range.start,
-                    error = %e,
-                    "anti-entropy exchange failed"
-                );
-            }
-        }
-
-        let elapsed = start.elapsed();
-        self.metrics
-            .total_repair_duration_ms
-            .fetch_add(elapsed.as_millis() as u64, Ordering::Relaxed);
-        self.metrics.rounds_completed.fetch_add(1, Ordering::Relaxed);
-        cluster_metrics::record_anti_entropy_round();
-        let lag = self.frontier_lag_secs().await;
-        self.metrics.frontier_lag_secs_bits.store(lag.to_bits(), Ordering::Relaxed);
-        cluster_metrics::set_repair_frontier_lag(lag);
-
-        debug!(
-            elapsed_ms = elapsed.as_millis(),
-            "anti-entropy round completed"
-        );
-    }
-
-    /// Exchange Merkle digests with a peer and repair divergent keys.
-    async fn exchange_with_peer(
-        &self,
-        peer: NodeId,
-        range_id: u64,
-        key_range: KeyRange,
-    ) -> Result<(), ClusterError> {
-        let trees = self.merkle_trees.read().await;
-        let local_tree = match trees.get(&range_id) {
-            Some(t) => t.clone(),
-            None => return Ok(()),
+    /// Runs one round and records it. A complete round moves the peer's cut
+    /// of the repair frontier to the moment the round started, less the
+    /// arrival window: a tombstone with an HLC before the cut that the write
+    /// of its delete brought here was here when the round started, so the
+    /// peer has it, or something newer.
+    pub async fn round(&self) -> RoundReport {
+        let started = Instant::now();
+        let margin = u64::try_from(self.cut_margin.as_millis()).unwrap_or(u64::MAX);
+        let cut = HlcTimestamp::from_record(now_millis().saturating_sub(margin), 0, 0);
+        let mut report = RoundReport {
+            outcome: RoundEnd::Complete,
+            peer: None,
+            divergent_leaves: 0,
+            repaired: 0,
+            failed: 0,
+            ambiguous: 0,
         };
-        drop(trees);
-
-        let local_root = local_tree.root_hash();
-
-        // Step 1: Exchange root hash.
-        let response = self
-            .rpc_client
-            .send_merkle_digest(
-                peer,
-                proto::MerkleDigestRequest {
-                    bucket: String::new(), // Range-based, not bucket-scoped
-                    range_start: key_range.start.to_be_bytes().to_vec(),
-                    range_end: key_range.end.to_be_bytes().to_vec(),
-                    level: 0,
-                    tree_hash: local_root.to_vec(),
-                    topology_epoch: 0,
-                },
-            )
-            .await?;
-
-        if response.r#match {
-            debug!(
-                %peer,
-                range_start = key_range.start,
-                "merkle trees match, range is consistent"
-            );
-            return Ok(());
+        report.outcome = self.round_with(&mut report).await;
+        if let (RoundEnd::Complete, Some(peer)) = (&report.outcome, report.peer) {
+            self.service.repair_frontier().write().await.advance_peer(peer, cut);
         }
+        self.record_frontier_lag().await;
+        let took = started.elapsed();
+        let outcome = match &report.outcome {
+            RoundEnd::Complete => RoundOutcome::Complete,
+            RoundEnd::Incomplete(_) => RoundOutcome::Incomplete,
+            RoundEnd::Skipped(_) => RoundOutcome::Skipped,
+        };
+        self.service.metrics().round(outcome, took);
+        let peer = report.peer.map(|peer| self.rpc_client.peer_label(peer));
+        match &report.outcome {
+            RoundEnd::Skipped(why) => debug!(%why, "anti-entropy round skipped"),
+            RoundEnd::Complete if report.divergent_leaves == 0 => {
+                debug!(
+                    ?peer,
+                    took_ms = took.as_millis() as u64,
+                    "anti-entropy round: in step"
+                )
+            }
+            RoundEnd::Complete => info!(
+                ?peer,
+                divergent_leaves = report.divergent_leaves,
+                repaired = report.repaired,
+                took_ms = took.as_millis() as u64,
+                "anti-entropy round complete"
+            ),
+            RoundEnd::Incomplete(why) => info!(
+                ?peer,
+                divergent_leaves = report.divergent_leaves,
+                repaired = report.repaired,
+                failed = report.failed,
+                ambiguous = report.ambiguous,
+                %why,
+                took_ms = took.as_millis() as u64,
+                "anti-entropy round incomplete; the rest is left for the next rounds"
+            ),
+        }
+        report
+    }
 
-        // Step 2: Find divergent key ranges from the remote's response.
-        let divergent_ranges: Vec<KeyRange> = response
-            .divergent_ranges
-            .iter()
-            .filter_map(|r| {
-                let start_bytes: [u8; 8] = r.range_start.as_slice().try_into().ok()?;
-                let end_bytes: [u8; 8] = r.range_end.as_slice().try_into().ok()?;
-                Some(KeyRange::new(
-                    u64::from_be_bytes(start_bytes),
-                    u64::from_be_bytes(end_bytes),
-                ))
+    /// Records how far behind now the oldest cut over the pool's peers is.
+    async fn record_frontier_lag(&self) {
+        let peers = self.turn_order();
+        let lag_ms = self.service.repair_frontier().read().await.lag_millis(
+            &peers,
+            self.began_ms,
+            now_millis(),
+        );
+        let seconds = lag_ms as f64 / 1000.0;
+        self.service
+            .metrics()
+            .frontier_lag_secs_bits
+            .store(seconds.to_bits(), Ordering::Relaxed);
+        record_repair_frontier_lag(seconds);
+    }
+
+    async fn round_with(&self, report: &mut RoundReport) -> RoundEnd {
+        // A live node that announced an older protocol means a rolling
+        // upgrade is under way: rounds wait for it to end. A node gossip has
+        // not seen, or that announced nothing yet, does not hold them up — its
+        // replicas are settled as ones that did not answer.
+        let upgrading: Vec<NodeId> = self
+            .turn_order()
+            .into_iter()
+            .filter(|node| {
+                self.gossip.get_node(node).is_some_and(|state| {
+                    matches!(state.status, NodeStatus::Alive | NodeStatus::Suspect)
+                        && (1..ROUNDS_MIN_PROTOCOL_VERSION).contains(&state.meta.protocol_version)
+                })
             })
             .collect();
-
-        if divergent_ranges.is_empty() {
-            return Ok(());
+        if !upgrading.is_empty() {
+            return RoundEnd::Skipped(format!(
+                "nodes {upgrading:?} of the pool announced a protocol older than \
+                 {ROUNDS_MIN_PROTOCOL_VERSION}"
+            ));
         }
-
-        // Ranges, not keys: the peer lists every leaf once the roots differ,
-        // so how many keys are behind is known only once they are compared.
-        let num_divergent = divergent_ranges.len();
-
-        info!(
-            %peer,
-            range_start = key_range.start,
-            divergent_ranges = num_divergent,
-            "divergence detected, starting repair"
+        let peer = match self.next_live_peer() {
+            NextPeer::Ready(peer) => peer,
+            NextPeer::NotAnnounced(peer) => {
+                return RoundEnd::Skipped(format!(
+                    "{peer}, the next peer in turn, has not announced its protocol yet"
+                ))
+            }
+            NextPeer::None => return RoundEnd::Skipped("no peer of the pool is alive".into()),
+        };
+        report.peer = Some(peer);
+        if let Some(why) = self.growth.as_ref().and_then(|growth| growth.apart_from(peer)) {
+            return RoundEnd::Skipped(why);
+        }
+        // Chosen once for the round: the peer compares by the same scope.
+        let (ring, moving) = pair_placement(
+            self.growth.as_ref(),
+            &self.placement,
+            self.bucket_metadata.as_deref(),
         );
+        let bucket_metadata = bucket_metadata_scope(moving);
+        let placement = match bucket_metadata_placement(bucket_metadata.as_ref(), ring, moving) {
+            Ok(placement) => placement,
+            Err(why) => return RoundEnd::Skipped(why),
+        };
+        let scope = RoundScope {
+            pair: PairScope::by_class(ring, placement.as_ref(), self.local_node_id, peer),
+            bucket_metadata,
+        };
 
-        // Step 3: Resolve divergent ranges to actual object keys.
-        //
-        // We send LOCAL keys in the divergent ranges to the peer. The peer
-        // returns its version of each key. We apply LWW to pull newer data.
-        //
-        // Keys that exist ONLY on the peer (not in our registry) will be
-        // discovered when the PEER runs its own anti-entropy round against
-        // us — both sides run this loop, ensuring bidirectional convergence.
-        let registry = self.key_registry.read().await;
-        let keys = Self::keys_in_ranges(&registry, &divergent_ranges);
-        drop(registry);
-
-        if keys.is_empty() {
-            debug!(
-                %peer,
-                "divergent ranges found but no local keys to check — \
-                 peer will push missing keys in its own anti-entropy round"
-            );
-            return Ok(());
+        let (local, remote) = tokio::join!(
+            pair_leaves(&*self.storage, &scope.pair),
+            self.peer_leaves(peer, &scope)
+        );
+        let local = match local {
+            Ok(leaves) => leaves,
+            Err(e) => return RoundEnd::Incomplete(format!("local leaves: {e}")),
+        };
+        let remote = match remote {
+            Ok(leaves) => leaves,
+            Err(e) => return RoundEnd::Incomplete(format!("leaves of the peer: {e}")),
+        };
+        #[cfg(test)]
+        if let Some(hook) = &self.after_leaves {
+            hook();
+        }
+        let divergent: Vec<u32> = (0..LEAF_COUNT)
+            .filter(|leaf| local[*leaf] != remote[*leaf])
+            .map(|leaf| leaf as u32)
+            .collect();
+        report.divergent_leaves = divergent.len();
+        if divergent.is_empty() {
+            return RoundEnd::Complete;
         }
 
-        let keys_to_sync = keys
-            .into_iter()
-            .take(self.config.max_keys_per_batch as usize)
-            .collect::<Vec<_>>();
-
-        let mut repair_stream = self
-            .rpc_client
-            .send_repair_sync(
-                peer,
-                proto::RepairSyncRequest {
-                    bucket: String::new(),
-                    keys: keys_to_sync,
-                    topology_epoch: 0,
-                },
-            )
-            .await?;
-
-        // Counted as each key is settled, so that a stream that breaks off
-        // midway still accounts for the keys it did repair.
-        let mut repaired = 0u64;
-        let mut failed = 0u64;
-
-        while let Some(item) = repair_stream
-            .message()
-            .await
-            .map_err(|e| ClusterError::Rpc(format!("repair sync stream error: {e}")))?
+        let budget = self.config.max_keys_per_round.max(1) as usize;
+        let resume = self
+            .resume
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&peer)
+            .cloned();
+        let (keys, all_compared) =
+            match self.divergent_keys(peer, &scope, &divergent, budget, resume.as_ref()).await {
+                Ok(found) => found,
+                Err(e) => return RoundEnd::Incomplete(format!("keys of the peer: {e}")),
+            };
         {
-            if item.key.is_empty() {
+            let mut resume = self.resume.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            match keys.last() {
+                Some(last) if !all_compared => {
+                    resume.insert(peer, last.clone());
+                }
+                _ => {
+                    resume.remove(&peer);
+                }
+            }
+        }
+
+        let pair = [self.local_node_id, peer];
+        let mut first_failure = None;
+        for (_, full_key) in &keys {
+            let Some((bucket, key)) = full_key.split_once('/') else {
+                continue;
+            };
+            let settled =
+                self.reconciler.settle(KeyRef { bucket, key }, &pair, self.gc_grace).await;
+            let outcome = match settled {
+                Settled::InStep => {
+                    report.repaired += 1;
+                    KeyRepairOutcome::Ok
+                }
+                Settled::Ambiguous(why) => {
+                    report.ambiguous += 1;
+                    warn!(
+                        bucket, key, %why,
+                        "anti-entropy left a key as it is: its newest copy may have missed a delete"
+                    );
+                    first_failure.get_or_insert(format!("{full_key} is ambiguous"));
+                    KeyRepairOutcome::Ambiguous
+                }
+                Settled::Failed(why) => {
+                    report.failed += 1;
+                    debug!(bucket, key, %why, "anti-entropy could not settle a key this round");
+                    first_failure.get_or_insert(format!("{full_key}: {why}"));
+                    KeyRepairOutcome::Failed
+                }
+                Settled::NotOurs => continue,
+            };
+            self.service.metrics().key(outcome);
+        }
+        if let Some(why) = first_failure {
+            return RoundEnd::Incomplete(why);
+        }
+        if !all_compared {
+            return RoundEnd::Incomplete(format!(
+                "more divergent keys than the {budget} a round settles"
+            ));
+        }
+        RoundEnd::Complete
+    }
+
+    /// The pool's other nodes, in the order rounds take them.
+    fn turn_order(&self) -> Vec<NodeId> {
+        self.turn.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).0.clone()
+    }
+
+    /// The next peer in turn that gossip holds alive. One that announced a
+    /// protocol with anti-entropy is taken, and the turn moves past it. One
+    /// whose metadata has not arrived yet — a node gossip has just seen come
+    /// back — keeps its turn: the round is skipped rather than taken with
+    /// another peer, so that rounds keep visiting every peer in turn.
+    fn next_live_peer(&self) -> NextPeer {
+        let mut turn = self.turn.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // A pool that settled on its successor takes the successor's nodes.
+        let (ring, _) = pair_placement(self.growth.as_ref(), &self.placement, None);
+        let members: Vec<NodeId> = ring
+            .all_nodes()
+            .iter()
+            .copied()
+            .filter(|node| *node != self.local_node_id)
+            .collect();
+        if turn.0.len() != members.len() || !members.iter().all(|node| turn.0.contains(node)) {
+            let mut peers = members;
+            peers.shuffle(&mut rand::rng());
+            *turn = (peers, 0);
+        }
+        let (peers, next) = &mut *turn;
+        let count = peers.len();
+        for step in 0..count {
+            let place = (*next + step) % count;
+            let peer = peers[place];
+            let Some(state) = self.gossip.get_node(&peer) else {
+                continue;
+            };
+            if state.status != NodeStatus::Alive || self.rpc_client.is_down(peer) {
                 continue;
             }
-            let Some(outcome) = self.repair_from_peer(item).await else {
-                continue; // this node's copy is as new as the peer's
-            };
-            self.metrics.divergent_keys_found.fetch_add(1, Ordering::Relaxed);
-            if outcome {
-                self.metrics.repairs_completed.fetch_add(1, Ordering::Relaxed);
-                self.metrics.last_repair_unix_ms.store(now_millis(), Ordering::Relaxed);
-                repaired += 1;
-            } else {
-                self.metrics.repairs_failed.fetch_add(1, Ordering::Relaxed);
-                failed += 1;
+            if state.meta.protocol_version < ROUNDS_MIN_PROTOCOL_VERSION {
+                *next = place;
+                return NextPeer::NotAnnounced(peer);
             }
-            cluster_metrics::record_anti_entropy_repair(outcome);
+            *next = (place + 1) % count;
+            return NextPeer::Ready(peer);
         }
-
-        // Step 4: Advance repair frontier.
-        if repaired > 0 {
-            let now = HlcTimestamp {
-                wall_time: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis() as u64,
-                logical: 0,
-                node_id: self.local_node_id.0,
-            };
-            let mut frontier = self.repair_frontier.write().await;
-            frontier.advance(&key_range, peer, now);
-        }
-
-        debug!(
-            %peer,
-            repaired,
-            failed,
-            "anti-entropy repair round completed"
-        );
-
-        Ok(())
+        NextPeer::None
     }
 
-    /// Takes the peer's copy of one key if it is newer than this node's.
-    ///
-    /// `None` when this node's copy is as new as the peer's: the key is not
-    /// behind here. Otherwise whether the peer's copy was written — including
-    /// `false` for a copy this node cannot place in time or in a bucket, which
-    /// leaves the key as behind as it was.
-    async fn repair_from_peer(&self, item: proto::RepairSyncResponse) -> Option<bool> {
-        let Some(peer_hlc_ts) = item.hlc.as_ref().map(|h| HlcTimestamp {
-            wall_time: h.wall_time,
-            logical: h.logical,
-            node_id: u128::from_be_bytes(h.node_id.as_slice().try_into().unwrap_or([0u8; 16])),
-        }) else {
-            return Some(false);
-        };
-
-        // Parse "bucket/key" from the response.
-        let Some((bucket, obj_key)) = item.key.split_once('/') else {
-            warn!(key = %item.key, "invalid repair key format, expected bucket/key");
-            return Some(false);
-        };
-
-        // LWW: only write if peer's version is newer than local.
-        //
-        // Note on tie-breaking: IndexRecord doesn't store the HLC
-        // logical counter, so when wall times match we treat any
-        // peer logical > 0 as "newer". This is a safe bias toward
-        // convergence — the worst case is a redundant overwrite
-        // with identical data.
-        let should_write = match self.storage.head_object(bucket, obj_key).await {
-            Ok(local_record) => {
-                let local_millis = local_record.modified_at / 1_000_000;
-                peer_hlc_ts.wall_time > local_millis
-                    || (peer_hlc_ts.wall_time == local_millis && peer_hlc_ts.logical > 0)
-            }
-            Err(_) => true, // Key missing locally — always write.
-        };
-
-        if !should_write {
-            return None;
-        }
-
-        // Defense-in-depth: ensure bucket marker exists locally.
-        // The bucket marker itself is also an object in __system__,
-        // so it will be synced by anti-entropy. But if a data object
-        // arrives before its bucket marker, auto-create the marker
-        // so API-layer bucket checks pass.
-        if bucket != "__system__" {
-            let marker_key = format!("__s4_bucket_marker_{bucket}");
-            if self.storage.head_object("__system__", &marker_key).await.is_err() {
-                debug!(bucket = %bucket, "auto-creating bucket marker during anti-entropy repair");
-                let _ = self
-                    .storage
-                    .put_object(
-                        "__system__",
-                        &marker_key,
-                        b"1",
-                        "application/octet-stream",
-                        &HashMap::new(),
-                    )
-                    .await;
-            }
-        }
-
-        // Use content_type and metadata from the peer's response
-        // (preserves the original values from when the object was written).
-        let content_type = if item.content_type.is_empty() {
-            "application/octet-stream"
-        } else {
-            &item.content_type
-        };
-
-        match self
-            .storage
-            .put_object(bucket, obj_key, &item.data, content_type, &item.metadata)
-            .await
-        {
-            Ok(_) => {
-                debug!(
-                    bucket = %bucket,
-                    key = %obj_key,
-                    peer_wall_time = peer_hlc_ts.wall_time,
-                    "anti-entropy: repaired key from peer"
-                );
-                Some(true)
-            }
-            Err(e) => {
-                warn!(
-                    bucket = %bucket,
-                    key = %obj_key,
-                    error = %e,
-                    "anti-entropy: failed to write repair data"
-                );
-                Some(false)
-            }
-        }
-    }
-
-    /// Seconds since the repair frontier last moved, for the peer it has gone
-    /// longest without moving for, over every range this node keeps a tree
-    /// for. A peer it never moved for counts from the service's creation.
-    async fn frontier_lag_secs(&self) -> f64 {
-        let ranges: Vec<KeyRange> =
-            self.merkle_trees.read().await.values().map(MerkleTree::key_range).collect();
-        let peers: Vec<NodeId> =
-            self.pool_nodes.iter().copied().filter(|n| *n != self.local_node_id).collect();
-        let frontier = self.repair_frontier.read().await;
-        frontier_lag_secs(&frontier, &ranges, &peers, self.created_at_ms, now_millis())
-    }
-
-    /// Pick a random alive replica peer (not self).
-    fn pick_random_alive_peer(&self) -> Option<NodeId> {
-        let members = self.gossip.members();
-        let alive_peers: Vec<NodeId> = self
-            .pool_nodes
-            .iter()
-            .filter(|&&n| n != self.local_node_id)
-            .filter(|n| {
-                members.get(n).map(|s| matches!(s.status, NodeStatus::Alive)).unwrap_or(false)
-            })
-            .copied()
-            .collect();
-
-        if alive_peers.is_empty() {
-            return None;
-        }
-
-        // Simple random selection using wall clock as seed.
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let idx = (now as usize) % alive_peers.len();
-        Some(alive_peers[idx])
-    }
-
-    /// Handle an incoming Merkle digest exchange request from a peer.
-    ///
-    /// Compares the peer's tree hash against local state and returns
-    /// the list of divergent ranges.
-    pub async fn handle_merkle_exchange(
+    async fn peer_leaves(
         &self,
-        request: &proto::MerkleDigestRequest,
-    ) -> proto::MerkleDigestResponse {
-        let range_start =
-            request.range_start.as_slice().try_into().map(u64::from_be_bytes).unwrap_or(0);
+        peer: NodeId,
+        scope: &RoundScope,
+    ) -> Result<Vec<LeafHash>, ClusterError> {
+        let response = self
+            .rpc_client
+            .send_anti_entropy_leaves(
+                peer,
+                proto::AntiEntropyLeavesRequest {
+                    pool_id: self.pool_id.as_u32(),
+                    peer_id: self.local_node_id.to_bytes().to_vec(),
+                    topology_epoch: self.topology_epoch,
+                    digests_format: VERSION_DIGESTS_FORMAT,
+                    bucket_metadata: scope.bucket_metadata,
+                },
+            )
+            .await?;
+        if response.epoch_mismatch {
+            return Err(ClusterError::Unavailable(
+                "the peer is on another topology epoch".into(),
+            ));
+        }
+        if !response.error.is_empty() {
+            return Err(ClusterError::Rpc(response.error));
+        }
+        if response.leaves.len() != LEAF_COUNT * LEAF_HASH_LEN {
+            return Err(ClusterError::Rpc(format!(
+                "the peer sent {} byte(s) of leaves, expected {}",
+                response.leaves.len(),
+                LEAF_COUNT * LEAF_HASH_LEN
+            )));
+        }
+        Ok(response.leaves.as_chunks::<LEAF_HASH_LEN>().0.to_vec())
+    }
 
-        let trees = self.merkle_trees.read().await;
-        let local_tree = match trees.get(&range_start) {
-            Some(t) => t,
-            None => {
-                return proto::MerkleDigestResponse {
-                    r#match: false,
-                    divergent_ranges: Vec::new(),
-                    tree_hash: Vec::new(),
-                    epoch_mismatch: false,
-                };
+    /// The keys of `divergent` leaves (ascending) whose versions differ
+    /// between this node and `peer`, with their leaves, at most `budget` of
+    /// them; and whether every divergent key was compared. Taken in ring
+    /// order from just after `resume` — the last key the previous round with
+    /// this peer took — around the ring and back to it, so that keys that do
+    /// not settle never keep the rest of the ring from its turn. Leaf by
+    /// leaf, so that only one leaf's keys of each side are held at a time.
+    async fn divergent_keys(
+        &self,
+        peer: NodeId,
+        scope: &RoundScope,
+        divergent: &[u32],
+        budget: usize,
+        resume: Option<&(u32, String)>,
+    ) -> Result<(Vec<(u32, String)>, bool), ClusterError> {
+        let passes: Vec<(Vec<u32>, KeyWindow<'_>)> = match resume {
+            None => vec![(divergent.to_vec(), KeyWindow::All)],
+            Some((from, after)) => {
+                let split = divergent.partition_point(|leaf| leaf < from);
+                let back: Vec<u32> = divergent
+                    .get(split)
+                    .filter(|leaf| *leaf == from)
+                    .into_iter()
+                    .copied()
+                    .collect();
+                vec![
+                    (divergent[split..].to_vec(), KeyWindow::After(*from, after)),
+                    (divergent[..split].to_vec(), KeyWindow::All),
+                    (back, KeyWindow::UpTo(*from, after)),
+                ]
             }
         };
-
-        let local_root = local_tree.root_hash();
-        let remote_root: [u8; 32] = request.tree_hash.as_slice().try_into().unwrap_or([0u8; 32]);
-
-        if local_root == remote_root {
-            return proto::MerkleDigestResponse {
-                r#match: true,
-                divergent_ranges: Vec::new(),
-                tree_hash: local_root.to_vec(),
-                epoch_mismatch: false,
-            };
-        }
-
-        // Build a remote hash map for comparison.
-        // For the initial exchange, we only have the root. Report all
-        // leaf ranges as potentially divergent. In a production system,
-        // this would do a multi-round drill-down.
-        let key_range = local_tree.key_range();
-        let num_leaves = local_tree.leaf_count();
-        let range_size = key_range.end.wrapping_sub(key_range.start);
-
-        let divergent_ranges: Vec<proto::MerkleRange> = (0..num_leaves)
-            .map(|i| {
-                let leaf_start = key_range.start.wrapping_add(if range_size == 0 {
-                    0
-                } else {
-                    (i as u128 * range_size as u128 / num_leaves as u128) as u64
-                });
-                let leaf_end = key_range.start.wrapping_add(if range_size == 0 {
-                    0
-                } else {
-                    ((i + 1) as u128 * range_size as u128 / num_leaves as u128) as u64
-                });
-                let leaf_idx = num_leaves - 1 + i;
-                let local_hash = local_tree.hash_at(leaf_idx).unwrap_or([0u8; 32]);
-
-                proto::MerkleRange {
-                    range_start: leaf_start.to_be_bytes().to_vec(),
-                    range_end: leaf_end.to_be_bytes().to_vec(),
-                    local_hash: local_hash.to_vec(),
+        let mut found = Vec::new();
+        for (leaves, window) in &passes {
+            for chunk in leaves.chunks(LEAVES_PER_REQUEST) {
+                let mut remote = PeerKeys::new(chunk, scope.bucket_metadata);
+                for &leaf in chunk {
+                    for key in self.differing_keys(&mut remote, peer, scope, leaf).await? {
+                        if !window.takes(leaf, &key) {
+                            continue;
+                        }
+                        if found.len() == budget {
+                            return Ok((found, false));
+                        }
+                        found.push((leaf, key));
+                    }
                 }
-            })
-            .collect();
-
-        proto::MerkleDigestResponse {
-            r#match: false,
-            divergent_ranges,
-            tree_hash: local_root.to_vec(),
-            epoch_mismatch: false,
+            }
         }
+        Ok((found, true))
+    }
+
+    /// The keys of `leaf` whose versions differ between this node and the
+    /// peer, sorted.
+    async fn differing_keys(
+        &self,
+        remote: &mut PeerKeys<'_>,
+        peer: NodeId,
+        scope: &RoundScope,
+        leaf: u32,
+    ) -> Result<Vec<String>, ClusterError> {
+        let theirs = remote.leaf(self, peer, leaf).await?;
+        let mut ours = BTreeMap::new();
+        let mut cursor = None;
+        loop {
+            let (page, next) = leaf_keys(
+                &*self.storage,
+                &scope.pair,
+                &[leaf],
+                cursor,
+                MAX_KEYS_PER_PAGE as usize,
+            )
+            .await?;
+            ours.extend(page.into_iter().map(|entry| (entry.key, entry.digest.encode().to_vec())));
+            match next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        let mut differing: Vec<String> = theirs
+            .iter()
+            .filter(|(key, digest)| ours.get(*key) != Some(*digest))
+            .map(|(key, _)| key.clone())
+            .collect();
+        differing.extend(ours.keys().filter(|key| !theirs.contains_key(*key)).cloned());
+        differing.sort_unstable();
+        Ok(differing)
+    }
+}
+
+/// The keys of a chunk of leaves on the peer, read a page at a time and
+/// handed out leaf by leaf.
+struct PeerKeys<'a> {
+    leaves: &'a [u32],
+    /// How the round compares the bucket metadata.
+    bucket_metadata: Option<proto::BucketMetadataScope>,
+    cursor: Option<proto::AntiEntropyCursor>,
+    /// Keys read but not handed out yet, in ring order.
+    read: VecDeque<proto::AntiEntropyKeyDigest>,
+    done: bool,
+}
+
+impl<'a> PeerKeys<'a> {
+    fn new(leaves: &'a [u32], bucket_metadata: Option<proto::BucketMetadataScope>) -> Self {
+        Self {
+            leaves,
+            bucket_metadata,
+            cursor: None,
+            read: VecDeque::new(),
+            done: false,
+        }
+    }
+
+    /// The peer's keys and digests in `leaf`: pages are read until one goes
+    /// past it, since they come in ring order.
+    async fn leaf(
+        &mut self,
+        rounds: &AntiEntropyRounds,
+        peer: NodeId,
+        leaf: u32,
+    ) -> Result<BTreeMap<String, Vec<u8>>, ClusterError> {
+        while !self.done && self.read.back().is_none_or(|last| last.leaf <= leaf) {
+            let response = rounds
+                .rpc_client
+                .send_anti_entropy_keys(
+                    peer,
+                    proto::AntiEntropyKeysRequest {
+                        pool_id: rounds.pool_id.as_u32(),
+                        peer_id: rounds.local_node_id.to_bytes().to_vec(),
+                        topology_epoch: rounds.topology_epoch,
+                        leaves: self.leaves.to_vec(),
+                        cursor: self.cursor.clone(),
+                        max_keys: MAX_KEYS_PER_PAGE,
+                        digests_format: VERSION_DIGESTS_FORMAT,
+                        bucket_metadata: self.bucket_metadata,
+                    },
+                )
+                .await?;
+            if response.epoch_mismatch {
+                return Err(ClusterError::Unavailable(
+                    "the peer is on another topology epoch".into(),
+                ));
+            }
+            if !response.error.is_empty() {
+                return Err(ClusterError::Rpc(response.error));
+            }
+            self.read.extend(response.keys);
+            self.cursor = response.next;
+            self.done = self.cursor.is_none();
+        }
+        let mut keys = BTreeMap::new();
+        while self.read.front().is_some_and(|front| front.leaf <= leaf) {
+            if let Some(entry) = self.read.pop_front() {
+                if entry.leaf == leaf {
+                    keys.insert(entry.key, entry.digest);
+                }
+            }
+        }
+        Ok(keys)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gossip::{GossipHandle, NodeState};
-    use crate::identity::{NodeAddr, NodeCapacity, NodeMeta};
+    use crate::identity::NodeId;
     use crate::repair::merkle::KeyRange;
-    use crate::rpc::NodeClientConfig;
-    use std::net::SocketAddr;
-
-    fn test_node_state(node_id: NodeId, status: NodeStatus) -> NodeState {
-        NodeState {
-            meta: NodeMeta {
-                node_id,
-                node_name: "test".into(),
-                addr: NodeAddr {
-                    grpc_addr: SocketAddr::from(([127, 0, 0, 1], 9100)),
-                    http_addr: SocketAddr::from(([127, 0, 0, 1], 9000)),
-                    gossip_addr: SocketAddr::from(([127, 0, 0, 1], 9200)),
-                },
-                pool_id: PoolId::new(1),
-                topology_epoch: 1,
-                protocol_version: 1,
-                capacity: NodeCapacity::default(),
-                started_at: 0,
-                s4_version: "0.1.0".into(),
-                edition: crate::identity::Edition::Community,
-            },
-            status,
-            last_seen: std::time::Instant::now(),
-        }
-    }
-
-    /// Minimal mock storage for unit tests.
-    struct MockStorage;
-
-    #[async_trait::async_trait]
-    impl StorageEngine for MockStorage {
-        async fn put_object(
-            &self,
-            _b: &str,
-            _k: &str,
-            _d: &[u8],
-            _ct: &str,
-            _m: &HashMap<String, String>,
-        ) -> Result<String, s4_core::StorageError> {
-            Ok("\"mock-etag\"".into())
-        }
-        async fn get_object(
-            &self,
-            _b: &str,
-            _k: &str,
-        ) -> Result<(Vec<u8>, s4_core::IndexRecord), s4_core::StorageError> {
-            Err(s4_core::StorageError::ObjectNotFound { key: "mock".into() })
-        }
-        async fn delete_object(&self, _b: &str, _k: &str) -> Result<(), s4_core::StorageError> {
-            Ok(())
-        }
-        async fn head_object(
-            &self,
-            _b: &str,
-            _k: &str,
-        ) -> Result<s4_core::IndexRecord, s4_core::StorageError> {
-            Err(s4_core::StorageError::ObjectNotFound { key: "mock".into() })
-        }
-        async fn list_objects(
-            &self,
-            _b: &str,
-            _p: &str,
-            _m: usize,
-        ) -> Result<Vec<(String, s4_core::IndexRecord)>, s4_core::StorageError> {
-            Ok(vec![])
-        }
-        async fn list_objects_after(
-            &self,
-            _b: &str,
-            _p: &str,
-            _s: &str,
-            _m: usize,
-        ) -> Result<Vec<(String, s4_core::IndexRecord)>, s4_core::StorageError> {
-            Ok(vec![])
-        }
-        async fn put_object_versioned(
-            &self,
-            _b: &str,
-            _k: &str,
-            _d: &[u8],
-            _ct: &str,
-            _m: &HashMap<String, String>,
-            _vs: s4_core::VersioningStatus,
-        ) -> Result<(String, Option<String>), s4_core::StorageError> {
-            Ok(("\"mock-etag\"".into(), None))
-        }
-        async fn get_object_version(
-            &self,
-            _b: &str,
-            _k: &str,
-            _v: &str,
-        ) -> Result<(Vec<u8>, s4_core::IndexRecord), s4_core::StorageError> {
-            Err(s4_core::StorageError::ObjectNotFound { key: "mock".into() })
-        }
-        async fn delete_object_versioned(
-            &self,
-            _b: &str,
-            _k: &str,
-            _v: Option<&str>,
-            _vs: s4_core::VersioningStatus,
-        ) -> Result<s4_core::DeleteResult, s4_core::StorageError> {
-            Ok(s4_core::DeleteResult {
-                delete_marker: false,
-                version_id: None,
-            })
-        }
-        async fn head_object_version(
-            &self,
-            _b: &str,
-            _k: &str,
-            _v: &str,
-        ) -> Result<s4_core::IndexRecord, s4_core::StorageError> {
-            Err(s4_core::StorageError::ObjectNotFound { key: "mock".into() })
-        }
-        async fn list_object_versions(
-            &self,
-            _b: &str,
-            _p: &str,
-            _km: Option<&str>,
-            _vm: Option<&str>,
-            _m: usize,
-        ) -> Result<s4_core::ListVersionsResult, s4_core::StorageError> {
-            Ok(Default::default())
-        }
-        #[allow(clippy::too_many_arguments)]
-        async fn put_object_with_retention(
-            &self,
-            _b: &str,
-            _k: &str,
-            _d: &[u8],
-            _ct: &str,
-            _m: &HashMap<String, String>,
-            _vs: s4_core::VersioningStatus,
-            _dr: Option<s4_core::types::DefaultRetention>,
-        ) -> Result<(String, Option<String>), s4_core::StorageError> {
-            Ok(("\"mock-etag\"".into(), None))
-        }
-        async fn update_object_metadata(
-            &self,
-            _b: &str,
-            _k: &str,
-            _v: &str,
-            _r: s4_core::IndexRecord,
-        ) -> Result<(), s4_core::StorageError> {
-            Ok(())
-        }
-        async fn open_object_stream(
-            &self,
-            _b: &str,
-            _k: &str,
-            _opts: s4_core::ReadOptions,
-        ) -> Result<s4_core::ObjectStream, s4_core::StorageError> {
-            Err(s4_core::StorageError::ObjectNotFound { key: "mock".into() })
-        }
-        async fn open_object_version_stream(
-            &self,
-            _b: &str,
-            _k: &str,
-            _v: &str,
-            _opts: s4_core::ReadOptions,
-        ) -> Result<s4_core::ObjectStream, s4_core::StorageError> {
-            Err(s4_core::StorageError::ObjectNotFound { key: "mock".into() })
-        }
-        async fn put_object_streaming(
-            &self,
-            _b: &str,
-            _k: &str,
-            _r: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-            _cl: u64,
-            _ct: &str,
-            _m: &HashMap<String, String>,
-            _e: &str,
-        ) -> Result<s4_core::StreamingPutResult, s4_core::StorageError> {
-            Ok(s4_core::StreamingPutResult {
-                content_hash: [0u8; 32],
-                crc32: 0,
-                bytes_written: 0,
-                etag: "\"mock-etag\"".into(),
-            })
-        }
-    }
-
-    fn make_service(local: NodeId, peers: Vec<(NodeId, NodeStatus)>) -> AntiEntropyService {
-        let mut members = HashMap::new();
-        let mut pool_nodes = vec![local];
-        members.insert(local, test_node_state(local, NodeStatus::Alive));
-        for (id, status) in &peers {
-            members.insert(*id, test_node_state(*id, *status));
-            pool_nodes.push(*id);
-        }
-
-        let gossip = Arc::new(GossipHandle::new_for_testing(members));
-        let client = Arc::new(NodeClient::new(gossip.clone(), NodeClientConfig::default()));
-        let storage: Arc<dyn StorageEngine> = Arc::new(MockStorage);
-
-        AntiEntropyService::new(
-            AntiEntropyConfig::default(),
-            local,
-            PoolId::new(1),
-            pool_nodes,
-            gossip,
-            client,
-            storage,
-        )
-    }
 
     #[test]
     fn metrics_default_zero() {
@@ -1082,149 +1264,1012 @@ mod tests {
         assert_eq!(snap.repairs_failed, 0);
     }
 
-    #[tokio::test]
-    async fn init_tree_stores_merkle_tree() {
-        let local = NodeId(1);
-        let service = make_service(local, vec![(NodeId(2), NodeStatus::Alive)]);
+    // ---- Bucket metadata in the tree of a pair ----
 
-        let range = KeyRange::full();
-        let entries = vec![
-            (100u64, *blake3::hash(b"a").as_bytes()),
-            (200u64, *blake3::hash(b"b").as_bytes()),
-        ];
-        service.init_tree(range, &entries).await;
-
-        let trees = service.merkle_trees.read().await;
-        assert!(trees.contains_key(&range.start));
-        let tree = &trees[&range.start];
-        assert_ne!(tree.root_hash(), [0u8; 32]);
+    /// A storage of a six-node pool holding 200 objects and 200 bucket
+    /// markers, every node the same.
+    async fn storage_of_every_key() -> (Arc<dyn StorageEngine>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = s4_core::storage::BitcaskStorageEngine::open(
+            dir.path().join("volumes"),
+            dir.path().join("metadata"),
+            10 * 1024 * 1024,
+            4096,
+            false,
+            s4_core::storage::IndexOptions {
+                version_digests: true,
+            },
+        )
+        .await
+        .unwrap();
+        let metadata = crate::coordinator::test_pool::hlc_metadata(at(10));
+        for i in 0..200 {
+            storage
+                .put_object("bucket", &format!("k{i}"), b"v", "text/plain", &metadata)
+                .await
+                .unwrap();
+            storage
+                .put_object(
+                    "__system__",
+                    &format!("{}b{i}", s4_core::types::BUCKET_MARKER_KEY_PREFIX),
+                    b"1",
+                    "application/octet-stream",
+                    &metadata,
+                )
+                .await
+                .unwrap();
+        }
+        (Arc::new(storage), dir)
     }
 
+    /// Two nodes of a pool that moves its bucket metadata from three
+    /// replicas to five are at neighbouring stages. Whichever starts the
+    /// round, both compute their leaves by the scope it chose, and the leaves
+    /// match: each answers by the caller's scope, not by its own stage. The
+    /// scopes of stages 0, 1 and 3 give three different trees (task
+    /// BMR-04-002).
     #[tokio::test]
-    async fn incremental_update_changes_tree() {
-        let local = NodeId(1);
-        let service = make_service(local, vec![]);
+    async fn nodes_at_neighbouring_stages_compute_the_same_leaves() {
+        use crate::metadata_placement::{QuorumShape, Stage, StageCell};
 
-        let range = KeyRange::full();
-        service.init_tree(range, &[]).await;
-
-        let root_before = {
-            let trees = service.merkle_trees.read().await;
-            trees[&range.start].root_hash()
+        let nodes: Vec<NodeId> = (1..=6).map(NodeId).collect();
+        let data = PlacementStrategy::new(nodes.clone(), 3).unwrap();
+        let moving_at = |stage: Stage| {
+            let layout = |shape: QuorumShape| {
+                ClassLayout::new(
+                    PlacementStrategy::new(nodes.clone(), shape.replication_factor).unwrap(),
+                    shape.write_quorum,
+                    shape.read_quorum,
+                )
+                .unwrap()
+            };
+            BucketMetadataMove::new(
+                layout(QuorumShape::majority(3)),
+                layout(QuorumShape::majority(5)),
+                StageCell::new(stage),
+            )
         };
-
-        let hash = *blake3::hash(b"data").as_bytes();
-        service.on_key_insert(&range, 100, hash).await;
-
-        let root_after = {
-            let trees = service.merkle_trees.read().await;
-            trees[&range.start].root_hash()
+        let (storage_1, _dir_1) = storage_of_every_key().await;
+        let (storage_2, _dir_2) = storage_of_every_key().await;
+        let responder = |storage: &Arc<dyn StorageEngine>, node: u128, stage: Stage| {
+            AntiEntropyResponder::new(
+                storage.clone(),
+                data.clone(),
+                NodeId(node),
+                PoolId::new(1),
+                0,
+            )
+            .with_bucket_metadata_move(moving_at(stage))
         };
-
-        assert_ne!(root_before, root_after);
-    }
-
-    #[tokio::test]
-    async fn handle_merkle_exchange_matching_trees() {
-        let local = NodeId(1);
-        let service = make_service(local, vec![]);
-
-        let range = KeyRange::full();
-        let entries = vec![(100u64, *blake3::hash(b"x").as_bytes())];
-        service.init_tree(range, &entries).await;
-
-        let root = {
-            let trees = service.merkle_trees.read().await;
-            trees[&range.start].root_hash()
-        };
-
-        let request = proto::MerkleDigestRequest {
-            bucket: String::new(),
-            range_start: range.start.to_be_bytes().to_vec(),
-            range_end: range.end.to_be_bytes().to_vec(),
-            level: 0,
-            tree_hash: root.to_vec(),
-            topology_epoch: 0,
-        };
-
-        let response = service.handle_merkle_exchange(&request).await;
-        assert!(response.r#match);
-        assert!(response.divergent_ranges.is_empty());
-    }
-
-    #[tokio::test]
-    async fn handle_merkle_exchange_divergent_trees() {
-        let local = NodeId(1);
-        let service = make_service(local, vec![]);
-
-        let range = KeyRange::full();
-        let entries = vec![(100u64, *blake3::hash(b"x").as_bytes())];
-        service.init_tree(range, &entries).await;
-
-        // Send a different root hash.
-        let request = proto::MerkleDigestRequest {
-            bucket: String::new(),
-            range_start: range.start.to_be_bytes().to_vec(),
-            range_end: range.end.to_be_bytes().to_vec(),
-            level: 0,
-            tree_hash: vec![0u8; 32], // different from actual root
-            topology_epoch: 0,
-        };
-
-        let response = service.handle_merkle_exchange(&request).await;
-        assert!(!response.r#match);
-        assert!(!response.divergent_ranges.is_empty());
-    }
-
-    #[test]
-    fn pick_peer_excludes_self() {
-        let local = NodeId(1);
-        let service = make_service(
-            local,
-            vec![
-                (NodeId(2), NodeStatus::Alive),
-                (NodeId(3), NodeStatus::Alive),
-            ],
-        );
-
-        // Run multiple times — should never return self.
-        for _ in 0..100 {
-            if let Some(peer) = service.pick_random_alive_peer() {
-                assert_ne!(peer, local);
+        let request = |caller: u128, scope: Option<proto::BucketMetadataScope>| {
+            proto::AntiEntropyLeavesRequest {
+                pool_id: 1,
+                peer_id: NodeId(caller).to_bytes().to_vec(),
+                topology_epoch: 0,
+                digests_format: VERSION_DIGESTS_FORMAT,
+                bucket_metadata: scope,
             }
+        };
+        let mut trees = Vec::new();
+        for pair in Stage::ALL.windows(2) {
+            let (first, second) = (pair[0], pair[1]);
+            let node_1 = responder(&storage_1, 1, first);
+            let node_2 = responder(&storage_2, 2, second);
+            for caller_stage in [first, second] {
+                let scope = bucket_metadata_scope(Some(&moving_at(caller_stage)));
+                let on_1 = node_1.leaves(&request(2, scope)).await;
+                let on_2 = node_2.leaves(&request(1, scope)).await;
+                assert!(on_1.error.is_empty() && on_2.error.is_empty(), "{on_1:?}");
+                assert_eq!(
+                    on_1.leaves, on_2.leaves,
+                    "{first} and {second}, scope of {caller_stage}"
+                );
+                trees.push((caller_stage, on_1.leaves));
+            }
+        }
+        let tree_of = |stage: Stage| {
+            trees
+                .iter()
+                .find(|(at, _)| *at == stage)
+                .map(|(_, leaves)| leaves.clone())
+                .unwrap()
+        };
+        assert_eq!(tree_of(Stage::DualWrite), tree_of(Stage::ReadNew));
+        assert_ne!(tree_of(Stage::Legacy), tree_of(Stage::DualWrite));
+        assert_ne!(tree_of(Stage::Settled), tree_of(Stage::DualWrite));
+        assert_ne!(tree_of(Stage::Legacy), tree_of(Stage::Settled));
+
+        // A caller of an earlier release names no scope: the bucket metadata
+        // are compared like the data, which is the old layout.
+        let old = responder(&storage_1, 1, Stage::Legacy).leaves(&request(2, None)).await;
+        assert_eq!(old.leaves, tree_of(Stage::Legacy));
+        // A layout the pool cannot hold is refused.
+        let wide = proto::BucketMetadataScope {
+            excluded: false,
+            replication_factor: 7,
+        };
+        let refused =
+            responder(&storage_1, 1, Stage::Settled).leaves(&request(2, Some(wide))).await;
+        assert!(refused.error.contains("cannot be placed"), "{refused:?}");
+    }
+
+    // ---- Rounds on a three-node pool ----
+
+    use crate::coordinator::test_pool::{at, Replica, TestPool};
+    use crate::gc::{DistributedGcService, GcConfig, TombstonePolicy};
+    use crate::repair::pair_tree::leaf_range;
+    use s4_core::storage::VersionDigestEntry;
+
+    fn config(max_keys_per_round: u32) -> AntiEntropyConfig {
+        AntiEntropyConfig {
+            enabled: true,
+            interval_secs: 1,
+            max_keys_per_round,
         }
     }
 
-    #[test]
-    fn pick_peer_excludes_dead_nodes() {
-        let local = NodeId(1);
-        let service = make_service(
-            local,
-            vec![(NodeId(2), NodeStatus::Dead), (NodeId(3), NodeStatus::Dead)],
-        );
-
-        assert!(service.pick_random_alive_peer().is_none());
+    /// Rounds of node 1 of `pool`, counting into `service`, taking node 2
+    /// first.
+    fn rounds_counted(
+        pool: &TestPool,
+        config: AntiEntropyConfig,
+        service: Arc<AntiEntropyService>,
+    ) -> AntiEntropyRounds {
+        rounds_keeping(pool, config, service, Duration::MAX)
     }
 
-    #[test]
-    fn pick_peer_returns_alive_node() {
-        let local = NodeId(1);
-        let service = make_service(
-            local,
-            vec![
-                (NodeId(2), NodeStatus::Dead),
-                (NodeId(3), NodeStatus::Alive),
-            ],
+    /// Rounds of node 1 of `pool`, counting into `service`, carrying no
+    /// tombstone older than `gc_grace` to a replica without the key, taking
+    /// node 2 first.
+    fn rounds_keeping(
+        pool: &TestPool,
+        config: AntiEntropyConfig,
+        service: Arc<AntiEntropyService>,
+        gc_grace: Duration,
+    ) -> AntiEntropyRounds {
+        AntiEntropyRounds::new(
+            service,
+            config,
+            gc_grace,
+            pool.storage(1).clone(),
+            pool.placement(),
+            NodeId(1),
+            pool.pool_id(),
+            pool.epoch(),
+            pool.rpc_client.clone(),
+            pool.gossip.clone(),
+            pool.reconciler(),
+        )
+        .turning_to(NodeId(2))
+    }
+
+    /// Rounds of node 1 of `pool`, taking node 2 first.
+    fn rounds(pool: &TestPool, config: AntiEntropyConfig) -> AntiEntropyRounds {
+        rounds_counted(pool, config, Arc::new(AntiEntropyService::new()))
+    }
+
+    async fn digests(pool: &TestPool, node: u128) -> Vec<VersionDigestEntry> {
+        pool.storage(node).index_db().version_digests().await.unwrap()
+    }
+
+    /// Node 2 missed a write, an overwrite and a delete; node 1 missed a
+    /// write node 2 took. One round settles all four, every node ends up
+    /// with the same versions, and the next round finds nothing.
+    async fn diverged(pool: &TestPool) {
+        for node in 1..=3 {
+            pool.create_bucket(node, at(1)).await;
+            pool.put(node, "kept", b"v", at(10)).await;
+            pool.put(node, "overwritten", b"v1", at(10)).await;
+            pool.put(node, "deleted", b"v", at(10)).await;
+        }
+        for node in [1, 3] {
+            pool.put(node, "new", b"new", at(20)).await;
+            pool.put(node, "overwritten", b"v2", at(20)).await;
+            pool.delete(node, "deleted", at(30)).await;
+        }
+        for node in [2, 3] {
+            pool.put(node, "theirs", b"theirs", at(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn missed_writes_and_deletes_converge_in_one_round_both_ways() {
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21140).await;
+        diverged(&pool).await;
+        let rounds = rounds(&pool, config(1000));
+
+        let report = rounds.round().await;
+        assert_eq!(report.outcome, RoundEnd::Complete);
+        assert_eq!(report.peer, Some(NodeId(2)));
+        assert_eq!(
+            (report.repaired, report.failed, report.ambiguous),
+            (4, 0, 0)
+        );
+        let on_3 = digests(&pool, 3).await;
+        assert_eq!(digests(&pool, 1).await, on_3);
+        assert_eq!(digests(&pool, 2).await, on_3);
+
+        let again = rounds.turning_to(NodeId(2)).round().await;
+        assert_eq!(again.outcome, RoundEnd::Complete);
+        assert_eq!(again.divergent_leaves, 0);
+    }
+
+    /// Bucket configurations are replicated keys, placed with the bucket
+    /// markers: a round settles a configuration a replica missed, an older
+    /// one it kept and a delete it missed, as it settles an object. The rest
+    /// of `__system__` has no digest and is left alone.
+    #[tokio::test]
+    async fn a_round_settles_bucket_configurations_and_nothing_else_of_the_system_bucket() {
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21288).await;
+        let cors = "__s4_bucket_cors_bucket";
+        let lifecycle = "__s4_bucket_lifecycle_bucket";
+        let policy = "__s4_bucket_policy_bucket";
+        for node in 1..=3 {
+            pool.create_bucket(node, at(1)).await;
+            pool.put_system(node, policy, b"{\"old\":true}", at(10)).await;
+        }
+        for node in [1, 3] {
+            pool.put_system(node, cors, b"<CORSConfiguration/>", at(20)).await;
+            pool.put_system(node, lifecycle, b"<new/>", at(30)).await;
+            pool.delete_system(node, policy, at(40)).await;
+        }
+        pool.put_system(2, lifecycle, b"<old/>", at(20)).await;
+        let ec_key = "__s4_ec_v1/tiering/bucket";
+        pool.put_system(1, ec_key, b"{}", at(50)).await;
+
+        let report = rounds(&pool, config(1000)).round().await;
+        assert_eq!(report.outcome, RoundEnd::Complete);
+        assert_eq!(
+            (report.repaired, report.failed, report.ambiguous),
+            (3, 0, 0)
+        );
+        assert_eq!(digests(&pool, 2).await, digests(&pool, 1).await);
+        let on_2 = pool.storage(2);
+        assert_eq!(
+            on_2.get_object("__system__", cors).await.unwrap().0,
+            b"<CORSConfiguration/>"
+        );
+        assert_eq!(
+            on_2.get_object("__system__", lifecycle).await.unwrap().0,
+            b"<new/>"
+        );
+        assert!(matches!(
+            on_2.key_version("__system__", policy).await.unwrap(),
+            s4_core::KeyVersion::Tombstone(_)
+        ));
+        assert!(matches!(
+            on_2.key_version("__system__", ec_key).await.unwrap(),
+            s4_core::KeyVersion::Absent
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_round_counts_what_it_found_and_how_it_ended() {
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21164).await;
+        diverged(&pool).await;
+        let metrics = crate::test_metrics::TestMetrics::install();
+        let service = Arc::new(AntiEntropyService::new());
+        let rounds = rounds_counted(&pool, config(1000), service.clone());
+        rounds.round().await;
+        rounds.turning_to(NodeId(2)).round().await;
+
+        let snapshot = service.metrics().snapshot();
+        assert_eq!(
+            (snapshot.rounds_completed, snapshot.rounds_incomplete),
+            (2, 0)
+        );
+        assert_eq!(
+            (snapshot.divergent_keys_found, snapshot.repairs_completed),
+            (4, 4)
+        );
+        assert!(snapshot.last_repair_unix_ms > 0);
+        let rounds_total = "s4_anti_entropy_rounds_total";
+        assert_eq!(
+            metrics.value(rounds_total, &[("outcome", "complete")]),
+            Some(2.0)
+        );
+        assert_eq!(
+            metrics.value("s4_anti_entropy_divergent_keys_total", &[]),
+            Some(4.0)
+        );
+        assert_eq!(
+            metrics.value("s4_anti_entropy_repairs_total", &[("outcome", "ok")]),
+            Some(4.0)
+        );
+        assert_eq!(
+            metrics.value("s4_anti_entropy_round_duration_seconds_count", &[]),
+            Some(2.0)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_round_settles_at_most_its_key_limit() {
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21144).await;
+        diverged(&pool).await;
+        let service = Arc::new(AntiEntropyService::new());
+        let rounds = rounds_counted(&pool, config(3), service.clone());
+
+        let first = rounds.round().await;
+        assert!(
+            matches!(first.outcome, RoundEnd::Incomplete(_)),
+            "{first:?}"
+        );
+        assert_eq!(first.repaired, 3);
+        let rounds = rounds.turning_to(NodeId(2));
+        let second = rounds.round().await;
+        assert_eq!(second.outcome, RoundEnd::Complete);
+        assert_eq!(second.repaired, 1);
+        let rounds = rounds.turning_to(NodeId(2));
+        assert_eq!(rounds.round().await.divergent_leaves, 0);
+
+        let snapshot = service.metrics().snapshot();
+        assert_eq!(
+            (
+                snapshot.rounds_completed,
+                snapshot.rounds_incomplete,
+                snapshot.rounds_skipped
+            ),
+            (2, 1, 0)
+        );
+        assert_eq!(
+            (snapshot.divergent_keys_found, snapshot.repairs_completed),
+            (4, 4)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pool_with_a_node_below_protocol_6_starts_no_round() {
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21148).await;
+        diverged(&pool).await;
+        // A build of the branch with tombstones but without rounds.
+        pool.announce_protocol(3, crate::protocol::TOMBSTONE_MIN_PROTOCOL_VERSION);
+        let service = Arc::new(AntiEntropyService::new());
+        let rounds = rounds_counted(&pool, config(1000), service.clone());
+        let before = digests(&pool, 2).await;
+
+        let report = rounds.round().await;
+        assert!(matches!(report.outcome, RoundEnd::Skipped(_)), "{report:?}");
+        assert_eq!(digests(&pool, 2).await, before);
+        assert_eq!(service.metrics().snapshot().rounds_skipped, 1);
+
+        // Protocol 5 answers rounds, but gives bucket configurations no
+        // digest: rounds still wait.
+        pool.announce_protocol(3, crate::protocol::ANTI_ENTROPY_MIN_PROTOCOL_VERSION);
+        let report = rounds.round().await;
+        assert!(matches!(report.outcome, RoundEnd::Skipped(_)), "{report:?}");
+        assert_eq!(digests(&pool, 2).await, before);
+
+        // Once it announces the protocol of replicated configurations, rounds run.
+        pool.announce_protocol(3, ROUNDS_MIN_PROTOCOL_VERSION);
+        assert_eq!(rounds.round().await.outcome, RoundEnd::Complete);
+    }
+
+    /// Keys `count` of the pool's bucket that a round takes first, in its
+    /// order: by leaf, then by key.
+    fn keys_in_round_order(count: usize) -> Vec<String> {
+        let mut names: Vec<String> = (0..200).map(|i| format!("key-{i:03}")).collect();
+        names.sort_by_key(|name| {
+            let full = format!("bucket/{name}");
+            (leaf_of(s4_core::ring_position_of(&full)), full)
+        });
+        names.truncate(count);
+        names
+    }
+
+    /// Keys that never settle — ambiguous ones — do not keep the rest of the
+    /// ring from its turn: the next round goes on past the last key the
+    /// previous one took. Before, every round took the same first keys of
+    /// the ring and the key past them was never repaired.
+    #[tokio::test]
+    async fn keys_that_never_settle_do_not_starve_the_rest_of_the_ring() {
+        // Node 3 deleted keys before it kept tombstones, up to 50.
+        let pool = TestPool::start_with_horizons(
+            Replica::Up,
+            Replica::Up,
+            21200,
+            [None, None, Some(at(50))],
+        )
+        .await;
+        let keys = keys_in_round_order(3);
+        for node in 1..=3 {
+            pool.create_bucket(node, at(1)).await;
+        }
+        // Lone copies older than node 3's horizon: ambiguous for ever.
+        pool.put(2, &keys[0], b"lone", at(40)).await;
+        pool.put(2, &keys[1], b"lone", at(40)).await;
+        // A write node 2 missed, past them in the ring.
+        pool.put(1, &keys[2], b"missed", at(60)).await;
+        pool.put(3, &keys[2], b"missed", at(60)).await;
+        let rounds = rounds(&pool, config(2));
+
+        let first = rounds.round().await;
+        assert_eq!((first.ambiguous, first.repaired), (2, 0), "{first:?}");
+        let rounds = rounds.turning_to(NodeId(2));
+        let second = rounds.round().await;
+        assert!(
+            matches!(second.outcome, RoundEnd::Incomplete(_)),
+            "{second:?}"
+        );
+        assert_eq!(second.repaired, 1, "{second:?}");
+        let on_2 = pool.storage(2).get_object("bucket", &keys[2]).await.unwrap().0;
+        assert_eq!(on_2, b"missed");
+    }
+
+    /// A node of the pool gossip has never seen, or one that announced no
+    /// protocol yet, does not hold up the rounds of the nodes that are up: its
+    /// replicas are the ones that did not answer. A live node that announced
+    /// an older protocol does.
+    #[tokio::test]
+    async fn only_a_live_node_that_announced_an_older_protocol_holds_rounds_up() {
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21204).await;
+        for node in 1..=3 {
+            pool.create_bucket(node, at(1)).await;
+        }
+        pool.put(1, "k", b"v", at(10)).await;
+        pool.put(3, "k", b"v", at(10)).await;
+        let state = pool.gossip.get_node(&NodeId(3)).unwrap();
+
+        pool.gossip.remove_member_for_testing(NodeId(3));
+        let report = rounds(&pool, config(1000)).round().await;
+        assert_eq!(report.outcome, RoundEnd::Complete, "never seen: {report:?}");
+        assert_eq!(
+            pool.storage(2).get_object("bucket", "k").await.unwrap().0,
+            b"v"
         );
 
-        let peer = service.pick_random_alive_peer();
-        assert_eq!(peer, Some(NodeId(3)));
+        let mut silent = state.clone();
+        silent.meta.protocol_version = 0;
+        pool.gossip.set_member_for_testing(NodeId(3), silent);
+        let report = rounds(&pool, config(1000)).round().await;
+        assert!(
+            !matches!(report.outcome, RoundEnd::Skipped(_)),
+            "announced nothing: {report:?}"
+        );
+        // Its own turn is kept, not handed to another peer: the round waits.
+        let turning_to_3 = rounds(&pool, config(1000)).turning_to(NodeId(3));
+        let report = turning_to_3.round().await;
+        assert!(matches!(report.outcome, RoundEnd::Skipped(_)), "{report:?}");
+        assert_eq!(report.peer, None);
+        pool.announce_protocol(3, ROUNDS_MIN_PROTOCOL_VERSION);
+        assert_eq!(turning_to_3.round().await.peer, Some(NodeId(3)));
+
+        let mut dead_and_old = state.clone();
+        dead_and_old.meta.protocol_version = ROUNDS_MIN_PROTOCOL_VERSION - 1;
+        dead_and_old.status = NodeStatus::Dead;
+        pool.gossip.set_member_for_testing(NodeId(3), dead_and_old);
+        let report = rounds(&pool, config(1000)).round().await;
+        assert!(
+            !matches!(report.outcome, RoundEnd::Skipped(_)),
+            "dead and old: {report:?}"
+        );
+
+        pool.gossip.set_member_for_testing(NodeId(3), state);
+        pool.announce_protocol(3, ROUNDS_MIN_PROTOCOL_VERSION - 1);
+        let report = rounds(&pool, config(1000)).round().await;
+        assert!(
+            matches!(report.outcome, RoundEnd::Skipped(_)),
+            "alive and old: {report:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_a_live_peer_a_round_is_skipped() {
+        let pool = TestPool::start(Replica::Down, Replica::Down, 21152).await;
+        let report = rounds(&pool, config(1000)).round().await;
+        assert!(matches!(report.outcome, RoundEnd::Skipped(_)), "{report:?}");
+        assert_eq!(report.peer, None);
+    }
+
+    /// Node 2 starts no rounds of its own, yet answers node 1's, which
+    /// completes; and with no round of its own its GC removes no tombstone.
+    #[tokio::test]
+    async fn a_node_that_starts_no_rounds_answers_its_peers_and_purges_nothing() {
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21156).await;
+        diverged(&pool).await;
+
+        let switched_off = Arc::new(AntiEntropyService::new());
+        let node_2 = Arc::new(AntiEntropyRounds::new(
+            switched_off.clone(),
+            AntiEntropyConfig {
+                enabled: false,
+                ..config(1000)
+            },
+            Duration::MAX,
+            pool.storage(2).clone(),
+            pool.placement(),
+            NodeId(2),
+            pool.pool_id(),
+            pool.epoch(),
+            pool.rpc_client.clone(),
+            pool.gossip.clone(),
+            pool.reconciler(),
+        ));
+        let (_stop, shutdown) = watch::channel(false);
+        tokio::time::timeout(Duration::from_secs(5), node_2.run(shutdown))
+            .await
+            .expect("a node with rounds switched off returns at once");
+        assert!(!switched_off.metrics().snapshot().enabled);
+
+        assert_eq!(
+            rounds(&pool, config(1000)).round().await.outcome,
+            RoundEnd::Complete
+        );
+        let snapshot = switched_off.metrics().snapshot();
+        assert_eq!(
+            snapshot.rounds_completed + snapshot.rounds_incomplete + snapshot.rounds_skipped,
+            0
+        );
+
+        let gc = DistributedGcService::new(
+            gc_config(Duration::ZERO),
+            pool.storage(2).clone(),
+            switched_off.repair_frontier().clone(),
+            pool.layout(),
+            NodeId(2),
+        );
+        gc.run_purge_cycle().await.unwrap();
+        assert!(matches!(
+            pool.storage(2).key_version("bucket", "deleted").await.unwrap(),
+            s4_core::KeyVersion::Tombstone(_)
+        ));
+    }
+
+    /// Over gRPC the peer's leaves are the ones computed from its storage,
+    /// and pages of its keys cover the leaves asked about without a gap or a
+    /// repeat.
+    #[tokio::test]
+    async fn the_peer_answers_with_its_leaves_and_its_keys_page_by_page() {
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21160).await;
+        for n in 0..300 {
+            pool.put(2, &format!("k{n}"), b"v", at(10 + n)).await;
+        }
+        let scope = PairScope::new(pool.placement(), NodeId(2), NodeId(1));
+        let local = pair_leaves(&**pool.storage(2), &scope).await.unwrap();
+        let request = proto::AntiEntropyLeavesRequest {
+            pool_id: pool.pool_id().as_u32(),
+            peer_id: NodeId(1).to_bytes().to_vec(),
+            topology_epoch: pool.epoch(),
+            digests_format: VERSION_DIGESTS_FORMAT,
+            bucket_metadata: None,
+        };
+        let answer = pool.rpc_client.send_anti_entropy_leaves(NodeId(2), request).await.unwrap();
+        assert_eq!(answer.leaves, local.concat());
+
+        let all = digests(&pool, 2).await;
+        let mut leaves: Vec<u32> = all.iter().map(|entry| leaf_of(entry.ring_position)).collect();
+        leaves.dedup();
+        let leaves: Vec<u32> = leaves.into_iter().step_by(2).collect();
+        let wanted: Vec<(String, Vec<u8>)> = all
+            .iter()
+            .filter(|entry| leaves.contains(&leaf_of(entry.ring_position)))
+            .map(|entry| (entry.key.clone(), entry.digest.encode().to_vec()))
+            .collect();
+        let mut paged = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = pool
+                .rpc_client
+                .send_anti_entropy_keys(
+                    NodeId(2),
+                    proto::AntiEntropyKeysRequest {
+                        pool_id: pool.pool_id().as_u32(),
+                        peer_id: NodeId(1).to_bytes().to_vec(),
+                        topology_epoch: pool.epoch(),
+                        leaves: leaves.clone(),
+                        cursor: cursor.clone(),
+                        max_keys: 5,
+                        digests_format: VERSION_DIGESTS_FORMAT,
+                        bucket_metadata: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(page.error.is_empty(), "{}", page.error);
+            assert!(page.keys.len() <= 5);
+            for key in &page.keys {
+                let (from, to) = leaf_range(key.leaf);
+                let position = s4_core::ring_position_of(&key.key);
+                assert!(position >= from && to.is_none_or(|to| position < to));
+            }
+            paged.extend(page.keys.into_iter().map(|key| (key.key, key.digest)));
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        assert_eq!(paged, wanted);
+
+        // A cursor outside the leaves asked about, or naming a key of another
+        // leaf, is refused rather than answered with keys of other leaves.
+        let skipped = all
+            .iter()
+            .find(|entry| !leaves.contains(&leaf_of(entry.ring_position)))
+            .unwrap();
+        for cursor in [
+            proto::AntiEntropyCursor {
+                leaf: leaf_of(skipped.ring_position),
+                after_key: None,
+            },
+            proto::AntiEntropyCursor {
+                leaf: leaves[leaves.len() - 1],
+                after_key: Some(skipped.key.clone()),
+            },
+        ] {
+            let refused = pool
+                .rpc_client
+                .send_anti_entropy_keys(
+                    NodeId(2),
+                    proto::AntiEntropyKeysRequest {
+                        pool_id: pool.pool_id().as_u32(),
+                        peer_id: NodeId(1).to_bytes().to_vec(),
+                        topology_epoch: pool.epoch(),
+                        leaves: leaves.clone(),
+                        cursor: Some(cursor.clone()),
+                        max_keys: 5,
+                        digests_format: VERSION_DIGESTS_FORMAT,
+                        bucket_metadata: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                refused.keys.is_empty() && !refused.error.is_empty(),
+                "{cursor:?}: {refused:?}"
+            );
+        }
+
+        // A caller that is no node of the pool gets no tree.
+        let stranger = proto::AntiEntropyLeavesRequest {
+            peer_id: NodeId(9).to_bytes().to_vec(),
+            ..request_for(&pool)
+        };
+        let refused = pool.rpc_client.send_anti_entropy_leaves(NodeId(2), stranger).await.unwrap();
+        assert!(refused.leaves.is_empty() && !refused.error.is_empty());
+
+        // A caller whose digests are of another format — a node of protocol
+        // 5 sends none — gets neither leaves nor keys: its tree is over
+        // another set of keys.
+        for format in [0, VERSION_DIGESTS_FORMAT - 1] {
+            let leaves_of_old = proto::AntiEntropyLeavesRequest {
+                digests_format: format,
+                bucket_metadata: None,
+                ..request_for(&pool)
+            };
+            let refused = pool
+                .rpc_client
+                .send_anti_entropy_leaves(NodeId(2), leaves_of_old)
+                .await
+                .unwrap();
+            assert!(
+                refused.leaves.is_empty() && refused.error.contains("format"),
+                "{format}: {refused:?}"
+            );
+            let refused = pool
+                .rpc_client
+                .send_anti_entropy_keys(
+                    NodeId(2),
+                    proto::AntiEntropyKeysRequest {
+                        pool_id: pool.pool_id().as_u32(),
+                        peer_id: NodeId(1).to_bytes().to_vec(),
+                        topology_epoch: pool.epoch(),
+                        leaves: leaves.clone(),
+                        cursor: None,
+                        max_keys: 5,
+                        digests_format: format,
+                        bucket_metadata: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(
+                refused.keys.is_empty() && refused.error.contains("format"),
+                "{format}: {refused:?}"
+            );
+        }
+    }
+
+    fn request_for(pool: &TestPool) -> proto::AntiEntropyLeavesRequest {
+        proto::AntiEntropyLeavesRequest {
+            pool_id: pool.pool_id().as_u32(),
+            peer_id: NodeId(1).to_bytes().to_vec(),
+            topology_epoch: pool.epoch(),
+            digests_format: VERSION_DIGESTS_FORMAT,
+            bucket_metadata: None,
+        }
+    }
+
+    fn gc_config(gc_grace: Duration) -> GcConfig {
+        GcConfig {
+            enabled: true,
+            interval: Duration::from_secs(3600),
+            tombstone_policy: TombstonePolicy {
+                gc_grace,
+                max_rejoin_downtime: Duration::ZERO,
+                repair_turn: Duration::ZERO,
+                write_settle: Duration::ZERO,
+            },
+        }
+    }
+
+    async fn cut_of(service: &AntiEntropyService, peer: u128) -> Option<HlcTimestamp> {
+        service.repair_frontier().read().await.peer_cut(&NodeId(peer))
+    }
+
+    /// A complete round sets the peer's cut to the moment it started less the
+    /// arrival window, a round in step included; the cut of a peer no round was taken with stays
+    /// unset; a repeated round moves the cut on.
+    #[tokio::test]
+    async fn a_complete_round_sets_the_peers_cut_to_its_start() {
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21252).await;
+        diverged(&pool).await;
+        let service = Arc::new(AntiEntropyService::new());
+        let rounds = rounds_counted(&pool, config(1000), service.clone());
+
+        let window = 60_500;
+        let before = now_millis();
+        assert_eq!(rounds.round().await.outcome, RoundEnd::Complete);
+        let first = cut_of(&service, 2).await.expect("a cut of node 2");
+        assert!(
+            first.wall_time >= before - window && first.wall_time <= now_millis() - window,
+            "{first:?}: the start of the round less the arrival window"
+        );
+        assert_eq!(cut_of(&service, 3).await, None);
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let rounds = rounds.turning_to(NodeId(2));
+        let again = rounds.round().await;
+        assert_eq!(
+            (again.outcome, again.divergent_leaves),
+            (RoundEnd::Complete, 0)
+        );
+        let second = cut_of(&service, 2).await.unwrap();
+        assert!(second > first, "{second:?} after {first:?}");
+    }
+
+    /// A round that left keys for the next one sets no cut: the peer may
+    /// still lack what this node holds.
+    #[tokio::test]
+    async fn an_incomplete_round_sets_no_cut() {
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21256).await;
+        diverged(&pool).await;
+        let service = Arc::new(AntiEntropyService::new());
+        let rounds = rounds_counted(&pool, config(3), service.clone());
+
+        let first = rounds.round().await;
+        assert!(
+            matches!(first.outcome, RoundEnd::Incomplete(_)),
+            "{first:?}"
+        );
+        assert_eq!(cut_of(&service, 2).await, None);
+
+        let rounds = rounds.turning_to(NodeId(2));
+        assert_eq!(rounds.round().await.outcome, RoundEnd::Complete);
+        assert!(cut_of(&service, 2).await.is_some());
+    }
+
+    /// The peer answers with its leaves, then stops answering before its
+    /// keys: the round is incomplete and the peer gets no cut.
+    #[tokio::test]
+    async fn a_peer_that_stops_answering_amid_the_keys_gets_no_cut() {
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21260).await;
+        diverged(&pool).await;
+        let service = Arc::new(AntiEntropyService::new());
+        let gossip = pool.gossip.clone();
+        let mut gone = gossip.get_node(&NodeId(2)).unwrap();
+        gone.status = NodeStatus::Dead;
+        let rounds = rounds_counted(&pool, config(1000), service.clone())
+            .after_leaves(move || gossip.set_member_for_testing(NodeId(2), gone.clone()));
+
+        let report = rounds.round().await;
+        assert_eq!(report.peer, Some(NodeId(2)));
+        assert!(report.divergent_leaves > 0);
+        assert!(
+            matches!(report.outcome, RoundEnd::Incomplete(_)),
+            "{report:?}"
+        );
+        assert_eq!(cut_of(&service, 2).await, None);
+    }
+
+    /// The frontier lag is the age of the oldest cut over the pool's peers;
+    /// a peer no round has completed with counts from when the rounds began.
+    #[tokio::test]
+    async fn the_frontier_lag_counts_over_every_peer_of_the_pool() {
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21264).await;
+        let metrics = crate::test_metrics::TestMetrics::install();
+        let service = Arc::new(AntiEntropyService::new());
+        let began = now_millis();
+        // Without the arrival window, so that a cut is younger than the start
+        // of the rounds and the two rules can be told apart.
+        let rounds =
+            rounds_counted(&pool, config(1000), service.clone()).with_cut_margin(Duration::ZERO);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Node 3 has no cut yet: the lag runs from the start of the rounds.
+        assert_eq!(rounds.round().await.outcome, RoundEnd::Complete);
+        let lag = service.metrics().snapshot().frontier_lag_secs;
+        let since_began = (now_millis() - began) as f64 / 1000.0;
+        assert!((0.3..=since_began).contains(&lag), "{lag} of {since_began}");
+        assert_eq!(
+            metrics.value("s4_repair_frontier_lag_seconds", &[]),
+            Some(lag)
+        );
+
+        // Both peers have cuts: the lag is the age of the older.
+        let rounds = rounds.turning_to(NodeId(3));
+        assert_eq!(rounds.round().await.outcome, RoundEnd::Complete);
+        let lag = service.metrics().snapshot().frontier_lag_secs;
+        let oldest = cut_of(&service, 2).await.unwrap().min(cut_of(&service, 3).await.unwrap());
+        let age = (now_millis() - oldest.wall_time) as f64 / 1000.0;
+        // The cut, not the start of the rounds: the oldest cut is past it.
+        assert!(oldest.wall_time >= began + 300, "{oldest:?}");
+        assert!(lag > 0.0 && lag <= age, "{lag}, the oldest cut {age}s old");
+    }
+
+    /// Node 3 missed a delete. Node 1 holds the tombstone until a complete
+    /// round with each of its peers, node 3 among them, then removes it; and
+    /// the next rounds bring nothing back, though nodes 2 and 3 still hold
+    /// their tombstones.
+    #[tokio::test]
+    async fn a_tombstone_goes_once_every_other_replica_has_it_and_the_key_stays_deleted() {
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21268).await;
+        for node in 1..=3 {
+            pool.create_bucket(node, at(1)).await;
+            pool.put(node, "deleted", b"v", at(10)).await;
+        }
+        pool.delete(1, "deleted", at(30)).await;
+        pool.delete(2, "deleted", at(30)).await;
+
+        let gc_grace = Duration::from_secs(1);
+        let service = Arc::new(AntiEntropyService::new());
+        let rounds = rounds_keeping(&pool, config(1000), service.clone(), gc_grace);
+        let gc = DistributedGcService::new(
+            gc_config(gc_grace),
+            pool.storage(1).clone(),
+            service.repair_frontier().clone(),
+            pool.layout(),
+            NodeId(1),
+        );
+        let on = |node: u128| pool.storage(node).key_version("bucket", "deleted");
+
+        assert_eq!(rounds.round().await.outcome, RoundEnd::Complete);
+        assert_eq!(gc.run_purge_cycle().await.unwrap().purged, 0);
+        assert!(matches!(
+            on(1).await.unwrap(),
+            s4_core::KeyVersion::Tombstone(_)
+        ));
+
+        let rounds = rounds.turning_to(NodeId(3));
+        let with_3 = rounds.round().await;
+        assert_eq!((with_3.outcome, with_3.repaired), (RoundEnd::Complete, 1));
+        assert!(matches!(
+            on(3).await.unwrap(),
+            s4_core::KeyVersion::Tombstone(_)
+        ));
+        assert_eq!(gc.run_purge_cycle().await.unwrap().purged, 1);
+        assert!(matches!(on(1).await.unwrap(), s4_core::KeyVersion::Absent));
+
+        let mut rounds = rounds;
+        for peer in [2, 3] {
+            rounds = rounds.turning_to(NodeId(peer));
+            let report = rounds.round().await;
+            assert_eq!(report.outcome, RoundEnd::Complete, "with node {peer}");
+        }
+        assert!(matches!(on(1).await.unwrap(), s4_core::KeyVersion::Absent));
+        for node in [2, 3] {
+            assert!(matches!(
+                on(node).await.unwrap(),
+                s4_core::KeyVersion::Tombstone(_)
+            ));
+        }
+        let head = pool.read_coordinator().head("bucket", "deleted").await;
+        assert!(
+            matches!(head, Err(ClusterError::ObjectNotFound { .. })),
+            "{head:?}"
+        );
+    }
+
+    /// A tombstone the write of its delete brings to node 1 after its rounds
+    /// with both peers started — late, but with an HLC before their start, as
+    /// a slow replica write or a coordinator whose clock is behind leaves it —
+    /// was in neither round, so the peers' cuts must not cover it: node 1
+    /// keeps it, though it is older than the grace period. Before, a cut at
+    /// the start of the round covered it and node 1 removed it.
+    #[tokio::test]
+    async fn a_tombstone_that_arrived_after_the_rounds_started_is_kept() {
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21284).await;
+        for node in 1..=3 {
+            pool.create_bucket(node, at(1)).await;
+        }
+        let service = Arc::new(AntiEntropyService::new());
+        let started = now_millis();
+        let mut rounds = rounds_counted(&pool, config(1000), service.clone());
+        for peer in [2, 3] {
+            rounds = rounds.turning_to(NodeId(peer));
+            assert_eq!(rounds.round().await.outcome, RoundEnd::Complete);
+        }
+        // Issued 30 s before the rounds started, inside the arrival window.
+        let late = HlcTimestamp::from_record(started - 30_000, 0, 7);
+        pool.delete(1, "late", late).await;
+        let gc = DistributedGcService::new(
+            gc_config(Duration::from_secs(1)),
+            pool.storage(1).clone(),
+            service.repair_frontier().clone(),
+            pool.layout(),
+            NodeId(1),
+        );
+
+        assert_eq!(gc.run_purge_cycle().await.unwrap().purged, 0);
+        let held = pool.storage(1).key_version("bucket", "late").await.unwrap();
+        assert!(
+            matches!(held, s4_core::KeyVersion::Tombstone(_)),
+            "{held:?}"
+        );
+    }
+
+    /// GC of node `node` of `pool` that holds every other replica past now:
+    /// the frontier as a slip of it would leave it.
+    async fn purge_as_if_every_peer_had_it(pool: &TestPool, node: u128) -> u64 {
+        let mut frontier = RepairFrontier::new();
+        for peer in (1..=3).filter(|peer| *peer != node) {
+            frontier.advance_peer(NodeId(peer), HlcTimestamp::from_record(now_millis(), 0, 0));
+        }
+        DistributedGcService::new(
+            gc_config(Duration::from_secs(1)),
+            pool.storage(node).clone(),
+            Arc::new(RwLock::new(frontier)),
+            pool.layout(),
+            NodeId(node),
+        )
+        .run_purge_cycle()
+        .await
+        .unwrap()
+        .purged
+    }
+
+    /// Nodes 1 and 2 removed the tombstone of `lone` while node 3 still holds
+    /// the copy the delete outranked: the frontier slipped. Their absence no
+    /// longer proves the copy outlived every delete — they report the
+    /// tombstone they removed as their horizon — so the lone copy is
+    /// ambiguous and goes nowhere. Before, their horizon stayed zero and the
+    /// round spread the deleted object back to them. A copy two replicas hold
+    /// is confirmed as before and is brought to the third.
+    #[tokio::test]
+    async fn a_lone_copy_older_than_a_removed_tombstone_is_not_spread() {
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21280).await;
+        for node in 1..=3 {
+            pool.create_bucket(node, at(1)).await;
+            pool.put(node, "lone", b"deleted", at(10)).await;
+        }
+        pool.delete(1, "lone", at(30)).await;
+        pool.delete(2, "lone", at(30)).await;
+        pool.put(2, "pair", b"kept", at(10)).await;
+        pool.put(3, "pair", b"kept", at(10)).await;
+        pool.delete(1, "pair", at(30)).await;
+        assert_eq!(purge_as_if_every_peer_had_it(&pool, 1).await, 2);
+        assert_eq!(purge_as_if_every_peer_had_it(&pool, 2).await, 1);
+
+        let service = Arc::new(AntiEntropyService::new());
+        let report = rounds_counted(&pool, config(1000), service.clone())
+            .turning_to(NodeId(3))
+            .round()
+            .await;
+        assert_eq!((report.ambiguous, report.repaired), (1, 1), "{report:?}");
+        for node in [1, 2] {
+            let held = pool.storage(node).key_version("bucket", "lone").await.unwrap();
+            assert!(
+                matches!(held, s4_core::KeyVersion::Absent),
+                "node {node}: {held:?}"
+            );
+        }
+        assert_eq!(
+            pool.storage(1).get_object("bucket", "pair").await.unwrap().0,
+            b"kept"
+        );
     }
 
     #[tokio::test]
     async fn repair_frontier_integration() {
-        let local = NodeId(1);
-        let service = make_service(local, vec![]);
+        let service = AntiEntropyService::new();
 
         let range = KeyRange::full();
         let hlc = HlcTimestamp {
@@ -1240,240 +2285,5 @@ mod tests {
 
         let frontier = service.repair_frontier.read().await;
         assert_eq!(frontier.get_cut(&range, &NodeId(2)), Some(hlc));
-    }
-
-    #[tokio::test]
-    async fn disabled_service_returns_immediately() {
-        let local = NodeId(1);
-        let config = AntiEntropyConfig {
-            enabled: false,
-            ..Default::default()
-        };
-
-        let gossip = Arc::new(GossipHandle::new_for_testing(HashMap::new()));
-        let client = Arc::new(NodeClient::new(gossip.clone(), NodeClientConfig::default()));
-        let storage: Arc<dyn StorageEngine> = Arc::new(MockStorage);
-        let service = AntiEntropyService::new(
-            config,
-            local,
-            PoolId::new(1),
-            vec![local],
-            gossip,
-            client,
-            storage,
-        );
-
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        // Send shutdown immediately.
-        let _ = tx.send(true);
-        service.run(rx).await;
-        // If we get here, the service exited properly.
-    }
-
-    // -----------------------------------------------------------------------
-    // Metrics
-    // -----------------------------------------------------------------------
-
-    fn cut(wall_time: u64) -> HlcTimestamp {
-        HlcTimestamp {
-            wall_time,
-            logical: 0,
-            node_id: 0,
-        }
-    }
-
-    /// The frontier lags by the peer it moved for least recently; a peer it
-    /// never moved for has been waiting since the service was created.
-    #[test]
-    fn the_frontier_lags_by_its_oldest_boundary() {
-        let range = KeyRange::full();
-        let (recent, stale, never) = (NodeId(2), NodeId(3), NodeId(4));
-        let mut frontier = RepairFrontier::new();
-        frontier.advance(&range, recent, cut(90_000));
-        frontier.advance(&range, stale, cut(40_000));
-
-        let lag = |peers: &[NodeId]| frontier_lag_secs(&frontier, &[range], peers, 10_000, 100_000);
-        assert_eq!(lag(&[recent]), 10.0);
-        assert_eq!(lag(&[recent, stale]), 60.0);
-        assert_eq!(lag(&[recent, stale, never]), 90.0);
-        assert_eq!(lag(&[]), 0.0, "a node without peers waits on nobody");
-        assert_eq!(
-            frontier_lag_secs(&frontier, &[], &[recent], 10_000, 100_000),
-            0.0
-        );
-    }
-
-    /// A round with nobody to exchange with is still a round, and leaves the
-    /// frontier where the service found it.
-    #[tokio::test]
-    async fn a_round_without_a_live_peer_is_counted() {
-        let metrics = crate::test_metrics::TestMetrics::install();
-        let service = make_service(NodeId(1), vec![(NodeId(2), NodeStatus::Dead)]);
-        service.init_tree(KeyRange::full(), &[]).await;
-
-        service.run_round().await;
-
-        assert_eq!(
-            metrics.value("s4_anti_entropy_rounds_total", &[]),
-            Some(1.0)
-        );
-        assert_eq!(
-            metrics.value("s4_anti_entropy_divergent_keys_total", &[]),
-            None
-        );
-        let lag = metrics.value("s4_repair_frontier_lag_seconds", &[]).unwrap();
-        assert!((0.0..5.0).contains(&lag), "lag {lag}");
-        let snapshot = service.metrics().snapshot();
-        assert_eq!(
-            snapshot.frontier_lag_secs, lag,
-            "the admin API reads another lag"
-        );
-        assert_eq!(snapshot.last_repair_unix_ms, 0, "nothing was repaired");
-    }
-
-    /// One round against a real peer: of the keys this node holds, only the
-    /// one the peer holds a newer copy of is behind, is counted as divergent
-    /// and is repaired — not the 2^(depth-1) leaf ranges a differing root reports,
-    /// which is what the divergence counter used to add up.
-    #[tokio::test]
-    async fn a_round_counts_the_keys_it_found_behind_and_repaired() {
-        use crate::replica::ReplicaReadHandler;
-        use crate::rpc::server::{NodeRpcServer, RpcServerConfig};
-        use s4_core::storage::BitcaskStorageEngine;
-
-        let metrics = crate::test_metrics::TestMetrics::install();
-        let (local, peer) = (NodeId(1), NodeId(2));
-        let peer_addr: SocketAddr = "127.0.0.1:19830".parse().unwrap();
-
-        async fn storage(dir: &tempfile::TempDir) -> Arc<BitcaskStorageEngine> {
-            Arc::new(
-                BitcaskStorageEngine::new(
-                    dir.path().join("volumes"),
-                    dir.path().join("metadata"),
-                    10 * 1024 * 1024,
-                    4096,
-                    false,
-                )
-                .await
-                .unwrap(),
-            )
-        }
-        async fn put(storage: &BitcaskStorageEngine, key: &str, data: &[u8], wall: Option<u64>) {
-            let mut metadata = HashMap::new();
-            if let Some(wall) = wall {
-                metadata.insert("_s4_hlc_wall".to_string(), wall.to_string());
-                metadata.insert("_s4_hlc_logical".to_string(), "0".to_string());
-                metadata.insert("_s4_hlc_node_id".to_string(), "2".to_string());
-            }
-            storage
-                .put_object(
-                    "__system__",
-                    "__s4_bucket_marker_bucket",
-                    b"1",
-                    "text/plain",
-                    &HashMap::new(),
-                )
-                .await
-                .unwrap();
-            storage.put_object("bucket", key, data, "text/plain", &metadata).await.unwrap();
-        }
-        let service = |node: NodeId, storage: Arc<BitcaskStorageEngine>, members| {
-            let gossip = Arc::new(GossipHandle::new_for_testing(members));
-            let client = Arc::new(NodeClient::new(gossip.clone(), NodeClientConfig::default()));
-            AntiEntropyService::new(
-                AntiEntropyConfig::default(),
-                node,
-                PoolId::new(1),
-                vec![local, peer],
-                gossip,
-                client,
-                storage,
-            )
-        };
-
-        // This node: a copy the peer has overwritten since, and one written
-        // here after the peer's.
-        let local_dir = tempfile::tempdir().unwrap();
-        let local_storage = storage(&local_dir).await;
-        put(&local_storage, "stale", b"old", None).await;
-        put(&local_storage, "newer-here", b"new", None).await;
-
-        // The peer: the newer copy of the first, an older one of the second,
-        // and a key only it has, which is its own round to push.
-        let peer_dir = tempfile::tempdir().unwrap();
-        let peer_storage = storage(&peer_dir).await;
-        put(&peer_storage, "stale", b"new", Some(now_millis() + 60_000)).await;
-        put(&peer_storage, "newer-here", b"old", Some(1_000)).await;
-        put(&peer_storage, "only-on-peer", b"x", Some(1_000)).await;
-        let peer_service = Arc::new(service(peer, peer_storage.clone(), HashMap::new()));
-        peer_service.init_from_storage().await;
-        let mut peer_state = test_node_state(peer, NodeStatus::Alive);
-        peer_state.meta.addr.grpc_addr = peer_addr;
-        let _server = NodeRpcServer::new(
-            peer,
-            Arc::new(peer_state.meta.clone()),
-            Arc::new(GossipHandle::new_for_testing(HashMap::new())),
-        )
-        .with_anti_entropy(peer_service)
-        .with_read_handler(Arc::new(ReplicaReadHandler::new(peer_storage, 1)))
-        .start(RpcServerConfig {
-            bind_addr: peer_addr,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-        let local_service = service(
-            local,
-            local_storage.clone(),
-            HashMap::from([(peer, peer_state)]),
-        );
-        local_service.init_from_storage().await;
-        let before_round = now_millis();
-        local_service.run_round().await;
-
-        let (data, _) = local_storage.get_object("bucket", "stale").await.unwrap();
-        assert_eq!(data, b"new", "the key behind was not repaired");
-        let (data, _) = local_storage.get_object("bucket", "newer-here").await.unwrap();
-        assert_eq!(data, b"new", "a key newer here was overwritten");
-
-        assert_eq!(
-            metrics.value("s4_anti_entropy_rounds_total", &[]),
-            Some(1.0)
-        );
-        assert_eq!(
-            metrics.value("s4_anti_entropy_divergent_keys_total", &[]),
-            Some(1.0)
-        );
-        assert_eq!(
-            metrics.value("s4_anti_entropy_repairs_total", &[("outcome", "ok")]),
-            Some(1.0)
-        );
-        assert_eq!(
-            metrics.value("s4_anti_entropy_repairs_total", &[("outcome", "failed")]),
-            None
-        );
-        let snapshot = local_service.metrics().snapshot();
-        assert_eq!(
-            (
-                snapshot.rounds_completed,
-                snapshot.divergent_keys_found,
-                snapshot.repairs_completed
-            ),
-            (1, 1, 1),
-            "the counters the admin API reads disagree with the metrics"
-        );
-        // The repair moved the frontier for the peer just now.
-        let lag = metrics.value("s4_repair_frontier_lag_seconds", &[]).unwrap();
-        assert!((0.0..5.0).contains(&lag), "lag {lag}");
-        assert_eq!(
-            snapshot.frontier_lag_secs, lag,
-            "the admin API reads another lag"
-        );
-        assert!(
-            (before_round..=now_millis()).contains(&snapshot.last_repair_unix_ms),
-            "last repair at {} is not during the round",
-            snapshot.last_repair_unix_ms
-        );
     }
 }

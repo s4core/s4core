@@ -14,6 +14,19 @@ A bucket can be in one of three versioning states:
 
 Once versioning is enabled on a bucket, it cannot be disabled — only suspended.
 
+## Cluster Mode
+
+Versioning works on a single node only. In cluster mode objects are written and deleted without
+versions, so `PutBucketVersioning` answers `501 NotImplemented`, and `GetBucketVersioning` answers
+with no `Status`: the bucket is unversioned. [Object Lock](object-lock.md), which needs
+versioning, is refused the same way.
+
+Earlier releases accepted `PutBucketVersioning` in cluster mode with `200` and kept no versions
+anyway. A bucket that got versioning that way is named in each node's log at start, under
+`unenforced_bucket_configs` in `/api/admin/cluster/health` and in
+`s4_bucket_unenforced_configs{kind="versioning"}`. Nothing changes for its objects: they never had
+versions.
+
 ## Enable Versioning
 
 ```bash

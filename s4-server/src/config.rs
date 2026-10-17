@@ -127,11 +127,30 @@ pub struct ClusterModeConfig {
     /// GC grace period in days (`S4_GC_GRACE_DAYS`, default: 7).
     pub gc_grace_days: u32,
 
+    /// GC grace period in seconds (`S4_GC_GRACE_SECS`). When set, it is the
+    /// grace period and `S4_GC_GRACE_DAYS` is not read.
+    pub gc_grace_secs: Option<u64>,
+
+    /// Seconds between two tombstone GC passes
+    /// (`S4_TOMBSTONE_GC_INTERVAL_SECS`, default: 21600, six hours).
+    pub tombstone_gc_interval_secs: u64,
+
     /// Maximum downtime (days) before a node must full-bootstrap (`S4_MAX_REJOIN_DOWNTIME_DAYS`).
     pub max_rejoin_downtime_days: u32,
 
     /// Anti-entropy interval in seconds (`S4_ANTI_ENTROPY_INTERVAL_SECS`, default: 600).
     pub anti_entropy_interval_secs: u64,
+
+    /// Whether this node starts anti-entropy rounds (`S4_ANTI_ENTROPY_ENABLED`,
+    /// default: true). A node that does not still answers its peers' rounds.
+    /// `Err` holds a value that is neither on nor off: [`Self::validate`]
+    /// refuses it, so that a kill switch set with a typo is not taken either
+    /// way.
+    pub anti_entropy_enabled: Result<bool, String>,
+
+    /// Most keys one anti-entropy round settles
+    /// (`S4_ANTI_ENTROPY_MAX_KEYS_PER_ROUND`, default: 1000).
+    pub anti_entropy_max_keys_per_round: u32,
 
     /// Scrubber full-scan interval in days (`S4_SCRUBBER_FULL_SCAN_DAYS`, default: 30).
     pub scrubber_full_scan_days: u32,
@@ -150,8 +169,51 @@ pub struct ClusterModeConfig {
     /// Hinted handoff TTL in hours (`S4_HINT_TTL_HOURS`, default: 3).
     pub hint_ttl_hours: u32,
 
+    /// How long a node grants the lease of IAM changes for, in seconds
+    /// (`S4_IAM_LEASE_SECS`, default: 5, at least 1).
+    pub iam_lease_secs: u64,
+
+    /// How long a change of IAM waits for a lease another node holds before
+    /// it is refused with 503 and `Retry-After`, in seconds
+    /// (`S4_IAM_LEASE_WAIT_SECS`, default: 10).
+    pub iam_lease_wait_secs: u64,
+
+    /// How long a node checks IAM credentials against its own copy of IAM
+    /// after a majority of its pool last agreed with it, in seconds
+    /// (`S4_IAM_MAX_STALENESS_SECS`, default: 30); past it, they are refused
+    /// with 503 until a majority agrees again. `0` takes the bound away.
+    pub iam_max_staleness_secs: u64,
+
     /// Drain timeout in seconds for graceful shutdown (`S4_DRAIN_TIMEOUT_SECS`, default: 30).
     pub drain_timeout_secs: u64,
+
+    /// Replicas of every bucket's metadata in the pool
+    /// (`S4_BUCKET_METADATA_REPLICATION_FACTOR`), above the number derived
+    /// from the failures the pool survives; unset, the derived number. `Err`
+    /// holds a value that is not a number: [`Self::validate`] refuses it.
+    pub bucket_metadata_replication_factor: Result<Option<u8>, String>,
+
+    /// Bytes of copies a node sends per second while a grown pool moves its
+    /// keys to their new owners (`S4_REBALANCE_MAX_BYTES_PER_SEC`, default:
+    /// 67108864, 64 MiB).
+    pub rebalance_max_bytes_per_sec: u64,
+
+    /// Concurrent single-to-cluster records (`S4_CLUSTER_MIGRATION_CONCURRENCY`, default 4).
+    pub migration_concurrency: Result<usize, String>,
+
+    /// Keys a node settles per second while a grown pool moves its keys
+    /// (`S4_REBALANCE_MAX_KEYS_PER_SEC`, default: 500).
+    pub rebalance_max_keys_per_sec: u32,
+
+    /// Ranges of the ring a node moves at the same time
+    /// (`S4_REBALANCE_CONCURRENT_RANGES`, default: 2).
+    pub rebalance_concurrent_ranges: usize,
+
+    /// Share of its disk a node receiving keys keeps free
+    /// (`S4_REBALANCE_MIN_FREE_RATIO`, default: 0.10): the move does not begin
+    /// while a new node lacks room for its share with this much left over,
+    /// and ranges sending to a node below it wait.
+    pub rebalance_min_free_ratio: f64,
 }
 
 impl Default for ClusterModeConfig {
@@ -203,6 +265,11 @@ impl Default for ClusterModeConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(7),
+            gc_grace_secs: std::env::var("S4_GC_GRACE_SECS").ok().and_then(|s| s.parse().ok()),
+            tombstone_gc_interval_secs: std::env::var("S4_TOMBSTONE_GC_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(s4_cluster::gc::tombstone::DEFAULT_GC_INTERVAL_SECS),
             max_rejoin_downtime_days: std::env::var("S4_MAX_REJOIN_DOWNTIME_DAYS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -211,6 +278,34 @@ impl Default for ClusterModeConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(600),
+            anti_entropy_enabled: parse_switch(
+                "S4_ANTI_ENTROPY_ENABLED",
+                std::env::var("S4_ANTI_ENTROPY_ENABLED").ok(),
+                true,
+            ),
+            anti_entropy_max_keys_per_round: std::env::var("S4_ANTI_ENTROPY_MAX_KEYS_PER_ROUND")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1000),
+            migration_concurrency: parse_migration_concurrency(
+                std::env::var("S4_CLUSTER_MIGRATION_CONCURRENCY").ok(),
+            ),
+            rebalance_max_bytes_per_sec: std::env::var("S4_REBALANCE_MAX_BYTES_PER_SEC")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(s4_cluster::rebalance::RebalanceConfig::default().max_bytes_per_sec),
+            rebalance_max_keys_per_sec: std::env::var("S4_REBALANCE_MAX_KEYS_PER_SEC")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(s4_cluster::rebalance::RebalanceConfig::default().max_keys_per_sec),
+            rebalance_concurrent_ranges: std::env::var("S4_REBALANCE_CONCURRENT_RANGES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(s4_cluster::rebalance::RebalanceConfig::default().concurrent_ranges),
+            rebalance_min_free_ratio: std::env::var("S4_REBALANCE_MIN_FREE_RATIO")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(s4_cluster::rebalance::RebalanceConfig::default().min_free_ratio),
             scrubber_full_scan_days: std::env::var("S4_SCRUBBER_FULL_SCAN_DAYS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -227,15 +322,149 @@ impl Default for ClusterModeConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(3),
+            iam_lease_secs: std::env::var("S4_IAM_LEASE_SECS")
+                .ok()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(5)
+                .max(1),
+            iam_lease_wait_secs: std::env::var("S4_IAM_LEASE_WAIT_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10),
+            iam_max_staleness_secs: std::env::var("S4_IAM_MAX_STALENESS_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30),
             drain_timeout_secs: std::env::var("S4_DRAIN_TIMEOUT_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30),
+            bucket_metadata_replication_factor: parse_count(
+                "S4_BUCKET_METADATA_REPLICATION_FACTOR",
+                std::env::var("S4_BUCKET_METADATA_REPLICATION_FACTOR").ok(),
+            ),
         }
     }
 }
 
+/// A count of 1 to 255 named `name`, read from `raw`; `None` when unset or
+/// empty. Anything else is an error naming the variable and the value.
+fn parse_migration_concurrency(raw: Option<String>) -> Result<usize, String> {
+    let Some(raw) = raw else {
+        return Ok(4);
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(value) if value > 0 => Ok(value),
+        _ => Err(format!(
+            "S4_CLUSTER_MIGRATION_CONCURRENCY must be a positive integer; got '{raw}'"
+        )),
+    }
+}
+
+fn parse_count(name: &str, raw: Option<String>) -> Result<Option<u8>, String> {
+    let Some(raw) = raw.filter(|raw| !raw.trim().is_empty()) else {
+        return Ok(None);
+    };
+    match raw.trim().parse::<u8>() {
+        Ok(count) if count > 0 => Ok(Some(count)),
+        _ => Err(format!(
+            "{name} must be a number from 1 to 255; got '{raw}'"
+        )),
+    }
+}
+
+/// An on/off setting `name` read from `raw`: `1`, `true`, `yes`, `on` or `0`,
+/// `false`, `no`, `off`, in any case; `default` when unset. Anything else is
+/// an error naming the variable and the value.
+fn parse_switch(name: &str, raw: Option<String>, default: bool) -> Result<bool, String> {
+    let Some(raw) = raw else {
+        return Ok(default);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!(
+            "{name} must be one of true, false, 1, 0, yes, no, on, off; got '{raw}'"
+        )),
+    }
+}
+
 impl ClusterModeConfig {
+    /// How this node holds the lease of IAM changes.
+    pub fn iam_lease(&self) -> s4_cluster::IamLeaseConfig {
+        s4_cluster::IamLeaseConfig {
+            duration: std::time::Duration::from_secs(self.iam_lease_secs.max(1)),
+            wait: std::time::Duration::from_secs(self.iam_lease_wait_secs),
+        }
+    }
+
+    /// How long this node checks IAM credentials against its own copy after a
+    /// majority of its pool last agreed with it; zero for no bound.
+    pub fn iam_max_staleness(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.iam_max_staleness_secs)
+    }
+
+    /// How this node runs anti-entropy rounds. A switch that is neither on
+    /// nor off, which [`Self::validate`] refuses, counts as off.
+    pub fn anti_entropy(&self) -> s4_cluster::AntiEntropyConfig {
+        s4_cluster::AntiEntropyConfig {
+            enabled: self.anti_entropy_enabled.clone().unwrap_or(false),
+            interval_secs: self.anti_entropy_interval_secs,
+            max_keys_per_round: self.anti_entropy_max_keys_per_round,
+        }
+    }
+
+    /// The limits of the move of a grown pool's keys to their new owners.
+    pub fn rebalance(&self) -> s4_cluster::rebalance::RebalanceConfig {
+        s4_cluster::rebalance::RebalanceConfig {
+            max_bytes_per_sec: self.rebalance_max_bytes_per_sec,
+            max_keys_per_sec: self.rebalance_max_keys_per_sec,
+            concurrent_ranges: self.rebalance_concurrent_ranges,
+            min_free_ratio: self.rebalance_min_free_ratio,
+            ..s4_cluster::rebalance::RebalanceConfig::default()
+        }
+    }
+
+    /// How long a tombstone is kept at least (`S4_GC_GRACE_SECS`, or else
+    /// `S4_GC_GRACE_DAYS`): the one value tombstone GC and anti-entropy both
+    /// go by.
+    pub fn gc_grace(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.gc_grace_secs.unwrap_or(u64::from(self.gc_grace_days) * 24 * 3600),
+        )
+    }
+
+    /// How this node removes tombstones. The safety invariant weighs a turn
+    /// of this node's anti-entropy rounds over every other node of the pool
+    /// and the write coordinator's replica write timeout.
+    pub fn tombstone_gc(&self) -> s4_cluster::GcConfig {
+        let peers = self.pool_node_count().saturating_sub(1).max(1);
+        s4_cluster::GcConfig {
+            enabled: true,
+            interval: std::time::Duration::from_secs(self.tombstone_gc_interval_secs),
+            tombstone_policy: s4_cluster::TombstonePolicy {
+                gc_grace: self.gc_grace(),
+                max_rejoin_downtime: std::time::Duration::from_secs(
+                    u64::from(self.max_rejoin_downtime_days) * 24 * 3600,
+                ),
+                repair_turn: std::time::Duration::from_secs(
+                    self.anti_entropy_interval_secs.saturating_mul(peers as u64),
+                ),
+                write_settle: s4_cluster::WriteTimeouts::default().replica_write_timeout,
+            },
+        }
+    }
+
+    /// How many nodes `S4_POOL_NODES` names.
+    fn pool_node_count(&self) -> usize {
+        self.pool_nodes
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .filter(|node| !node.trim().is_empty())
+            .count()
+    }
+
     /// Returns `true` if the server is running in cluster mode.
     pub fn is_cluster(&self) -> bool {
         self.mode == ServerMode::Cluster
@@ -273,6 +502,20 @@ impl ClusterModeConfig {
                 }
                 if self.pool_nodes.is_none() {
                     return Err("S4_POOL_NODES is required in cluster mode".to_string());
+                }
+                if self.migration_concurrency.clone()? == 0 {
+                    return Err(
+                        "S4_CLUSTER_MIGRATION_CONCURRENCY must be a positive integer".into(),
+                    );
+                }
+                self.anti_entropy_enabled.clone()?;
+                self.bucket_metadata_replication_factor.clone()?;
+                self.anti_entropy().validate().map_err(|e| e.to_string())?;
+                self.rebalance().validate().map_err(|e| e.to_string())?;
+                // Tombstones of a pool of erasure-coded objects are the
+                // Enterprise runtime's, with settings of their own.
+                if !pool_storage_class.is_erasure_coded() {
+                    self.tombstone_gc().validate()?;
                 }
                 Ok(())
             }
@@ -460,6 +703,20 @@ pub struct SecurityConfig {
     /// [`crate::secrets::resolve_jwt_secret`].
     #[serde(skip_serializing, default)]
     pub jwt_secret: Option<String>,
+    /// Key the secrets of IAM users' S3 credentials are encrypted with
+    /// (`S4_IAM_ENCRYPTION_KEY`), 32 bytes in hex, the same on every node.
+    /// When unset, the key is derived from `S4_JWT_SECRET`.
+    #[serde(skip_serializing, default)]
+    pub iam_encryption_key: Option<String>,
+    /// The key that replaced `iam_encryption_key` is still read with
+    /// (`S4_IAM_ENCRYPTION_KEY_PREVIOUS`), until every secret is encrypted
+    /// again.
+    #[serde(skip_serializing, default)]
+    pub iam_encryption_key_previous: Option<String>,
+    /// How long the audit log of IAM changes keeps an entry
+    /// (`S4_IAM_AUDIT_RETENTION_DAYS`, default 90; `0` keeps every entry).
+    #[serde(default = "default_iam_audit_retention_days")]
+    pub iam_audit_retention_days: u64,
     /// Audit log path
     pub audit_log_path: Option<PathBuf>,
 }
@@ -494,6 +751,11 @@ impl SecurityConfig {
                 .unwrap_or_else(default_root_username),
             root_password: non_empty(secret("S4_ROOT_PASSWORD")?),
             jwt_secret: non_empty(secret("S4_JWT_SECRET")?),
+            iam_encryption_key: non_empty(secret("S4_IAM_ENCRYPTION_KEY")?),
+            iam_encryption_key_previous: non_empty(secret("S4_IAM_ENCRYPTION_KEY_PREVIOUS")?),
+            iam_audit_retention_days: secret("S4_IAM_AUDIT_RETENTION_DAYS")?
+                .and_then(|days| days.trim().parse().ok())
+                .unwrap_or_else(default_iam_audit_retention_days),
             audit_log_path: default_audit_log_path(),
         })
     }
@@ -508,6 +770,9 @@ impl Default for SecurityConfig {
             root_username: default_root_username(),
             root_password: None,
             jwt_secret: None,
+            iam_encryption_key: None,
+            iam_encryption_key_previous: None,
+            iam_audit_retention_days: default_iam_audit_retention_days(),
             audit_log_path: default_audit_log_path(),
         }
     }
@@ -525,9 +790,22 @@ impl std::fmt::Debug for SecurityConfig {
                 &self.root_password.as_ref().map(|_| REDACTED),
             )
             .field("jwt_secret", &self.jwt_secret.as_ref().map(|_| REDACTED))
+            .field(
+                "iam_encryption_key",
+                &self.iam_encryption_key.as_ref().map(|_| REDACTED),
+            )
+            .field(
+                "iam_encryption_key_previous",
+                &self.iam_encryption_key_previous.as_ref().map(|_| REDACTED),
+            )
+            .field("iam_audit_retention_days", &self.iam_audit_retention_days)
             .field("audit_log_path", &self.audit_log_path)
             .finish()
     }
+}
+
+fn default_iam_audit_retention_days() -> u64 {
+    90
 }
 
 fn default_root_username() -> String {
@@ -577,6 +855,21 @@ pub struct LifecycleConfig {
     /// Dry-run mode - log actions without executing.
     /// Can be set via S4_LIFECYCLE_DRY_RUN environment variable.
     pub dry_run: bool,
+    /// Evaluation interval in seconds; when set, `interval_hours` is not read.
+    /// Can be set via S4_LIFECYCLE_INTERVAL_SECS environment variable.
+    pub interval_secs: Option<u64>,
+    /// Dev and testing only: rules are evaluated as if this many more days
+    /// had passed, so that a test sees an object expire without waiting a
+    /// day. Can be set via S4_LIFECYCLE_DAYS_AHEAD environment variable.
+    pub days_ahead: u32,
+}
+
+impl LifecycleConfig {
+    /// Time between two evaluations, never zero.
+    pub fn interval(&self) -> std::time::Duration {
+        let secs = self.interval_secs.unwrap_or(self.interval_hours.saturating_mul(3600));
+        std::time::Duration::from_secs(secs.max(1))
+    }
 }
 
 /// Volume compaction worker configuration.
@@ -682,6 +975,13 @@ impl Default for LifecycleConfig {
             dry_run: std::env::var("S4_LIFECYCLE_DRY_RUN")
                 .map(|s| s.to_lowercase() == "true" || s == "1")
                 .unwrap_or(false),
+            interval_secs: std::env::var("S4_LIFECYCLE_INTERVAL_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok()),
+            days_ahead: std::env::var("S4_LIFECYCLE_DAYS_AHEAD")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0),
         }
     }
 }
@@ -823,11 +1123,29 @@ mod tests {
     }
 
     #[test]
+    fn iam_encryption_keys_and_audit_retention_are_read() {
+        let unset = security_from(&[("S4_IAM_ENCRYPTION_KEY", "")]);
+        assert!(unset.iam_encryption_key.is_none());
+        assert!(unset.iam_encryption_key_previous.is_none());
+        assert_eq!(unset.iam_audit_retention_days, 90);
+
+        let set = security_from(&[
+            ("S4_IAM_ENCRYPTION_KEY", "aa"),
+            ("S4_IAM_ENCRYPTION_KEY_PREVIOUS", "bb"),
+            ("S4_IAM_AUDIT_RETENTION_DAYS", "7"),
+        ]);
+        assert_eq!(set.iam_encryption_key.as_deref(), Some("aa"));
+        assert_eq!(set.iam_encryption_key_previous.as_deref(), Some("bb"));
+        assert_eq!(set.iam_audit_retention_days, 7);
+    }
+
+    #[test]
     fn security_debug_output_hides_the_secrets() {
         let security = security_from(&[
             ("S4_SECRET_ACCESS_KEY", "secret-key-value"),
             ("S4_ROOT_PASSWORD", "root-password-value"),
             ("S4_JWT_SECRET", "jwt-secret-value"),
+            ("S4_IAM_ENCRYPTION_KEY", "iam-key-value"),
         ]);
         let shown = format!("{security:?}");
 
@@ -835,6 +1153,7 @@ mod tests {
             "secret-key-value",
             "root-password-value",
             "jwt-secret-value",
+            "iam-key-value",
         ] {
             assert!(!shown.contains(secret), "{shown}");
         }
@@ -987,6 +1306,52 @@ mod tests {
         assert!(err.contains("S4_POOL_TYPE=ec requires S4_MODE=cluster"));
     }
 
+    /// The anti-entropy kill switch takes on and off in the usual spellings,
+    /// and refuses anything else instead of reading it either way.
+    #[test]
+    fn the_anti_entropy_switch_is_on_off_or_an_error() {
+        let name = "S4_ANTI_ENTROPY_ENABLED";
+        assert_eq!(parse_switch(name, None, true), Ok(true));
+        for on in ["true", "1", "YES", " on "] {
+            assert_eq!(parse_switch(name, Some(on.into()), false), Ok(true), "{on}");
+        }
+        for off in ["false", "0", "No", "OFF"] {
+            assert_eq!(
+                parse_switch(name, Some(off.into()), true),
+                Ok(false),
+                "{off}"
+            );
+        }
+        for typo in ["disabled", "n", "flase", ""] {
+            let err = parse_switch(name, Some(typo.into()), true).unwrap_err();
+            assert!(err.contains(name) && err.contains(typo), "{err}");
+        }
+    }
+
+    /// Cluster mode refuses a switch that is neither on nor off, and checks
+    /// the interval and the key limit only on a node that starts rounds.
+    #[test]
+    fn cluster_mode_checks_rounds_only_where_they_run() {
+        let cluster = |enabled, interval| ClusterModeConfig {
+            mode: ServerMode::Cluster,
+            seeds: vec!["10.0.1.1:9100".into()],
+            pool_name: Some("pool-1".into()),
+            pool_nodes: Some("node-1:10.0.1.1:9100".into()),
+            anti_entropy_enabled: enabled,
+            anti_entropy_interval_secs: interval,
+            ..ClusterModeConfig::default()
+        };
+        assert!(cluster(Ok(false), 0).validate().is_ok());
+        assert!(cluster(Ok(true), 600).validate().is_ok());
+        let err = cluster(Ok(true), 0).validate().unwrap_err();
+        assert!(err.contains("S4_ANTI_ENTROPY_INTERVAL_SECS"), "{err}");
+        let err = cluster(Err("S4_ANTI_ENTROPY_ENABLED: 'disabled'".into()), 600)
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("S4_ANTI_ENTROPY_ENABLED"), "{err}");
+        assert!(!cluster(Err(String::new()), 600).anti_entropy().enabled);
+    }
+
     #[test]
     fn cluster_mode_parses_ec_pool_type() {
         let config = ClusterModeConfig {
@@ -1002,6 +1367,46 @@ mod tests {
             s4_core::types::StorageClass::ErasureCoded
         );
         assert!(config.validate().is_ok());
+    }
+
+    /// The replicas of the bucket metadata: unset or empty is the derived
+    /// number, a number from 1 to 255 is taken, anything else refused at
+    /// validation with the variable named.
+    #[test]
+    fn the_bucket_metadata_replication_factor_is_a_count() {
+        let name = "S4_BUCKET_METADATA_REPLICATION_FACTOR";
+        assert_eq!(parse_count(name, None), Ok(None));
+        assert_eq!(parse_count(name, Some(" ".into())), Ok(None));
+        assert_eq!(parse_count(name, Some("5".into())), Ok(Some(5)));
+        for bad in ["0", "five", "-1", "256"] {
+            let err = parse_count(name, Some(bad.into())).unwrap_err();
+            assert!(err.contains(name) && err.contains(bad), "{err}");
+        }
+        let config = ClusterModeConfig {
+            mode: ServerMode::Cluster,
+            seeds: vec!["10.0.1.1:9100".into()],
+            pool_name: Some("pool-1".into()),
+            pool_nodes: Some("node-1:10.0.1.1:9100".into()),
+            bucket_metadata_replication_factor: parse_count(name, Some("five".into())),
+            ..ClusterModeConfig::default()
+        };
+        assert!(config.validate().unwrap_err().contains(name));
+    }
+
+    #[test]
+    fn migration_concurrency_defaults_and_rejects_malformed_or_zero() {
+        assert_eq!(parse_migration_concurrency(None), Ok(4));
+        assert_eq!(parse_migration_concurrency(Some("8".into())), Ok(8));
+        for bad in ["0", "", "no", "-1", "184467440737095516160"] {
+            let error = parse_migration_concurrency(Some(bad.into())).unwrap_err();
+            assert!(
+                error.contains("S4_CLUSTER_MIGRATION_CONCURRENCY"),
+                "{error}"
+            );
+            let config = cluster(|config| config.migration_concurrency = Err(error));
+            assert!(config.validate().unwrap_err().contains("S4_CLUSTER_MIGRATION_CONCURRENCY"));
+        }
+        assert!(cluster(|config| config.migration_concurrency = Ok(0)).validate().is_err());
     }
 
     #[test]
@@ -1097,6 +1502,27 @@ mod tests {
         );
     }
 
+    /// A limit of the move of a grown pool that cannot be kept is refused at
+    /// startup rather than taken.
+    #[test]
+    fn cluster_mode_refuses_rebalance_limits_that_cannot_be_kept() {
+        let cluster = |ratio: f64, ranges: usize| ClusterModeConfig {
+            mode: ServerMode::Cluster,
+            seeds: vec!["10.0.1.1:9100".into()],
+            pool_name: Some("pool-1".into()),
+            pool_nodes: Some("node-1:10.0.1.1:9100".into()),
+            rebalance_min_free_ratio: ratio,
+            rebalance_concurrent_ranges: ranges,
+            ..ClusterModeConfig::default()
+        };
+        assert!(cluster(0.1, 2).validate().is_ok());
+        assert!(cluster(1.0, 2).validate().unwrap_err().contains("S4_REBALANCE_MIN_FREE_RATIO"));
+        assert!(cluster(0.1, 0)
+            .validate()
+            .unwrap_err()
+            .contains("S4_REBALANCE_CONCURRENT_RANGES"));
+    }
+
     #[test]
     fn cluster_defaults_match_plan() {
         let config = ClusterModeConfig::default();
@@ -1106,8 +1532,107 @@ mod tests {
         assert_eq!(config.gc_grace_days, 7);
         assert_eq!(config.max_rejoin_downtime_days, 3);
         assert_eq!(config.anti_entropy_interval_secs, 600);
+        assert_eq!(config.anti_entropy_enabled, Ok(true));
+        assert_eq!(config.anti_entropy_max_keys_per_round, 1000);
+        assert_eq!(
+            config.rebalance(),
+            s4_cluster::rebalance::RebalanceConfig::default()
+        );
         assert_eq!(config.scrubber_full_scan_days, 30);
         assert_eq!(config.hint_ttl_hours, 3);
+        assert_eq!(config.iam_lease_secs, 5);
+        assert_eq!(config.iam_lease_wait_secs, 10);
+        assert_eq!(config.iam_max_staleness_secs, 30);
         assert_eq!(config.drain_timeout_secs, 30);
+        assert_eq!(config.gc_grace_secs, None);
+        assert_eq!(config.tombstone_gc_interval_secs, 6 * 3600);
+        assert_eq!(
+            config.gc_grace(),
+            std::time::Duration::from_secs(7 * 24 * 3600)
+        );
+    }
+
+    fn cluster(adjust: impl FnOnce(&mut ClusterModeConfig)) -> ClusterModeConfig {
+        let mut config = ClusterModeConfig {
+            mode: ServerMode::Cluster,
+            seeds: vec!["10.0.1.1:9100".into()],
+            pool_name: Some("pool-1".into()),
+            pool_nodes: Some(
+                "node-1:10.0.1.1:9100,node-2:10.0.1.2:9100,node-3:10.0.1.3:9100".into(),
+            ),
+            ..ClusterModeConfig::default()
+        };
+        adjust(&mut config);
+        config
+    }
+
+    /// `S4_GC_GRACE_SECS`, when set, is the grace period, whatever
+    /// `S4_GC_GRACE_DAYS` says.
+    #[test]
+    fn the_grace_period_in_seconds_wins_over_days() {
+        let config = cluster(|config| {
+            config.gc_grace_days = 30;
+            config.gc_grace_secs = Some(75);
+            config.max_rejoin_downtime_days = 0;
+            config.anti_entropy_interval_secs = 5;
+            config.tombstone_gc_interval_secs = 5;
+        });
+        assert_eq!(config.gc_grace(), std::time::Duration::from_secs(75));
+        let gc = config.tombstone_gc();
+        assert_eq!(gc.interval, std::time::Duration::from_secs(5));
+        // Three nodes: a turn of rounds takes the interval twice.
+        assert_eq!(
+            gc.tombstone_policy.repair_turn,
+            std::time::Duration::from_secs(10)
+        );
+        assert_eq!(
+            gc.tombstone_policy.write_settle,
+            std::time::Duration::from_secs(60)
+        );
+        assert_eq!(config.validate(), Ok(()));
+    }
+
+    /// A grace period no longer than the rejoin downtime, a turn of rounds
+    /// over the peers, the replica write timeout and the clock skew stops a
+    /// node of a replicated pool from starting, and so does a GC interval of
+    /// zero — with an error, not a panic, however large the terms.
+    #[test]
+    fn a_grace_period_that_breaks_the_invariant_is_refused() {
+        let invariant = |grace: u64, interval: u64, nodes: usize| {
+            cluster(|config| {
+                config.gc_grace_secs = Some(grace);
+                config.max_rejoin_downtime_days = 0;
+                config.anti_entropy_interval_secs = interval;
+                config.pool_nodes = Some(
+                    (1..=nodes)
+                        .map(|n| format!("node-{n}:10.0.1.{n}:9100"))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+            })
+            .validate()
+        };
+        assert_eq!(invariant(75, 5, 3), Ok(()));
+        // Shorter than the replica write timeout.
+        let error = invariant(40, 5, 3).unwrap_err();
+        assert!(error.contains("replica write timeout"), "{error}");
+        // Ten nodes, an hour between rounds: a turn takes nine hours.
+        let error = invariant(4000, 3600, 10).unwrap_err();
+        assert!(error.contains("S4_ANTI_ENTROPY_INTERVAL_SECS"), "{error}");
+        assert!(invariant(9 * 3600 + 61, 3600, 10).is_ok());
+        let error = invariant(u64::MAX, u64::MAX, 3).unwrap_err();
+        assert!(error.contains("add up past"), "{error}");
+
+        let never = cluster(|config| config.tombstone_gc_interval_secs = 0);
+        let error = never.validate().unwrap_err();
+        assert!(error.contains("S4_TOMBSTONE_GC_INTERVAL_SECS"), "{error}");
+
+        // A pool of erasure-coded objects has no replicated tombstones.
+        let erasure_coded = cluster(|config| {
+            config.gc_grace_secs = Some(40);
+            config.anti_entropy_interval_secs = 60;
+            config.pool_type = "ec".into();
+        });
+        assert_eq!(erasure_coded.validate(), Ok(()));
     }
 }

@@ -37,7 +37,7 @@ pub const EXTERNAL_DATA_FILE_ID: u32 = u32::MAX - 1;
 ///
 /// This is the "map" that points to where the actual bytes are stored.
 /// For delete markers, `is_delete_marker` is true and no actual data is stored.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexRecord {
     /// Volume file ID (e.g., 42 -> "volume_042.dat").
     /// For delete markers, this is set to `DELETE_MARKER_FILE_ID`.
@@ -142,6 +142,108 @@ pub const OBJECT_TAGS_METADATA_KEY: &str = "_tags";
 /// tiering sweep, and named once so the two cannot drift apart.
 pub const BUCKET_MARKER_KEY_PREFIX: &str = "__s4_bucket_marker_";
 
+/// The bucket of S4's own records: bucket markers and configurations, IAM,
+/// erasure-coding metadata.
+pub const SYSTEM_BUCKET: &str = "__system__";
+
+/// Key prefix of a bucket's CORS configuration in `__system__`.
+pub const CORS_CONFIG_KEY_PREFIX: &str = "__s4_bucket_cors_";
+/// Key prefix of a bucket's versioning status in `__system__`.
+pub const VERSIONING_CONFIG_KEY_PREFIX: &str = "__s4_bucket_versioning_";
+/// Key prefix of a bucket's lifecycle configuration in `__system__`.
+pub const LIFECYCLE_CONFIG_KEY_PREFIX: &str = "__s4_bucket_lifecycle_";
+/// Key prefix of a bucket's policy in `__system__`.
+pub const POLICY_CONFIG_KEY_PREFIX: &str = "__s4_bucket_policy_";
+/// Key prefix of a bucket's Object Lock configuration in `__system__`.
+pub const OBJECT_LOCK_CONFIG_KEY_PREFIX: &str = "__s4_bucket_object_lock_";
+/// Key prefix of a bucket's default encryption in `__system__`.
+pub const ENCRYPTION_CONFIG_KEY_PREFIX: &str = "__s4_bucket_encryption_";
+
+/// Key prefixes of a bucket's configurations in `__system__`, one key per
+/// configuration: `<prefix><bucket>`. Deleting a bucket deletes all six, so a
+/// bucket created again under the same name starts without them.
+pub const BUCKET_CONFIG_KEY_PREFIXES: [&str; 6] = [
+    CORS_CONFIG_KEY_PREFIX,
+    VERSIONING_CONFIG_KEY_PREFIX,
+    LIFECYCLE_CONFIG_KEY_PREFIX,
+    POLICY_CONFIG_KEY_PREFIX,
+    OBJECT_LOCK_CONFIG_KEY_PREFIX,
+    ENCRYPTION_CONFIG_KEY_PREFIX,
+];
+
+/// Whether `key` of `__system__` holds a bucket's configuration.
+pub fn is_bucket_config_key(key: &str) -> bool {
+    BUCKET_CONFIG_KEY_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
+}
+
+/// Whether `bucket/key` is a bucket's marker: the bucket exists while it does.
+pub fn is_bucket_marker(bucket: &str, key: &str) -> bool {
+    bucket == SYSTEM_BUCKET && key.starts_with(BUCKET_MARKER_KEY_PREFIX)
+}
+
+/// Whether `bucket/key` is a bucket's metadata: its marker or one of its
+/// configurations in `__system__`. These keys decide whether a bucket exists
+/// and how it behaves, so cluster placement gives them a replication class of
+/// their own (plan BUCKET-METADATA-REPLICATION.md, decision 1).
+pub fn is_bucket_metadata(bucket: &str, key: &str) -> bool {
+    bucket == SYSTEM_BUCKET
+        && (key.starts_with(BUCKET_MARKER_KEY_PREFIX) || is_bucket_config_key(key))
+}
+
+/// Whether a key spelt `bucket/key` in one string, as the version digests of
+/// the storage name it, is a bucket's metadata ([`is_bucket_metadata`]).
+pub fn is_bucket_metadata_full_key(full_key: &str) -> bool {
+    full_key
+        .split_once('/')
+        .is_some_and(|(bucket, key)| is_bucket_metadata(bucket, key))
+}
+
+/// Key prefix of the IAM records every node of a pool holds a copy of (plan
+/// CLUSTER-IAM-REPLICATION.md, decisions 1 and 2): one record per user,
+/// `__s4_iam_v2_user_<id>`, and root's state, `__s4_iam_v2_root_state`. The
+/// IAM records of earlier releases, `__s4_iam_user_*`, `__s4_iam_username_*`
+/// and `__s4_iam_access_key_*`, are not under it.
+pub const IAM_V2_KEY_PREFIX: &str = "__s4_iam_v2_";
+
+/// Key prefix of a user record an earlier release stored, `__s4_iam_user_<id>`
+/// in `__system__`, on the node it was created through alone. A cluster node
+/// that holds such records serves them as its own IAM until its pool takes
+/// them over (plan CLUSTER-IAM-REPLICATION.md, decision 8); they are not
+/// replicated.
+pub const IAM_LEGACY_USER_KEY_PREFIX: &str = "__s4_iam_user_";
+
+/// Whether `bucket/key` is a record of the cluster's control state: an IAM
+/// record of version 2 in `__system__`. Cluster placement keeps such a key on
+/// every node of the pool, written and read through a majority of them.
+pub fn is_cluster_control(bucket: &str, key: &str) -> bool {
+    bucket == SYSTEM_BUCKET && key.starts_with(IAM_V2_KEY_PREFIX)
+}
+
+/// Whether a key spelt `bucket/key` in one string, as the version digests of
+/// the storage name it, is a record of the cluster's control state
+/// ([`is_cluster_control`]).
+pub fn is_cluster_control_full_key(full_key: &str) -> bool {
+    full_key
+        .split_once('/')
+        .is_some_and(|(bucket, key)| is_cluster_control(bucket, key))
+}
+
+/// Whether a replicated pool keeps `bucket/key` in step by its versions: every
+/// key of a user bucket, the marker that makes a bucket exist (plan
+/// ANTI-ENTROPY.md, decision 3), the bucket's configurations (plan
+/// BUCKET-CONFIG-REPLICATION.md, decision 2) and the IAM records of version 2
+/// (plan CLUSTER-IAM-REPLICATION.md, decision 2).
+///
+/// Such a key has a version digest, and its delete leaves a tombstone, so a
+/// deleted user does not come back from a replica that missed the delete. The
+/// rest of `__system__` — the IAM records of earlier releases, erasure-coding
+/// metadata — has neither: each of those paths orders its records its own
+/// way, and erasure coding removes a record at the HLC of the very generation
+/// it removes, which a tombstone at that HLC would leave in place.
+pub fn is_replicated_key(bucket: &str, key: &str) -> bool {
+    bucket != SYSTEM_BUCKET || is_bucket_metadata(bucket, key) || is_cluster_control(bucket, key)
+}
+
 impl IndexRecord {
     fn default_metadata() -> HashMap<String, String> {
         HashMap::from([(
@@ -217,6 +319,78 @@ impl IndexRecord {
             origin_node_id: 0,
             operation_id: 0,
         }
+    }
+
+    /// Creates the tombstone of a key a replicated pool deleted at the given HLC.
+    ///
+    /// A tombstone is what a cluster replica keeps in place of a deleted key, so
+    /// that the delete has a version: it is ordered against writes of the key by
+    /// its HLC, like any write. It is a delete marker without a version ID,
+    /// stored under the key itself, and carries no data. Versioned delete
+    /// markers live under `key#version_id` and are never tombstones.
+    pub fn new_tombstone(hlc_timestamp: u64, hlc_logical: u32, origin_node_id: u128) -> Self {
+        let now = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0) as u64;
+        Self {
+            file_id: DELETE_MARKER_FILE_ID,
+            offset: 0,
+            size: 0,
+            etag: String::new(),
+            content_type: String::new(),
+            metadata: HashMap::new(),
+            content_hash: [0u8; 32],
+            created_at: now,
+            modified_at: now,
+            version_id: None,
+            is_delete_marker: true,
+            retention_mode: None,
+            retain_until_timestamp: None,
+            legal_hold: false,
+            layout: None,
+            pool_id: 0,
+            hlc_timestamp,
+            hlc_logical,
+            origin_node_id,
+            operation_id: 0,
+        }
+    }
+
+    /// Whether this record is the tombstone of a deleted key (see
+    /// [`new_tombstone`](Self::new_tombstone)) rather than an object or a
+    /// versioned delete marker.
+    pub fn is_tombstone(&self) -> bool {
+        self.is_delete_marker && self.version_id.is_none()
+    }
+
+    /// The order last-writer-wins weighs this record by: its HLC as
+    /// `(wall, logical, origin node)`, or `None` for a record stored without
+    /// one, which is not weighed against a record or a delete that has one.
+    pub fn hlc_order(&self) -> Option<(u64, u32, u128)> {
+        (self.hlc_timestamp > 0).then_some((
+            self.hlc_timestamp,
+            self.hlc_logical,
+            self.origin_node_id,
+        ))
+    }
+
+    /// The HLC every replica and every read path reports for this record, as
+    /// `(wall, logical, origin node)`: its own, or, for a record written
+    /// without one (in single mode, before the node joined a cluster), one
+    /// made up from its modification time with node 0 — no node issued it. A
+    /// copy repaired from such a record is written with that same HLC.
+    pub fn reported_hlc(&self) -> (u64, u32, u128) {
+        self.hlc_order().unwrap_or((self.modified_at / 1_000_000, 0, 0))
+    }
+
+    /// Whether last-writer-wins keeps this stored record rather than take
+    /// `incoming`: both carry an HLC, and this one ranks at least as high
+    /// ([`VersionRank`](crate::storage::VersionRank)). An equal rank is the
+    /// same version, which a repeated write does not write again. A record
+    /// stored without an HLC is not weighed against one that has it.
+    pub fn keeps_over(&self, incoming: &IndexRecord) -> bool {
+        self.hlc_order().is_some()
+            && incoming.hlc_order().is_some()
+            && crate::storage::VersionRank::of_record(self)
+                >= crate::storage::VersionRank::of_record(incoming)
     }
 
     /// Checks if this record represents actual object data (not a delete marker).
@@ -333,6 +507,99 @@ impl IndexRecord {
 mod tests {
     use super::*;
     use crate::types::composite::{BlobId, ObjectLayout};
+
+    /// The marker and the six configurations of a bucket, in `__system__`,
+    /// are its metadata, spelt apart or as one `bucket/key` string; a key of
+    /// a user bucket with the same name, IAM and erasure-coding metadata are
+    /// not.
+    #[test]
+    fn a_bucket_marker_and_its_configurations_are_bucket_metadata() {
+        assert!(is_bucket_marker(SYSTEM_BUCKET, "__s4_bucket_marker_photos"));
+        assert!(!is_bucket_marker(SYSTEM_BUCKET, "__s4_bucket_cors_photos"));
+        assert!(!is_bucket_marker("photos", "__s4_bucket_marker_photos"));
+        let mut keys = vec!["__s4_bucket_marker_photos".to_string()];
+        keys.extend(BUCKET_CONFIG_KEY_PREFIXES.iter().map(|prefix| format!("{prefix}photos")));
+        for key in &keys {
+            assert!(is_bucket_metadata(SYSTEM_BUCKET, key), "{key}");
+            assert!(
+                is_bucket_metadata_full_key(&format!("__system__/{key}")),
+                "{key}"
+            );
+            assert!(!is_bucket_metadata("photos", key), "{key}");
+            assert!(
+                !is_bucket_metadata_full_key(&format!("photos/{key}")),
+                "{key}"
+            );
+            assert!(!is_bucket_metadata_full_key(key), "{key}");
+        }
+        for key in [
+            "__s4_iam_user_alice",
+            "__s4_iam_v2_root_state",
+            "__s4_ec_v1/pools/pool-1",
+        ] {
+            assert!(!is_bucket_metadata(SYSTEM_BUCKET, key), "{key}");
+        }
+        assert!(!is_bucket_metadata_full_key("__system__"));
+    }
+
+    /// User keys, bucket markers and the six bucket configurations are
+    /// replicated keys; IAM and erasure-coding metadata in `__system__` are
+    /// not, nor is a key of a user bucket that only looks like a configuration
+    /// outside `__system__` (it is replicated as any user key).
+    #[test]
+    fn bucket_configurations_are_replicated_keys() {
+        for prefix in BUCKET_CONFIG_KEY_PREFIXES {
+            let key = format!("{prefix}photos");
+            assert!(is_bucket_config_key(&key), "{key}");
+            assert!(is_replicated_key(SYSTEM_BUCKET, &key), "{key}");
+        }
+        assert!(is_replicated_key(
+            SYSTEM_BUCKET,
+            "__s4_bucket_marker_photos"
+        ));
+        assert!(is_replicated_key("photos", "__s4_bucket_cors_x"));
+        assert!(!is_bucket_config_key("__s4_bucket_marker_photos"));
+        for key in [
+            "__s4_iam_user_alice",
+            "__s4_iam_username_alice",
+            "__s4_iam_access_key_S4AKX",
+            "__s4_ec_v1/tiering/photos",
+            "cors/photos",
+        ] {
+            assert!(!is_replicated_key(SYSTEM_BUCKET, key), "{key}");
+        }
+    }
+
+    /// The IAM records of version 2 are the cluster's control state and
+    /// replicated keys; those of earlier releases, a user's key named like
+    /// them and bucket metadata are not control state.
+    #[test]
+    fn iam_records_of_version_2_are_cluster_control_and_replicated() {
+        for key in ["__s4_iam_v2_user_0f8e", "__s4_iam_v2_root_state"] {
+            assert!(is_cluster_control(SYSTEM_BUCKET, key), "{key}");
+            assert!(
+                is_cluster_control_full_key(&format!("__system__/{key}")),
+                "{key}"
+            );
+            assert!(is_replicated_key(SYSTEM_BUCKET, key), "{key}");
+            assert!(!is_bucket_metadata(SYSTEM_BUCKET, key), "{key}");
+            assert!(!is_cluster_control("photos", key), "{key}");
+            assert!(
+                !is_cluster_control_full_key(&format!("photos/{key}")),
+                "{key}"
+            );
+            assert!(!is_cluster_control_full_key(key), "{key}");
+        }
+        for key in [
+            "__s4_iam_user_alice",
+            "__s4_iam_username_alice",
+            "__s4_iam_access_key_S4AKX",
+            "__s4_bucket_marker_photos",
+            "__s4_bucket_cors_photos",
+        ] {
+            assert!(!is_cluster_control(SYSTEM_BUCKET, key), "{key}");
+        }
+    }
 
     #[test]
     fn index_record_new_roundtrip() {

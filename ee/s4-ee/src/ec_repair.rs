@@ -536,7 +536,8 @@ pub struct EcRepairQueueOutcome {
 pub struct EcRepairReport {
     /// Durable repair task after the attempt.
     pub task: EcRepairTaskRecord,
-    /// How the shard was rebuilt.
+    /// How the shard was rebuilt. Unused (`Global`) when an obsolete task
+    /// completes without a repair (`committed == false`).
     pub strategy: RepairStrategy,
     /// Source shards read and verified, including any a widened plan did not
     /// end up using.
@@ -548,6 +549,7 @@ pub struct EcRepairReport {
     /// Bytes this repair moved, by leg and zone scope.
     pub transfers: RepairBytes,
     /// Whether the writer acknowledged durable bytes and local index update.
+    /// False when quorum-confirmed promotion made the task obsolete.
     pub committed: bool,
 }
 
@@ -908,7 +910,33 @@ impl EcRepairCoordinator {
         ensure_task_can_run(&task)?;
 
         let manifest = match self.resolve_manifest(&task, metadata_coordinator).await {
-            Ok(manifest) => manifest,
+            Ok(Some(manifest)) => manifest,
+            Ok(None) => {
+                // Promotion restored the object's hot replicas and committed
+                // its new authority. Rebuilding the old shards serves no
+                // purpose; finish the queued work without claiming a repair
+                // or advancing its frontier.
+                task.status = EcRepairStatus::Succeeded;
+                task.reason = "repair obsolete: metadata quorum confirms Promoted".to_string();
+                task.updated_at = unix_time_nanos();
+                task.next_retry_at = None;
+                self.metadata.put_repair_task(&task).await?;
+                tracing::info!(
+                    repair_id = %task.repair_id,
+                    bucket = %task.object.bucket,
+                    key = %task.object.key,
+                    "EC repair task no longer needed after quorum-confirmed promotion"
+                );
+                return Ok(EcRepairReport {
+                    task,
+                    strategy: RepairStrategy::Global,
+                    verified_source_shards: 0,
+                    skipped_source_shards: 0,
+                    repaired_bytes: 0,
+                    transfers: RepairBytes::default(),
+                    committed: false,
+                });
+            }
             Err(error) => {
                 self.mark_task_failed(task, &error).await?;
                 return Err(error);
@@ -1095,14 +1123,16 @@ impl EcRepairCoordinator {
         &self,
         task: &EcRepairTaskRecord,
         metadata_coordinator: &M,
-    ) -> Result<EcObjectManifest, EcRepairError>
+    ) -> Result<Option<EcObjectManifest>, EcRepairError>
     where
         M: EcRepairMetadataCoordinator,
     {
         if let Some(local) = self.metadata.get_manifest(&task.object).await? {
-            if manifest_matches_task(&local, task) {
+            if manifest_matches_task(&local, task)
+                && (local.state != EcPlacementState::Promoted || local.is_deleted)
+            {
                 ensure_manifest_repairable(&local)?;
-                return Ok(local);
+                return Ok(Some(local));
             }
         }
 
@@ -1121,8 +1151,12 @@ impl EcRepairCoordinator {
                         reason: "quorum manifest does not match repair task identity".to_string(),
                     });
                 }
+                if manifest.state == EcPlacementState::Promoted && !manifest.is_deleted {
+                    manifest.validate()?;
+                    return Ok(None);
+                }
                 ensure_manifest_repairable(&manifest)?;
-                Ok(manifest)
+                Ok(Some(manifest))
             }
             EcManifestReadResult::Tombstone(_) => Err(EcRepairError::Deleted {
                 bucket: task.object.bucket.clone(),
@@ -2308,6 +2342,7 @@ mod tests {
     #[derive(Default)]
     struct MemoryMetadata {
         manifest: Mutex<Option<EcManifestReadResult>>,
+        reads: AtomicU64,
     }
 
     #[async_trait]
@@ -2316,6 +2351,7 @@ mod tests {
             &self,
             _object: &EcObjectVersionKey,
         ) -> Result<EcManifestReadResult, EcRepairError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
             Ok(self.manifest.lock().unwrap().clone().unwrap_or(EcManifestReadResult::Absent))
         }
     }
@@ -2594,6 +2630,210 @@ mod tests {
         assert!(matches!(err, EcRepairError::NotFound { .. }));
         let stored = local.get_repair_task(task.repair_id).await.unwrap().unwrap();
         assert_eq!(stored.status, EcRepairStatus::FailedPermanent);
+    }
+
+    #[tokio::test]
+    async fn quorum_promotion_closes_obsolete_repair_without_shard_io() {
+        for cached in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let local = Arc::new(EcMetadataStore::open(&dir.path().join("ec-meta")).unwrap());
+            let coordinator = coordinator(local.clone(), EcRepairConfig::default());
+            let (manifest, shard_bytes) =
+                encoded_manifest(EcProfileSnapshot::rs_small(), b"promoted");
+            let task = queue_missing(&coordinator, &manifest, 0).await;
+            let mut promoted = manifest.clone();
+            promoted.state = EcPlacementState::Promoted;
+            if cached {
+                local.put_manifest(&promoted).await.unwrap();
+            }
+            let metadata = MemoryMetadata::default();
+            install_manifest(&metadata, &promoted).await;
+            let shards = MemoryShards::new(shard_bytes);
+            let frontier = MemoryFrontier::default();
+
+            let report = coordinator
+                .repair_task(task.repair_id, &metadata, &shards, &shards, &frontier)
+                .await
+                .expect("a quorum-confirmed promotion makes this repair obsolete");
+
+            assert_eq!(metadata.reads.load(Ordering::Relaxed), 1);
+            assert_eq!(report.task.status, EcRepairStatus::Succeeded);
+            assert!(report.task.reason.contains("Promoted"));
+            assert!(!report.committed);
+            assert_eq!(report.repaired_bytes, 0);
+            assert_eq!(report.verified_source_shards, 0);
+            assert_eq!(report.skipped_source_shards, 0);
+            assert_eq!(report.transfers, RepairBytes::default());
+            assert!(shards.reads.lock().unwrap().is_empty());
+            assert!(shards.writes.lock().unwrap().is_empty());
+            assert!(frontier.updates.lock().unwrap().is_empty());
+            let stored = local.get_repair_task(task.repair_id).await.unwrap().unwrap();
+            assert_eq!(stored.status, EcRepairStatus::Succeeded);
+            assert_eq!(stored.next_retry_at, None);
+            assert!(coordinator
+                .repair_next(&metadata, &shards, &shards, &frontier)
+                .await
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_promotion_cannot_skip_a_quorum_that_still_needs_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = Arc::new(EcMetadataStore::open(&dir.path().join("ec-meta")).unwrap());
+        let coordinator = coordinator(local.clone(), EcRepairConfig::default());
+        let (manifest, shard_bytes) = encoded_manifest(EcProfileSnapshot::rs_small(), b"still EC");
+        let task = queue_missing(&coordinator, &manifest, 0).await;
+        let mut cached = manifest.clone();
+        cached.state = EcPlacementState::Promoted;
+        local.put_manifest(&cached).await.unwrap();
+        let metadata = MemoryMetadata::default();
+        install_manifest(&metadata, &manifest).await;
+        let shards = MemoryShards::new(shard_bytes.clone());
+        shards.missing_slots(&[(0, 0)]);
+        let frontier = MemoryFrontier::default();
+
+        let report = coordinator
+            .repair_task(task.repair_id, &metadata, &shards, &shards, &frontier)
+            .await
+            .expect("the quorum still needs this repair");
+
+        assert_eq!(metadata.reads.load(Ordering::Relaxed), 1);
+        assert!(report.committed);
+        assert_eq!(report.task.status, EcRepairStatus::Succeeded);
+        assert_eq!(
+            shards.writes.lock().unwrap().get(&(0, 0)),
+            shard_bytes.get(&(0, 0))
+        );
+        assert_eq!(frontier.updates.lock().unwrap().len(), 1);
+    }
+
+    struct UnavailableMetadata;
+
+    #[async_trait]
+    impl EcRepairMetadataCoordinator for UnavailableMetadata {
+        async fn quorum_read_manifest(
+            &self,
+            _: &EcObjectVersionKey,
+        ) -> Result<EcManifestReadResult, EcRepairError> {
+            Err(EcRepairError::SourceUnavailable {
+                reason: "metadata quorum unavailable".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_promotion_without_a_quorum_keeps_repair_retryable() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = Arc::new(EcMetadataStore::open(&dir.path().join("ec-meta")).unwrap());
+        let coordinator = coordinator(local.clone(), EcRepairConfig::default());
+        let (manifest, shard_bytes) =
+            encoded_manifest(EcProfileSnapshot::rs_small(), b"unavailable");
+        let task = queue_missing(&coordinator, &manifest, 0).await;
+        let mut promoted = manifest;
+        promoted.state = EcPlacementState::Promoted;
+        local.put_manifest(&promoted).await.unwrap();
+        let shards = MemoryShards::new(shard_bytes);
+        let frontier = MemoryFrontier::default();
+
+        let result = coordinator
+            .repair_task(
+                task.repair_id,
+                &UnavailableMetadata,
+                &shards,
+                &shards,
+                &frontier,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(EcRepairError::SourceUnavailable { .. })
+        ));
+        let stored = local.get_repair_task(task.repair_id).await.unwrap().unwrap();
+        assert_eq!(stored.status, EcRepairStatus::FailedRetryable);
+        assert!(stored.next_retry_at.is_some());
+        assert!(shards.reads.lock().unwrap().is_empty());
+        assert!(shards.writes.lock().unwrap().is_empty());
+        assert!(frontier.updates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_promoted_metadata_cannot_complete_a_repair() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = Arc::new(EcMetadataStore::open(&dir.path().join("ec-meta")).unwrap());
+        let coordinator = coordinator(local.clone(), EcRepairConfig::default());
+        let (manifest, shard_bytes) = encoded_manifest(EcProfileSnapshot::rs_small(), b"invalid");
+        let task = queue_missing(&coordinator, &manifest, 0).await;
+        let mut invalid = manifest;
+        invalid.state = EcPlacementState::Promoted;
+        invalid.chunks.clear();
+        let metadata = MemoryMetadata::default();
+        install_manifest(&metadata, &invalid).await;
+        let shards = MemoryShards::new(shard_bytes);
+        let frontier = MemoryFrontier::default();
+
+        assert!(coordinator
+            .repair_task(task.repair_id, &metadata, &shards, &shards, &frontier)
+            .await
+            .is_err());
+        assert_ne!(
+            local.get_repair_task(task.repair_id).await.unwrap().unwrap().status,
+            EcRepairStatus::Succeeded
+        );
+        assert!(shards.reads.lock().unwrap().is_empty());
+        assert!(shards.writes.lock().unwrap().is_empty());
+        assert!(frontier.updates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn promotion_completion_preserves_deleted_and_mismatched_manifest_errors() {
+        for deleted in [false, true] {
+            for cached in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let local = Arc::new(EcMetadataStore::open(&dir.path().join("ec-meta")).unwrap());
+                let coordinator = coordinator(local.clone(), EcRepairConfig::default());
+                let (manifest, shard_bytes) =
+                    encoded_manifest(EcProfileSnapshot::rs_small(), b"guard");
+                let task = queue_missing(&coordinator, &manifest, 0).await;
+                let mut promoted = manifest;
+                promoted.state = EcPlacementState::Promoted;
+                if deleted {
+                    // validate permits a deleted record with empty chunks;
+                    // Promoted must not override its delete marker.
+                    promoted.is_deleted = true;
+                    promoted.chunks.clear();
+                } else {
+                    promoted.operation_id = Uuid::from_u128(0xdef);
+                }
+                if cached {
+                    local.put_manifest(&promoted).await.unwrap();
+                }
+                let metadata = MemoryMetadata::default();
+                install_manifest(&metadata, &promoted).await;
+                let shards = MemoryShards::new(shard_bytes);
+                let frontier = MemoryFrontier::default();
+
+                let result = coordinator
+                    .repair_task(task.repair_id, &metadata, &shards, &shards, &frontier)
+                    .await;
+                if deleted {
+                    assert!(matches!(result, Err(EcRepairError::Deleted { .. })));
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(EcRepairError::ManifestMismatch { .. })
+                    ));
+                }
+                assert_eq!(
+                    local.get_repair_task(task.repair_id).await.unwrap().unwrap().status,
+                    EcRepairStatus::FailedPermanent
+                );
+                assert!(shards.reads.lock().unwrap().is_empty());
+                assert!(shards.writes.lock().unwrap().is_empty());
+                assert!(frontier.updates.lock().unwrap().is_empty());
+            }
+        }
     }
 
     #[tokio::test]

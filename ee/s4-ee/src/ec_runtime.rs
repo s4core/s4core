@@ -2126,6 +2126,8 @@ async fn write_remote_object(
 ) -> Result<(), EcTranscodeError> {
     let node_id = write.node_id;
     let request = proto::WriteBlobRequest {
+        verify_content: false,
+        placement_generation: 0,
         bucket: SYSTEM_BUCKET.to_string(),
         key: write.key,
         content_hash: sha256(&write.data).to_vec(),
@@ -2137,6 +2139,10 @@ async fn write_remote_object(
         coordinator_id: local_node_id.to_bytes().to_vec(),
         operation_id: write.operation_id.to_be_bytes().to_vec(),
         topology_epoch,
+        etag: String::new(),
+        bucket_metadata_stage: 0,
+        repair_copy: false,
+        iam_lease: None,
     };
     let response = rpc_client.send_write(node_id, request).await.map_err(|error| {
         EcTranscodeError::ShardIo {

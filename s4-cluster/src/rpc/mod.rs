@@ -40,7 +40,7 @@ pub mod proto {
 }
 
 pub use client::{probe_node_identity, NodeClient, NodeClientConfig};
-pub use server::{NodeRpcServer, RpcServerConfig};
+pub use server::{NodeRpcServer, PoolMoveResponder, PoolMoveSlot, RpcServerConfig};
 pub use tls::TlsConfig;
 
 /// Default gRPC port for inter-node communication.

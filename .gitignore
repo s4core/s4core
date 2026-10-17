@@ -53,9 +53,19 @@ cache/
 # Script 55 keeps the logs, /metrics snapshots and request ledger of a failed run.
 /cluster-observability-test/
 /ci-cluster-observability/
+# Script 56 keeps the logs, /metrics snapshots and request ledger of a failed run.
+/cluster-anti-entropy-test/
+/ci-cluster-anti-entropy/
 # Script 57 keeps the logs and manifests of a failed run.
 /single-to-cluster-migration-test/
 /ci-single-to-cluster-migration/
+# Script 58 keeps the logs of a failed run, and the part results of every run.
+/bucket-metadata-test/
+# Script 61 keeps the logs, the ledger and the verification reports of a failed run.
+/cluster-pool-growth-test/
+# Script 62 keeps the logs of a failed run, and the group results of every run.
+/cluster-iam-test/
+/ci-cluster-iam/
 
 # Coverage and profiling
 *.profraw
@@ -69,3 +79,8 @@ frontend/
 
 # WARP test files
 scripts/warp-mixed*
+
+# Binaries of the previous release (scripts/ci/fetch-previous-release.sh) and of
+# the release without the IAM fix that scenario 62 --unfixed runs on
+/previous/
+/unfixed/

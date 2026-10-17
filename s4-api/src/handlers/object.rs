@@ -134,6 +134,12 @@ pub async fn put_object(
         return resp;
     }
 
+    if let Some(resp) =
+        super::cluster_unsupported::refuse_object_lock_headers_in_cluster(&state, &headers)
+    {
+        return resp;
+    }
+
     // Get versioning status before acquiring storage lock
     let versioning_status = get_bucket_versioning_status(&state, &bucket).await;
 
@@ -154,16 +160,7 @@ pub async fn put_object(
         .unwrap_or("binary/octet-stream");
 
     // Extract custom metadata (x-amz-meta-* headers)
-    let mut metadata = HashMap::new();
-    for (name, value) in headers.iter() {
-        let name_str = name.as_str().to_lowercase();
-        if name_str.starts_with("x-amz-meta-") {
-            if let Ok(v) = value.to_str() {
-                let meta_key = name_str.strip_prefix("x-amz-meta-").unwrap().to_string();
-                metadata.insert(meta_key, v.to_string());
-            }
-        }
-    }
+    let mut metadata = super::user_metadata(&headers);
 
     // Store x-amz-storage-class as internal metadata (validate first)
     if let Some(sc) = headers.get("x-amz-storage-class").and_then(|v| v.to_str().ok()) {
@@ -444,6 +441,12 @@ pub async fn copy_object(
         &src_bucket, &src_key, &bucket, &key
     );
 
+    if let Some(resp) =
+        super::cluster_unsupported::refuse_object_lock_headers_in_cluster(&state, &headers)
+    {
+        return resp;
+    }
+
     if let Some(resp) = super::check_bucket_cluster(&state, &bucket).await {
         return resp;
     }
@@ -511,19 +514,13 @@ pub async fn copy_object(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("binary/octet-stream")
             .to_string();
-        let mut meta = HashMap::new();
-        for (name, value) in headers.iter() {
-            let name_str = name.as_str().to_lowercase();
-            if name_str.starts_with("x-amz-meta-") {
-                if let Ok(v) = value.to_str() {
-                    let meta_key = name_str.strip_prefix("x-amz-meta-").unwrap().to_string();
-                    meta.insert(meta_key, v.to_string());
-                }
-            }
-        }
+        let meta = super::user_metadata(&headers);
         (ct, meta)
     } else {
-        (src_record.content_type.clone(), src_record.metadata.clone())
+        (
+            src_record.content_type.clone(),
+            super::copied_metadata(&src_record.metadata),
+        )
     };
 
     // Apply storage class from request (overrides source metadata)
@@ -637,19 +634,13 @@ async fn copy_object_cluster(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("binary/octet-stream")
             .to_string();
-        let mut meta = HashMap::new();
-        for (name, value) in headers.iter() {
-            let name_str = name.as_str().to_lowercase();
-            if name_str.starts_with("x-amz-meta-") {
-                if let Ok(v) = value.to_str() {
-                    let meta_key = name_str.strip_prefix("x-amz-meta-").unwrap().to_string();
-                    meta.insert(meta_key, v.to_string());
-                }
-            }
-        }
+        let meta = super::user_metadata(headers);
         (ct, meta)
     } else {
-        (src.content_type.clone(), src.metadata.clone())
+        (
+            src.content_type.clone(),
+            super::copied_metadata(&src.metadata),
+        )
     };
 
     if let Some(sc) = req_storage_class {
@@ -981,16 +972,19 @@ async fn get_ec_object_response(
             )
                 .into_response();
         };
-        return match read_coord.read_stream(&bucket, &key, range.map(ec_range_tuple)).await {
-            Ok(result) => build_quorum_stream_response(result),
+        match read_coord.read_stream(&bucket, &key, range.map(ec_range_tuple)).await {
+            Ok(result) => return build_quorum_stream_response(result),
             Err(ClusterError::ObjectNotFound { .. }) => {
-                super::object_not_found(state, &bucket).await
+                return super::object_not_found(state, &bucket).await
             }
+            // Moved into its erasure set since the HEAD found its hot copies:
+            // read through the EC runtime, as a HEAD a moment later would.
+            Err(ClusterError::ErasureCodedOnly { .. }) => {}
             Err(error) => {
                 error!("EC hot replicated quorum read failed: {:?}", error);
-                cluster_error_to_response(&error)
+                return cluster_error_to_response(&error);
             }
-        };
+        }
     }
 
     match state
@@ -1193,10 +1187,11 @@ fn build_delete_marker_response(query: &ObjectVersionQuery, version_id: &str) ->
 }
 
 /// Deletes the current version of one object through the write quorum, as
-/// DeleteObject and DeleteObjects do in cluster mode: the EC pool's delete
-/// commit is recorded, and an object whose hot copy is gone is deleted from
-/// its erasure-coded layout. `Ok(())` once the delete holds; otherwise the
-/// response the request gets.
+/// DeleteObject and DeleteObjects in cluster mode. The namespace delete must
+/// reach its write quorum before its HLC and operation ID are passed to the
+/// EC runtime, including when the object's bytes have already been purged
+/// from hot storage. `Ok(())` once both commits hold; otherwise the response
+/// the request gets.
 #[allow(clippy::result_large_err)] // Response is the standard axum error type
 pub(crate) async fn delete_object_in_cluster(
     state: &AppState,
@@ -1221,89 +1216,9 @@ pub(crate) async fn delete_object_in_cluster(
             .await
         }
         Err(e) => {
-            let current = ObjectVersionQuery::default();
-            if let Some(response) = try_delete_cold_ec_object_after_hot_delete_failure(
-                state,
-                bucket,
-                key,
-                &current,
-                write_coord,
-            )
-            .await
-            {
-                return if response.status().is_success() {
-                    Ok(())
-                } else {
-                    Err(response)
-                };
-            }
             error!("Quorum delete failed: {:?}", e);
             Err(cluster_error_to_response(&e))
         }
-    }
-}
-
-async fn try_delete_cold_ec_object_after_hot_delete_failure(
-    state: &AppState,
-    bucket: &str,
-    key: &str,
-    query: &ObjectVersionQuery,
-    write_coord: &QuorumWriteCoordinator,
-) -> Option<Response> {
-    if !super::is_ec_cluster_pool(state) || query.version_id.is_some() {
-        return None;
-    }
-
-    let head = match state
-        .ec_object_runtime
-        .head_object(EcObjectHeadRequest {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            version_id: None,
-        })
-        .await
-    {
-        Ok(head) => head,
-        Err(EcObjectReadError::Deleted { .. }) => {
-            return Some(
-                Response::builder().status(StatusCode::NO_CONTENT).body(Body::empty()).unwrap(),
-            );
-        }
-        Err(EcObjectReadError::NotFound { .. } | EcObjectReadError::EnterpriseRequired(_)) => {
-            return None;
-        }
-        Err(error) => return Some(ec_read_error_to_response(error, query)),
-    };
-
-    match head.layout {
-        EcObjectReadLayout::HotReplicated => return None,
-        EcObjectReadLayout::ReplicatedSmall { .. }
-        | EcObjectReadLayout::PackedSegment { .. }
-        | EcObjectReadLayout::ErasureCoded { .. } => {}
-    }
-
-    let delete_hlc = write_coord.next_delete_hlc();
-    let operation_id = uuid::Uuid::new_v4();
-    match super::record_ec_delete_commit(
-        state,
-        bucket.to_string(),
-        key.to_string(),
-        None,
-        delete_hlc,
-        operation_id,
-    )
-    .await
-    {
-        Ok(()) => {
-            info!(
-                bucket = %bucket,
-                key = %key,
-                operation_id = %operation_id,
-                "recorded EC delete tombstone after hot delete path failed"
-            );
-            Some(Response::builder().status(StatusCode::NO_CONTENT).body(Body::empty()).unwrap())
-        }
-        Err(response) => Some(response),
     }
 }
 
@@ -2137,6 +2052,13 @@ pub async fn post_object(
                 // First try IAM storage
                 match state.iam_storage.get_user_by_access_key_with_secret(access_key).await {
                     Ok(Some(user)) => user.secret_key,
+                    // IAM credentials are not checked on this node now; the
+                    // environment's still are.
+                    Err(error @ s4_features::iam::IamError::NotServing(_))
+                        if access_key != state.access_key_id =>
+                    {
+                        return S3Error::ServiceUnavailable(error.to_string()).into_response();
+                    }
                     _ => {
                         // Fallback to legacy ENV credentials
                         if access_key == state.access_key_id {
@@ -2318,6 +2240,10 @@ fn post_object_success_response(
 fn cluster_error_to_response(err: &ClusterError) -> Response {
     super::cluster_error_to_response(err)
 }
+
+#[cfg(test)]
+#[path = "object_delete_tests.rs"]
+mod delete_tests;
 
 #[cfg(test)]
 mod tests {

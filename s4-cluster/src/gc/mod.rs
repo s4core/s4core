@@ -12,21 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Distributed garbage collection for tombstones and dedup entries (Phase 8).
+//! Distributed garbage collection of the tombstones of a replicated pool.
 //!
-//! This module provides safe distributed GC that prevents zombie resurrection
-//! of deleted objects. The core safety properties are:
+//! This module removes tombstones without letting a deleted object come back.
+//! The core safety properties are:
 //!
 //! - Tombstones live for at least `gc_grace` (default: 7 days)
-//! - Tombstone purge requires repair frontier confirmation from ALL replicas
-//! - Nodes offline longer than `max_rejoin_downtime` must full-bootstrap
+//! - A node removes a tombstone only once the repair frontier holds a cut past
+//!   it for every other replica of its key; the node itself is not in the
+//!   condition
+//! - `gc_grace > max_rejoin_downtime + anti-entropy interval + clock skew`
 //!
 //! # Architecture
 //!
 //! ```text
-//! DistributedGcService (background loop, every gc_interval)
-//! ├── Tombstone scan → TombstonePolicy + RepairFrontier check → purge
-//! └── ZombieGuard → node rejoin validation
+//! DistributedGcService (background loop, every S4_TOMBSTONE_GC_INTERVAL_SECS)
+//! └── version digests → tombstones → age + cuts of the other replicas → purge
 //! ```
 
 pub mod service;

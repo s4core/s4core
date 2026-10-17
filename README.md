@@ -222,7 +222,7 @@ complete reference — including erasure coding and licensing — is in
 | `S4_READ_QUORUM` | Read quorum (R) | `2` | `2` |
 | `S4_GC_GRACE_DAYS` | Tombstone GC grace period (days) | `7` | `7` |
 | `S4_MAX_REJOIN_DOWNTIME_DAYS` | Max offline before full bootstrap | `3` | `3` |
-| `S4_ANTI_ENTROPY_INTERVAL_SECS` | Merkle tree exchange interval (s) | `600` | `600` |
+| `S4_ANTI_ENTROPY_INTERVAL_SECS` | Seconds between two anti-entropy rounds of a node | `600` | `600` |
 | `S4_SCRUBBER_FULL_SCAN_DAYS` | CRC32 scrub cycle (days) | `30` | `30` |
 | `S4_HINT_TTL_HOURS` | Hinted handoff TTL (hours) | `3` | `3` |
 
@@ -514,19 +514,20 @@ Full SQL support includes `WHERE`, `GROUP BY`, `ORDER BY`, `LIMIT`, `JOIN`, wind
 
 ### Federation (Distributed Mode)
 
-S4 supports leaderless quorum replication for high availability. A cluster is composed of **server pools** — immutable groups of nodes that replicate data among themselves.
+S4 supports leaderless quorum replication for high availability. A cluster is composed of **server pools** — groups of nodes that replicate data among themselves. An Enterprise pool grows by appending nodes; it moves its data to them in the background while it keeps serving.
 
 **Key properties:**
 - Any node can serve any S3 request (no single leader)
 - Default quorum: N=3, W=2, R=2 — tolerates 1 node failure
 - SWIM gossip for failure detection, gRPC for data replication
-- Buckets are pinned to pools; horizontal scaling = adding new pools
+- Growing a pool: new nodes are appended, existing data moves to them in the background, with progress, pause and resume in the admin API (Enterprise)
 - HLC + LWW conflict resolution (deterministic, no coordination)
 - Hinted handoff: a replica that missed writes is brought up to date once it is back
-- Merkle trees for anti-entropy; the background rounds of a replicated pool are not started yet,
-  so tombstone GC, which waits for them, purges nothing yet
+- Anti-entropy: every node compares itself with its peers round after round, by a digest of each
+  key's version kept beside the record, and brings missed writes and deletes up to date; tombstone
+  GC purges nothing yet
 - Bit rot detection and auto-healing from replicas
-- Rolling upgrades, graceful shutdown on SIGTERM, admin API for cluster health and topology
+- Rolling upgrades, graceful shutdown on SIGTERM, admin API for cluster health, topology and pool growth
 - Prometheus metrics of membership, quorum, peers, hinted handoff and repair on every node, and a
   Grafana dashboard ([Prometheus Metrics → Cluster](docs/06-monitoring/prometheus-metrics.md#cluster))
 

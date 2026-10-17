@@ -8,6 +8,13 @@ CORS allows web browsers to make requests to S4 from a different origin (domain)
 
 If you are building a web application that accesses S4 directly from the browser (e.g., uploading files via JavaScript), you need to configure CORS.
 
+## What S4 Applies
+
+S4 stores the CORS configuration of a bucket and returns it, as S3 does, but it does not answer
+browsers by those rules yet: the server allows requests from every origin, with the methods GET,
+PUT, POST, DELETE and HEAD and any header, whatever the bucket's rules say. Do not rely on a bucket's CORS rules to keep
+other sites out; authentication is what protects your data.
+
 ## Set CORS Configuration
 
 ```bash

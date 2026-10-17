@@ -80,6 +80,19 @@ use tokio::io::AsyncRead;
 /// by hand, so that every layer agrees on what a healing write looks like.
 pub const FORCE_PHYSICAL_WRITE_METADATA_KEY: &str = "_s4_force_physical_write";
 
+/// Metadata key that carries the ETag a replica keeps for a copy repaired
+/// onto it.
+///
+/// A replica computes the ETag of a write from its bytes. A copy of an object
+/// completed by a multipart upload, whose ETag ends in `-N`, would get another
+/// one, and the replicas of one version would disagree about it. So whoever
+/// brings a replica a copy — anti-entropy, hint delivery, read repair — sends
+/// the source's ETag under this key. The storage keeps it as the record's ETag
+/// only for a write that also carries an HLC, the way only cluster nodes
+/// write, and strips the key either way. Clients cannot set it: the HTTP layer
+/// drops user metadata keys starting with `_s4_`.
+pub const REPAIRED_ETAG_METADATA_KEY: &str = "_s4_etag";
+
 /// Whether `metadata` asks for a healing write.
 ///
 /// See [`FORCE_PHYSICAL_WRITE_METADATA_KEY`]. Accepts the spellings an
@@ -138,6 +151,54 @@ pub struct StreamingPutResult {
     pub bytes_written: u64,
     /// ETag of the stored object (MD5 hex string or multipart format).
     pub etag: String,
+}
+
+// ============================================================================
+// Tombstones
+// ============================================================================
+
+/// What became of a write that last-writer-wins weighs
+/// ([`StorageEngine::put_object_outcome`]).
+#[derive(Debug, Clone)]
+pub enum PutOutcome {
+    /// The write is what the key holds now.
+    Stored {
+        /// ETag of the stored object.
+        etag: String,
+    },
+    /// The key holds a newer version — an object or a tombstone — and the
+    /// write was not applied.
+    Superseded {
+        /// The record that outranks the write.
+        by: Box<IndexRecord>,
+    },
+}
+
+/// What the index holds for one key, a tombstone included.
+///
+/// Every read path of [`StorageEngine`] answers a tombstone as an absent
+/// object. A replicated pool needs to tell the two apart — a tombstone is a
+/// version of the key, ordered against its writes by HLC, and absence is
+/// not — and asks with [`StorageEngine::key_version`].
+#[derive(Debug, Clone)]
+pub enum KeyVersion {
+    /// The key holds an object.
+    Live(IndexRecord),
+    /// The key was deleted; the record is its tombstone, with the delete's HLC
+    /// (see [`IndexRecord::new_tombstone`]).
+    Tombstone(IndexRecord),
+    /// The index holds nothing for the key.
+    Absent,
+}
+
+impl KeyVersion {
+    /// The record behind this version, if there is one.
+    pub fn record(&self) -> Option<&IndexRecord> {
+        match self {
+            Self::Live(record) | Self::Tombstone(record) => Some(record),
+            Self::Absent => None,
+        }
+    }
 }
 
 // ============================================================================
@@ -200,6 +261,17 @@ pub struct ListVersionsResult {
     pub next_version_id_marker: Option<String>,
 }
 
+/// A tombstone tombstone GC found due
+/// ([`StorageEngine::gc_tombstones`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TombstoneRef {
+    /// The key as the index holds it: `{bucket}/{key}`, a bucket marker as
+    /// `__system__/__s4_bucket_marker_{bucket}`.
+    pub full_key: String,
+    /// The HLC of its delete: wall time, logical counter, origin node.
+    pub hlc: (u64, u32, u128),
+}
+
 /// Main storage engine interface — the public API contract for all S4 storage operations.
 ///
 /// This trait defines the core operations for storing and retrieving objects,
@@ -258,6 +330,29 @@ pub trait StorageEngine: Send + Sync {
         metadata: &std::collections::HashMap<String, String>,
     ) -> Result<String, StorageError>;
 
+    /// Writes an object like [`put_object`](Self::put_object), and says
+    /// whether the write is what the key holds now or a newer version
+    /// outranked it.
+    ///
+    /// A write that carries an HLC is weighed against the key's version by
+    /// last-writer-wins, and an older one is not applied — which
+    /// `put_object` answers with the ETag the key keeps. A coordinator needs
+    /// to know, to raise its write above that version. The default
+    /// implementation serves an engine without last-writer-wins, where every
+    /// write is stored.
+    async fn put_object_outcome(
+        &self,
+        bucket: &str,
+        key: &str,
+        data: &[u8],
+        content_type: &str,
+        metadata: &std::collections::HashMap<String, String>,
+    ) -> Result<PutOutcome, StorageError> {
+        Ok(PutOutcome::Stored {
+            etag: self.put_object(bucket, key, data, content_type, metadata).await?,
+        })
+    }
+
     /// Reads an object from storage.
     ///
     /// # Arguments
@@ -267,7 +362,9 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// # Returns
     ///
-    /// Returns the object data and metadata.
+    /// Returns the object data and metadata. A tombstone is no object: it
+    /// answers [`StorageError::ObjectNotFound`], as it does on every read path
+    /// below; [`key_version`](Self::key_version) tells the two apart.
     async fn get_object(
         &self,
         bucket: &str,
@@ -308,6 +405,122 @@ pub trait StorageEngine: Send + Sync {
 
         self.delete_object(bucket, key).await?;
         Ok(true)
+    }
+
+    /// Deletes a key of a replicated pool by leaving its tombstone, issued at
+    /// the given HLC.
+    ///
+    /// The tombstone takes the key's place under the same last-writer-wins rule
+    /// as a write: it replaces a record with an older HLC, or one stored
+    /// without an HLC, and leaves a record with the same or a newer HLC alone.
+    /// A key the index does not hold gets a tombstone too, so that a copy that
+    /// missed the delete cannot come back as the newest version. The replaced
+    /// record's data is released in the same batch, as
+    /// [`delete_object`](Self::delete_object) releases it.
+    ///
+    /// Returns `Ok(true)` when the tombstone was written, `Ok(false)` when the
+    /// key holds a version that is not older.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::InvalidOperation`] for a zero HLC: a tombstone without
+    /// one could not be ordered against anything. The default implementation
+    /// refuses as well: an engine has to keep the tombstone itself, and a
+    /// delete in its place would lose exactly what the tombstone is for.
+    async fn tombstone_object(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _hlc_timestamp: u64,
+        _hlc_logical: u32,
+        _origin_node_id: u128,
+    ) -> Result<bool, StorageError> {
+        Err(StorageError::InvalidOperation {
+            operation: "tombstone_object".to_string(),
+            reason: "this storage engine does not keep tombstones".to_string(),
+        })
+    }
+
+    /// Removes the tombstones in `tombstones` that the index still holds as
+    /// found, leaving their keys absent: tombstone GC, once every replica of
+    /// each key has seen its delete. Returns how many it removed.
+    ///
+    /// A key that holds anything else by now — an object, or a tombstone of
+    /// another HLC that replaced the one found — or nothing, is left as it is.
+    /// The removals, their keys' version digests and the raised tombstone
+    /// purge horizon go in one atomic batch, with one sync to disk.
+    ///
+    /// The default implementation serves an engine without tombstones, which
+    /// has none to remove.
+    async fn gc_tombstones(&self, _tombstones: &[TombstoneRef]) -> Result<u64, StorageError> {
+        Ok(0)
+    }
+
+    /// What the index holds for `bucket/key`: an object, a tombstone or
+    /// nothing.
+    ///
+    /// The default implementation serves an engine without tombstones, whose
+    /// [`head_object`](Self::head_object) answers for every version it has.
+    async fn key_version(&self, bucket: &str, key: &str) -> Result<KeyVersion, StorageError> {
+        match self.head_object(bucket, key).await {
+            Ok(record) => Ok(KeyVersion::Live(record)),
+            Err(StorageError::ObjectNotFound { .. }) => Ok(KeyVersion::Absent),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The tombstone horizon of this node's storage: the HLC from which every
+    /// delete on it left a tombstone, once settled
+    /// ([`IndexDb::settle_tombstone_horizon`](crate::storage::IndexDb::settle_tombstone_horizon)).
+    /// An absent key says nothing about a delete older than it.
+    ///
+    /// The default implementation serves an engine without tombstones, which
+    /// has none.
+    async fn tombstone_horizon(
+        &self,
+    ) -> Result<Option<crate::storage::TombstoneHorizon>, StorageError> {
+        Ok(None)
+    }
+
+    /// A page of this node's version digests in ring order
+    /// ([`IndexDb::version_digests_in`](crate::storage::IndexDb::version_digests_in)):
+    /// ring positions from `from` up to `to`, right after the key `after`,
+    /// at most `limit`. Anti-entropy compares replicas by them.
+    ///
+    /// The default implementation serves an engine that keeps no digests.
+    async fn version_digests_in(
+        &self,
+        _from: u64,
+        _to: Option<u64>,
+        _after: Option<&str>,
+        _limit: usize,
+    ) -> Result<Vec<crate::storage::VersionDigestEntry>, StorageError> {
+        Err(StorageError::InvalidOperation {
+            operation: "version digests".to_string(),
+            reason: "this storage keeps none".to_string(),
+        })
+    }
+
+    /// Lists a bucket like [`list_objects_after`](Self::list_objects_after),
+    /// or like [`list_objects`](Self::list_objects) without `start_after`,
+    /// but with tombstones among the entries: a replicated pool merges the
+    /// listings of its nodes by HLC, and a tombstone has to outrank the older
+    /// copy another node still lists.
+    ///
+    /// The default implementation serves an engine without tombstones.
+    async fn list_objects_with_tombstones(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        max_keys: usize,
+    ) -> Result<Vec<(String, IndexRecord)>, StorageError> {
+        match start_after {
+            Some(start_after) => {
+                self.list_objects_after(bucket, prefix, start_after, max_keys).await
+            }
+            None => self.list_objects(bucket, prefix, max_keys).await,
+        }
     }
 
     /// Releases an object's local data while keeping its namespace entry.
@@ -438,7 +651,8 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// # Returns
     ///
-    /// Returns the object metadata.
+    /// Returns the object metadata, or [`StorageError::ObjectNotFound`] for a
+    /// tombstone.
     async fn head_object(&self, bucket: &str, key: &str) -> Result<IndexRecord, StorageError>;
 
     /// Lists objects in a bucket with the given prefix.
@@ -451,7 +665,8 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// # Returns
     ///
-    /// Returns a vector of (key, metadata) pairs.
+    /// Returns a vector of (key, metadata) pairs. Tombstones are not listed,
+    /// and do not count toward `max_keys`.
     async fn list_objects(
         &self,
         bucket: &str,
@@ -470,7 +685,8 @@ pub trait StorageEngine: Send + Sync {
     ///
     /// # Returns
     ///
-    /// Returns a vector of (key, metadata) pairs.
+    /// Returns a vector of (key, metadata) pairs, tombstones left out as in
+    /// [`list_objects`](Self::list_objects).
     async fn list_objects_after(
         &self,
         bucket: &str,

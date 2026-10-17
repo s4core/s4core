@@ -28,6 +28,7 @@ use crate::auth::signature_v4::{
     verify_signature_v4, verify_signature_v4_with_iam_data, SignatureRequestData,
 };
 use crate::auth::Credentials;
+use crate::s3::errors::S3Error;
 use crate::server::AppState;
 
 /// IAM authentication middleware that verifies AWS Signature V4.
@@ -94,7 +95,7 @@ pub async fn iam_auth_middleware(
                 return next.run(request).await;
             }
             Err(e) => {
-                if matches!(e, crate::s3::errors::S3Error::AccessDenied) {
+                if falls_back_to_environment(&e) {
                     debug!("V2 IAM lookup failed, trying legacy ENV credentials");
 
                     if !state.access_key_id.is_empty() && !state.secret_access_key.is_empty() {
@@ -112,7 +113,7 @@ pub async fn iam_auth_middleware(
                             }
                             Err(legacy_err) => {
                                 warn!("V2 legacy ENV authentication also failed: {:?}", legacy_err);
-                                return error_response(&legacy_err);
+                                return error_response(&answer_of(e, legacy_err));
                             }
                         }
                     }
@@ -145,8 +146,9 @@ pub async fn iam_auth_middleware(
             next.run(request).await
         }
         Err(e) => {
-            // If access key not found in IAM, try legacy ENV-based authentication
-            if matches!(e, crate::s3::errors::S3Error::AccessDenied) {
+            // If access key not found in IAM, or IAM credentials are not checked
+            // on this node now, try legacy ENV-based authentication
+            if falls_back_to_environment(&e) {
                 debug!("IAM lookup failed, trying legacy ENV credentials");
 
                 // Check if legacy credentials are configured
@@ -166,7 +168,7 @@ pub async fn iam_auth_middleware(
                         }
                         Err(legacy_err) => {
                             warn!("Legacy ENV authentication also failed: {:?}", legacy_err);
-                            return error_response(&legacy_err);
+                            return error_response(&answer_of(e, legacy_err));
                         }
                     }
                 }
@@ -175,6 +177,32 @@ pub async fn iam_auth_middleware(
             warn!("IAM authentication failed: {:?}", e);
             error_response(&e)
         }
+    }
+}
+
+/// Whether a request IAM did not authenticate is tried against the S3
+/// credentials of the environment: its key is not an IAM user's, or IAM
+/// credentials are not checked on this node now (plan
+/// CLUSTER-IAM-REPLICATION.md, decision 4) — the credentials of the
+/// environment are not IAM's, and work while the node confirms its copy of
+/// IAM.
+fn falls_back_to_environment(iam_error: &S3Error) -> bool {
+    matches!(
+        iam_error,
+        S3Error::AccessDenied | S3Error::ServiceUnavailable(_)
+    )
+}
+
+/// What a request that neither IAM nor the environment authenticated is
+/// answered: unavailable when IAM could not check it now and its key is not
+/// the environment's — it may be an IAM key, which another node, or this one
+/// a moment later, checks — and what the environment's check found
+/// otherwise: a wrong signature with the environment's key is a wrong
+/// signature, whatever IAM's state.
+fn answer_of(iam_error: S3Error, environment_error: S3Error) -> S3Error {
+    match (&iam_error, &environment_error) {
+        (S3Error::ServiceUnavailable(_), S3Error::AccessDenied) => iam_error,
+        _ => environment_error,
     }
 }
 
@@ -187,15 +215,18 @@ fn create_legacy_user(state: &AppState) -> User {
         role: Role::SuperUser,
         access_key: Some(state.access_key_id.clone()),
         secret_key: None,
+        secret_key_sealed: None,
         secret_key_hash: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
         is_active: true,
+        credential_version: 0,
+        created_epoch: 0,
     }
 }
 
 /// Helper to create XML error response.
-fn error_response(e: &crate::s3::errors::S3Error) -> Response {
+fn error_response(e: &S3Error) -> Response {
     let status = e.status_code();
     let xml_body = crate::s3::xml::error_response(
         e.code(),
@@ -204,9 +235,54 @@ fn error_response(e: &crate::s3::errors::S3Error) -> Response {
         &uuid::Uuid::new_v4().to_string(),
     );
 
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/xml")
-        .body(axum::body::Body::from(xml_body))
-        .unwrap()
+    let mut builder = Response::builder().status(status).header("content-type", "application/xml");
+    if matches!(e, S3Error::ServiceUnavailable(_)) {
+        builder = builder.header(axum::http::header::RETRY_AFTER, "1");
+    }
+    builder.body(axum::body::Body::from(xml_body)).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_key_iam_does_not_check_now_is_tried_against_the_environment() {
+        assert!(falls_back_to_environment(&S3Error::AccessDenied));
+        assert!(falls_back_to_environment(&S3Error::ServiceUnavailable(
+            "starting".into()
+        )));
+        assert!(!falls_back_to_environment(&S3Error::SignatureDoesNotMatch));
+    }
+
+    /// A key the environment does not hold is answered 503 while IAM could
+    /// not check it; anything else as the environment's check found.
+    #[test]
+    fn a_key_neither_checks_is_unavailable_only_when_iam_could_not() {
+        assert!(matches!(
+            answer_of(
+                S3Error::ServiceUnavailable("starting".into()),
+                S3Error::AccessDenied
+            ),
+            S3Error::ServiceUnavailable(_)
+        ));
+        assert!(matches!(
+            answer_of(S3Error::AccessDenied, S3Error::SignatureDoesNotMatch),
+            S3Error::SignatureDoesNotMatch
+        ));
+        // The environment's key with a wrong signature: not IAM's to judge.
+        assert!(matches!(
+            answer_of(
+                S3Error::ServiceUnavailable("starting".into()),
+                S3Error::SignatureDoesNotMatch
+            ),
+            S3Error::SignatureDoesNotMatch
+        ));
+        let response = error_response(&S3Error::ServiceUnavailable("starting".into()));
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(response.headers()[axum::http::header::RETRY_AFTER], "1");
+    }
 }

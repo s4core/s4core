@@ -27,9 +27,9 @@ use axum::{
     Router,
 };
 use s4_cluster::{
-    ClusterAdminService, DistributedListCoordinator, EcAdminService, EcObjectRuntime,
-    NoopClusterAdminService, NoopEcAdminService, NoopEcObjectRuntime, QuorumReadCoordinator,
-    QuorumWriteCoordinator,
+    ClusterAdminService, ConfigReadGate, DistributedListCoordinator, EcAdminService,
+    EcObjectRuntime, NoopClusterAdminService, NoopEcAdminService, NoopEcObjectRuntime,
+    QuorumReadCoordinator, QuorumWriteCoordinator,
 };
 use s4_core::storage::{BitcaskStorageEngine, StorageEngine};
 use s4_core::types::StorageClass;
@@ -99,6 +99,24 @@ pub struct AppState {
     /// The usage of the pool a cluster node last counted, reused for a few
     /// seconds by the bucket statistics and `/api/stats`.
     pub usage_cache: Arc<crate::handlers::usage::UsageCache>,
+    /// Whether a cluster node reads bucket configurations through the
+    /// quorums. Closed until every node of the pool adopted the
+    /// configurations it stored before protocol 6; until then a node reads
+    /// its own storage, as an earlier release did.
+    pub config_read_gate: ConfigReadGate,
+    /// The latest count of the versioning and Object Lock configurations a
+    /// cluster node stores and does not enforce, reported by the cluster
+    /// health.
+    pub unenforced_configs: crate::handlers::UnenforcedConfigs,
+    /// The pool taking over the IAM its nodes kept of their own; `None` on a
+    /// single node, whose IAM is all there is.
+    pub iam_adoption: Option<Arc<crate::cluster_iam::ClusterIamAdoption>>,
+    /// How IAM stands on a cluster node — its copy, the pool's agreement with
+    /// it, the lease of IAM changes; `None` on a single node.
+    pub iam_status: Option<Arc<s4_cluster::IamStatusSource>>,
+    /// The same freshness gate used for IAM credentials, checked without
+    /// counting credential refusals by public readiness probes.
+    pub iam_freshness: Option<Arc<s4_cluster::IamFreshness>>,
 }
 
 impl AppState {
@@ -172,6 +190,11 @@ impl AppState {
             ec_object_runtime: Arc::new(NoopEcObjectRuntime),
             cluster_admin_service: Arc::new(NoopClusterAdminService),
             usage_cache: Arc::default(),
+            config_read_gate: ConfigReadGate::default(),
+            unenforced_configs: Default::default(),
+            iam_adoption: None,
+            iam_status: None,
+            iam_freshness: None,
         }
     }
 
@@ -181,10 +204,24 @@ impl AppState {
     /// router starts serving. Every node of a cluster must use the same secret,
     /// or a token issued by one node is rejected by the others.
     pub fn with_jwt_secret(mut self, secret: &str) -> Self {
-        self.auth_service = Arc::new(AuthService::new(
+        let mut auth_service = AuthService::new(
             (*self.iam_storage).clone(),
             JwtManager::new(secret, jwt_lifetime_hours()),
-        ));
+        );
+        if let Some(root) = self.auth_service.root() {
+            auth_service = auth_service.with_root(root.clone());
+        }
+        self.auth_service = Arc::new(auth_service);
+        self
+    }
+
+    /// Makes `root` the root account: logins with its name are checked against
+    /// its configured password, and its id acts as SuperUser.
+    ///
+    /// The root account is not stored. Call [`AuthService::start_root`] once the
+    /// state is built, to end root's earlier sessions after a password change.
+    pub fn with_root_account(mut self, root: s4_features::iam::RootAccount) -> Self {
+        self.auth_service = Arc::new((*self.auth_service).clone().with_root(root));
         self
     }
 
@@ -201,15 +238,82 @@ impl AppState {
     ///
     /// When coordinators are set, handlers route PUT/GET/HEAD/DELETE/LIST
     /// through quorum coordinators instead of the local storage engine.
+    ///
+    /// IAM changes go through them too, under the lease of IAM changes
+    /// `iam_lease` takes, to a majority of the pool, while credentials are
+    /// still checked against this node's own copy (plan
+    /// CLUSTER-IAM-REPLICATION.md, decisions 1 and 3).
     pub fn with_cluster_coordinators(
         mut self,
         write: Arc<QuorumWriteCoordinator>,
         read: Arc<QuorumReadCoordinator>,
         list: Arc<DistributedListCoordinator>,
+        iam_lease: Arc<s4_cluster::IamLeaseHolder>,
     ) -> Self {
+        let iam_storage = self.iam_storage.with_record_store(Arc::new(
+            crate::cluster_iam::ClusterRecordStore::new(write.clone(), iam_lease),
+        ));
+        self.auth_service = Arc::new(self.auth_service.with_storage(iam_storage.clone()));
+        self.iam_storage = Arc::new(iam_storage);
         self.write_coordinator = Some(write);
         self.read_coordinator = Some(read);
         self.list_coordinator = Some(list);
+        self
+    }
+
+    /// Checks IAM credentials only while `freshness` says a majority of the
+    /// pool agrees with this node's copy of IAM (plan
+    /// CLUSTER-IAM-REPLICATION.md, decision 4); root and the S3 credentials
+    /// of the environment are not IAM's and work regardless.
+    pub fn with_iam_freshness(mut self, freshness: Arc<s4_cluster::IamFreshness>) -> Self {
+        self.iam_freshness = Some(freshness.clone());
+        let iam_storage = self.iam_storage.with_credential_gate(Arc::new(
+            crate::cluster_iam::ClusterCredentialGate::new(freshness),
+        ));
+        self.auth_service = Arc::new(self.auth_service.with_storage(iam_storage.clone()));
+        self.iam_storage = Arc::new(iam_storage);
+        self
+    }
+
+    /// Changes IAM only once `adoption`'s gate opens — every node of the pool
+    /// keeps no IAM of its own the pool has not taken over — and answers the
+    /// report and the decision of that adoption (plan
+    /// CLUSTER-IAM-REPLICATION.md, decision 8).
+    pub fn with_iam_adoption(mut self, adoption: crate::cluster_iam::ClusterIamAdoption) -> Self {
+        let iam_storage = self.iam_storage.with_adoption_gate(Arc::new(
+            crate::cluster_iam::ClusterAdoptionGate::new(adoption.gate().clone()),
+        ));
+        self.auth_service = Arc::new(self.auth_service.with_storage(iam_storage.clone()));
+        self.iam_storage = Arc::new(iam_storage);
+        self.iam_adoption = Some(Arc::new(adoption));
+        self
+    }
+
+    /// Answers `GET /api/admin/iam/status` from `status`.
+    pub fn with_iam_status(mut self, status: Arc<s4_cluster::IamStatusSource>) -> Self {
+        self.iam_status = Some(status);
+        self
+    }
+
+    /// Records the IAM changes made through this node under `name` in the
+    /// audit log (plan CLUSTER-IAM-REPLICATION.md, decision 10).
+    pub fn with_iam_node_name(mut self, name: &str) -> Self {
+        let iam_storage = self.iam_storage.with_node_name(name);
+        self.auth_service = Arc::new(self.auth_service.with_storage(iam_storage.clone()));
+        self.iam_storage = Arc::new(iam_storage);
+        self
+    }
+
+    /// Sets the gate that opens the quorum reads of bucket configurations.
+    pub fn with_config_read_gate(mut self, gate: ConfigReadGate) -> Self {
+        self.config_read_gate = gate;
+        self
+    }
+
+    /// Sets the count of unenforced bucket configurations the cluster health
+    /// reports.
+    pub fn with_unenforced_configs(mut self, configs: crate::handlers::UnenforcedConfigs) -> Self {
+        self.unenforced_configs = configs;
         self
     }
 
@@ -1138,13 +1242,19 @@ async fn head_object_router(
 /// # Admin API Routing (JWT-based authentication)
 ///
 /// - `POST /api/admin/login` - Login (no auth required)
-/// - `GET /api/admin/users` - List users (SuperUser only)
+/// - `GET /api/admin/users` - List users, a page at a time (SuperUser only)
 /// - `POST /api/admin/users` - Create user (SuperUser only)
 /// - `GET /api/admin/users/:id` - Get user (SuperUser only)
 /// - `PUT /api/admin/users/:id` - Update user (SuperUser only)
 /// - `DELETE /api/admin/users/:id` - Delete user (SuperUser only)
 /// - `POST /api/admin/users/:id/credentials` - Generate S3 credentials (SuperUser only)
 /// - `DELETE /api/admin/users/:id/credentials` - Delete S3 credentials (SuperUser only)
+/// - `POST /api/admin/users/:id/sessions/revoke` - End a user's sessions (SuperUser only)
+/// - `POST /api/admin/logout` - End the caller's own sessions (any account)
+/// - `GET /api/admin/iam/adoption` - What the nodes keep of their own (SuperUser only)
+/// - `POST /api/admin/iam/adoption` - Take it over as decided (SuperUser only)
+/// - `GET /api/admin/iam/audit` - The audit log of IAM changes (SuperUser only)
+/// - `GET /api/admin/iam/status` - How IAM stands on this node and its pool (SuperUser only)
 pub fn create_router(state: AppState) -> Router {
     // Create a permissive CORS layer for browser-based clients
     // Individual bucket CORS policies are handled at the handler level
@@ -1209,6 +1319,17 @@ pub fn create_router(state: AppState) -> Router {
             "/users/:id/credentials",
             delete(handlers::admin::delete_credentials),
         )
+        .route(
+            "/users/:id/sessions/revoke",
+            post(handlers::admin::revoke_sessions),
+        )
+        .route("/logout", post(handlers::admin::logout))
+        .route(
+            "/iam/adoption",
+            get(handlers::admin::iam_adoption_report).post(handlers::admin::adopt_iam),
+        )
+        .route("/iam/audit", get(handlers::admin::iam_audit))
+        .route("/iam/status", get(handlers::admin::iam_status))
         .route("/bucket-stats", get(handlers::admin::bucket_stats))
         .route(
             "/buckets/:name",
@@ -1233,6 +1354,18 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/cluster/repair-status",
             get(handlers::admin_cluster::repair_status),
+        )
+        .route(
+            "/cluster/rebalance",
+            get(handlers::admin_cluster::rebalance_status),
+        )
+        .route(
+            "/cluster/rebalance/pause",
+            post(handlers::admin_cluster::pause_rebalance),
+        )
+        .route(
+            "/cluster/rebalance/resume",
+            post(handlers::admin_cluster::resume_rebalance),
         )
         .route("/node/health", get(handlers::admin_cluster::node_health))
         .route("/node/drain", post(handlers::admin_cluster::node_drain))
@@ -1366,7 +1499,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/health", get(|| async { StatusCode::OK }))
         // MinIO-compatible health check endpoints (no auth required)
         .route("/minio/health/live", get(|| async { StatusCode::OK }))
-        .route("/minio/health/ready", get(|| async { StatusCode::OK }))
+        .route("/minio/health/ready", get(handlers::readiness::readiness))
         // MinIO-compatible Prometheus metrics endpoints (no auth required)
         .route(
             "/minio/v2/metrics/cluster",

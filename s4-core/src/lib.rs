@@ -29,10 +29,11 @@ pub mod types;
 pub use error::StorageError;
 pub use storage::bitcask::{BitcaskStorageEngine, DiagnosticSnapshot, StorageStats};
 pub use storage::engine::{
-    is_force_physical_write, DeleteMarkerEntry, DeleteResult, ListVersionsResult, ObjectStream,
-    ObjectVersion, ReadOptions, StorageEngine, StreamingPutResult,
-    FORCE_PHYSICAL_WRITE_METADATA_KEY,
+    is_force_physical_write, DeleteMarkerEntry, DeleteResult, KeyVersion, ListVersionsResult,
+    ObjectStream, ObjectVersion, PutOutcome, ReadOptions, StorageEngine, StreamingPutResult,
+    FORCE_PHYSICAL_WRITE_METADATA_KEY, REPAIRED_ETAG_METADATA_KEY,
 };
+pub use storage::placement::{ring_position, ring_position_of};
 pub use storage::version_index::VersionList;
 pub use storage::versioning::{generate_version_id, is_null_version, NULL_VERSION_ID};
 pub use types::{

@@ -778,6 +778,72 @@ async fn test_object_custom_metadata() {
     );
 }
 
+/// User metadata cannot carry S4's own instructions: keys starting with
+/// `_s4_` — the HLC of a replicated write, the ETag of a repaired copy — are
+/// dropped, and the object keeps the ETag of its bytes.
+#[tokio::test]
+async fn reserved_metadata_from_a_client_is_dropped() {
+    let (storage, _temp) = create_test_storage().await;
+    let state = create_test_state(storage, _temp.path()).await;
+    create_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/test-bucket")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let response = create_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/test-bucket/doc.txt")
+                .header("x-amz-meta-_s4_etag", "\"forged-2\"")
+                .header("x-amz-meta-_s4_hlc_wall", "99999999999999")
+                .header("x-amz-meta-_s4_hlc_node_id", "7")
+                .header("x-amz-meta-author", "John Doe")
+                .body(Body::from("hello"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = create_router(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/test-bucket/doc.txt")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let header = |name: &str| response.headers().get(name).map(|v| v.to_str().unwrap().to_string());
+    // MD5 of "hello".
+    assert_eq!(
+        header("etag").as_deref(),
+        Some("\"5d41402abc4b2a76b9719d911017c592\"")
+    );
+    assert_eq!(header("x-amz-meta-author").as_deref(), Some("John Doe"));
+    for reserved in [
+        "x-amz-meta-_s4_etag",
+        "x-amz-meta-_s4_hlc_wall",
+        "x-amz-meta-_s4_hlc_node_id",
+    ] {
+        assert_eq!(header(reserved), None, "{reserved}");
+    }
+    let record =
+        s4_core::StorageEngine::head_object(&*state.storage.read().await, "test-bucket", "doc.txt")
+            .await
+            .unwrap();
+    assert_eq!(record.hlc_timestamp, 0, "a client gave the write an HLC");
+}
+
 // ============================================================================
 // Full workflow test
 // ============================================================================

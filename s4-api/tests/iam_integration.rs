@@ -609,3 +609,97 @@ async fn test_reader_can_get_object() {
     let body = body_to_string(response.into_body()).await;
     assert_eq!(body, "readable content");
 }
+
+// ============================================================================
+// The gate of a cluster node (plan CLUSTER-IAM-REPLICATION.md, decision 4)
+// ============================================================================
+
+/// While a cluster node has not confirmed its copy of IAM with a majority of
+/// its pool, a request signed with an IAM user's key is answered 503 with
+/// `Retry-After` — not 403: the key may be fine, another node checks it — a
+/// login of an IAM user too, while the credentials of the environment and
+/// root work. Once the copy is confirmed, the same key is checked.
+#[tokio::test]
+async fn iam_credentials_wait_for_the_gate_and_the_environment_does_not() {
+    let (storage, temp) = create_test_storage().await;
+    let state = create_test_state(storage, temp.path()).await;
+    let (access_key, secret_key) =
+        create_user_with_credentials(&state, "gated_user", "password123", Role::Writer).await;
+    let freshness = std::sync::Arc::new(s4_cluster::IamFreshness::new(
+        std::time::Duration::from_secs(30),
+    ));
+    let state = state.with_iam_freshness(freshness.clone());
+    let app = create_router(state);
+
+    let response = app
+        .clone()
+        .oneshot(build_signed_request(
+            "GET",
+            "/",
+            &access_key,
+            &secret_key,
+            vec![],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+    assert!(body_to_string(response.into_body())
+        .await
+        .contains("<Code>ServiceUnavailable</Code>"));
+
+    let response = app
+        .clone()
+        .oneshot(build_signed_request(
+            "GET",
+            "/",
+            "test-access-key",
+            "test-secret-key",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the environment's key works"
+    );
+
+    // A wrong secret for the environment's key is still a wrong signature.
+    let response = app
+        .clone()
+        .oneshot(build_signed_request(
+            "GET",
+            "/",
+            "test-access-key",
+            "wrong",
+            vec![],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let login = Request::builder()
+        .method("POST")
+        .uri("/api/admin/login")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            r#"{"username":"gated_user","password":"password123"}"#,
+        ))
+        .unwrap();
+    let response = app.clone().oneshot(login).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    freshness.confirm(std::time::Instant::now());
+    let response = app
+        .oneshot(build_signed_request(
+            "GET",
+            "/",
+            &access_key,
+            &secret_key,
+            vec![],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}

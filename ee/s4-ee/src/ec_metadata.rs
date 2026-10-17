@@ -717,7 +717,9 @@ pub enum EcRepairStatus {
     Queued,
     /// A worker is actively repairing the shard.
     Running,
-    /// Shard was reconstructed, written durably, indexed locally, and frontiers were advanced.
+    /// Task completed: the shard was repaired and its frontier advanced, or
+    /// quorum-confirmed promotion made the repair obsolete. The repair report
+    /// distinguishes the latter with `committed == false` and zero bytes.
     Succeeded,
     /// Repair failed but may succeed later.
     FailedRetryable,

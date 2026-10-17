@@ -145,6 +145,11 @@ pub enum S3Error {
     /// The storage pool has no room left for the object.
     #[error("There is not enough space to store the object")]
     InsufficientStorage,
+
+    /// The node cannot serve the request now; another node, or this one a
+    /// moment later, can. Answered with `Retry-After`.
+    #[error("{0}")]
+    ServiceUnavailable(String),
 }
 
 impl S3Error {
@@ -182,6 +187,7 @@ impl S3Error {
                 "ServerSideEncryptionConfigurationNotFoundError"
             }
             S3Error::InsufficientStorage => "InsufficientStorage",
+            S3Error::ServiceUnavailable(_) => "ServiceUnavailable",
         }
     }
 
@@ -217,6 +223,7 @@ impl S3Error {
             S3Error::InvalidStorageClass => StatusCode::BAD_REQUEST,
             S3Error::ServerSideEncryptionConfigurationNotFound => StatusCode::NOT_FOUND,
             S3Error::InsufficientStorage => StatusCode::INSUFFICIENT_STORAGE,
+            S3Error::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 }
@@ -226,12 +233,14 @@ impl IntoResponse for S3Error {
         let request_id = Uuid::new_v4().to_string();
         let xml_body = xml::error_response(self.code(), &self.to_string(), "", &request_id);
 
-        Response::builder()
+        let mut builder = Response::builder()
             .status(self.status_code())
             .header(header::CONTENT_TYPE, "application/xml")
-            .header("x-amz-request-id", request_id)
-            .body(Body::from(xml_body))
-            .unwrap()
+            .header("x-amz-request-id", request_id);
+        if matches!(self, S3Error::ServiceUnavailable(_)) {
+            builder = builder.header(header::RETRY_AFTER, "1");
+        }
+        builder.body(Body::from(xml_body)).unwrap()
     }
 }
 
@@ -254,6 +263,24 @@ mod tests {
             StatusCode::CONFLICT
         );
         assert_eq!(S3Error::AccessDenied.status_code(), StatusCode::FORBIDDEN);
+    }
+
+    /// A node that cannot check IAM credentials now answers 503 with
+    /// `Retry-After`: the client retries, through another node or later,
+    /// rather than taking its key for a wrong one.
+    #[test]
+    fn service_unavailable_is_503_with_retry_after() {
+        let error = S3Error::ServiceUnavailable("not now".into());
+        assert_eq!(error.code(), "ServiceUnavailable");
+        assert_eq!(error.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers()[header::RETRY_AFTER], "1");
+        assert!(S3Error::AccessDenied
+            .into_response()
+            .headers()
+            .get(header::RETRY_AFTER)
+            .is_none());
     }
 
     /// 507 rather than 500: an operator has to be able to tell "out of space"

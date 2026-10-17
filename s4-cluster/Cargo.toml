@@ -43,6 +43,7 @@ postcard = { version = "1.0", features = ["alloc"] }
 
 # Random number generation (must match foca's rand version)
 rand = "0.9"
+futures = "0.3"
 
 # Binary buffer manipulation (used by foca::Codec)
 bytes = "1"

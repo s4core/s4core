@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use s4_core::{ObjectStream, ReadOptions, StorageEngine};
+use s4_core::{KeyVersion, ObjectStream, ReadOptions, StorageEngine};
 use tracing::{debug, warn};
 
 use crate::error::ClusterError;
@@ -41,6 +41,41 @@ impl ReplicaReadHandler {
         Self {
             storage,
             topology_epoch,
+        }
+    }
+
+    /// Answers `RangeDigests`: a page of this node's version digests at the
+    /// ring positions asked, at most 4 096 of them.
+    pub async fn range_digests(
+        &self,
+        request: &proto::RangeDigestsRequest,
+    ) -> proto::RangeDigestsResponse {
+        let limit = (request.max_keys as usize).clamp(1, 4096);
+        match self
+            .storage
+            .version_digests_in(
+                request.from,
+                request.to,
+                request.after_key.as_deref(),
+                limit,
+            )
+            .await
+        {
+            Ok(page) => proto::RangeDigestsResponse {
+                keys: page
+                    .into_iter()
+                    .map(|entry| proto::RangeKeyDigest {
+                        key: entry.key,
+                        digest: entry.digest.encode().to_vec(),
+                        ring_position: entry.ring_position,
+                    })
+                    .collect(),
+                error: String::new(),
+            },
+            Err(e) => proto::RangeDigestsResponse {
+                keys: Vec::new(),
+                error: e.to_string(),
+            },
         }
     }
 
@@ -70,6 +105,7 @@ impl ReplicaReadHandler {
                     success: true,
                     error: String::new(),
                     data,
+                    etag: record.etag,
                     content_hash: record.content_hash.to_vec(),
                     content_type: record.content_type,
                     metadata: record.metadata,
@@ -77,20 +113,41 @@ impl ReplicaReadHandler {
                     version_id: record.version_id,
                     content_length: record.size,
                     epoch_mismatch: false,
+                    tombstone: false,
                 })
             }
-            Err(e @ s4_core::StorageError::ObjectNotFound { .. }) => Ok(proto::ReadBlobResponse {
-                success: false,
-                error: e.to_string(),
-                data: Vec::new(),
-                content_hash: Vec::new(),
-                content_type: String::new(),
-                metadata: Default::default(),
-                hlc: None,
-                version_id: None,
-                content_length: 0,
-                epoch_mismatch: false,
-            }),
+            Err(e @ s4_core::StorageError::ObjectNotFound { .. }) => {
+                // No object to read; a tombstone is still a version, and the
+                // coordinator orders it by the HLC of its delete.
+                let tombstone = self.tombstone_hlc(&request.bucket, &request.key).await?;
+                Ok(proto::ReadBlobResponse {
+                    success: false,
+                    error: e.to_string(),
+                    data: Vec::new(),
+                    content_hash: Vec::new(),
+                    content_type: String::new(),
+                    metadata: Default::default(),
+                    hlc: tombstone.map(|hlc| hlc.to_proto()),
+                    version_id: None,
+                    content_length: 0,
+                    epoch_mismatch: false,
+                    tombstone: tombstone.is_some(),
+                    etag: String::new(),
+                })
+            }
+            Err(error) => Err(ClusterError::Storage(error.to_string())),
+        }
+    }
+
+    /// The HLC of the tombstone `bucket/key` holds, if it holds one.
+    async fn tombstone_hlc(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<HlcTimestamp>, ClusterError> {
+        match self.storage.key_version(bucket, key).await {
+            Ok(KeyVersion::Tombstone(record)) => Ok(Some(HlcTimestamp::of_record(&record))),
+            Ok(KeyVersion::Live(_) | KeyVersion::Absent) => Ok(None),
             Err(error) => Err(ClusterError::Storage(error.to_string())),
         }
     }
@@ -138,10 +195,10 @@ impl ReplicaReadHandler {
             return Ok(err);
         }
 
-        let result = self.storage.head_object(&request.bucket, &request.key).await;
+        let result = self.storage.key_version(&request.bucket, &request.key).await;
 
         match result {
-            Ok(record) => {
+            Ok(KeyVersion::Live(record)) => {
                 let hlc = HlcTimestamp::of_record(&record);
 
                 debug!(
@@ -168,21 +225,30 @@ impl ReplicaReadHandler {
                     etag: record.etag,
                     epoch_mismatch: false,
                     content_hash: record.content_hash.to_vec(),
+                    tombstone: false,
+                    tombstone_horizon: None,
                 })
             }
-            Err(s4_core::StorageError::ObjectNotFound { .. }) => Ok(proto::HeadObjectResponse {
-                exists: false,
-                error: String::new(),
-                content_type: String::new(),
-                content_length: 0,
-                metadata: Default::default(),
-                hlc: None,
-                version_id: None,
-                etag: String::new(),
-                erasure_coded: false,
-                epoch_mismatch: false,
-                content_hash: Vec::new(),
+            // No object; the tombstone is a version all the same, reported
+            // with the HLC of its delete.
+            Ok(KeyVersion::Tombstone(record)) => Ok(proto::HeadObjectResponse {
+                hlc: Some(HlcTimestamp::of_record(&record).to_proto()),
+                tombstone: true,
+                ..absent_head()
             }),
+            // Nothing at all; the horizon says how far back that holds
+            Ok(KeyVersion::Absent) => {
+                let horizon = self
+                    .storage
+                    .tombstone_horizon()
+                    .await
+                    .map_err(|error| ClusterError::Storage(error.to_string()))?;
+                Ok(proto::HeadObjectResponse {
+                    tombstone_horizon: horizon
+                        .map(|horizon| HlcTimestamp::from(horizon).to_proto()),
+                    ..absent_head()
+                })
+            }
             Err(error) => Err(ClusterError::Storage(error.to_string())),
         }
     }
@@ -217,17 +283,23 @@ impl ReplicaReadHandler {
             request.max_keys as usize
         };
 
-        let result = if request.continuation_token.is_empty() {
-            self.storage.list_objects(&request.bucket, &request.prefix, max_keys + 1).await
-        } else {
+        let start_after =
+            Some(request.continuation_token.as_str()).filter(|token| !token.is_empty());
+        let result = if request.include_tombstones {
             self.storage
-                .list_objects_after(
+                .list_objects_with_tombstones(
                     &request.bucket,
                     &request.prefix,
-                    &request.continuation_token,
+                    start_after,
                     max_keys + 1,
                 )
                 .await
+        } else if let Some(start_after) = start_after {
+            self.storage
+                .list_objects_after(&request.bucket, &request.prefix, start_after, max_keys + 1)
+                .await
+        } else {
+            self.storage.list_objects(&request.bucket, &request.prefix, max_keys + 1).await
         };
 
         match result {
@@ -247,6 +319,7 @@ impl ReplicaReadHandler {
                     }
                     let hlc = HlcTimestamp::of_record(&record);
                     objects.push(proto::ObjectInfo {
+                        tombstone: record.is_tombstone(),
                         key,
                         size: record.size,
                         content_type: record.content_type,
@@ -296,6 +369,8 @@ impl ReplicaReadHandler {
                 version_id: None,
                 content_length: 0,
                 epoch_mismatch: true,
+                tombstone: false,
+                etag: String::new(),
             });
         }
         None
@@ -308,23 +383,34 @@ impl ReplicaReadHandler {
                 request_epoch, "epoch mismatch on replica head"
             );
             return Some(proto::HeadObjectResponse {
-                exists: false,
                 error: format!(
                     "epoch mismatch: local={}, request={}",
                     self.topology_epoch, request_epoch
                 ),
-                content_type: String::new(),
-                content_length: 0,
-                erasure_coded: false,
-                metadata: Default::default(),
-                hlc: None,
-                version_id: None,
-                etag: String::new(),
                 epoch_mismatch: true,
-                content_hash: Vec::new(),
+                ..absent_head()
             });
         }
         None
+    }
+}
+
+/// The answer to a HEAD of a key the replica holds nothing for.
+fn absent_head() -> proto::HeadObjectResponse {
+    proto::HeadObjectResponse {
+        exists: false,
+        error: String::new(),
+        content_type: String::new(),
+        content_length: 0,
+        metadata: Default::default(),
+        hlc: None,
+        version_id: None,
+        etag: String::new(),
+        erasure_coded: false,
+        epoch_mismatch: false,
+        content_hash: Vec::new(),
+        tombstone: false,
+        tombstone_horizon: None,
     }
 }
 
@@ -696,10 +782,122 @@ mod tests {
             max_keys: 100,
             continuation_token: String::new(),
             topology_epoch: 1,
+            include_tombstones: false,
         };
 
         let resp = handler.handle_list(&req).await.unwrap();
         assert!(!resp.objects.is_empty());
         assert!(resp.error.is_empty());
+    }
+
+    // ---- Tombstones over a real gRPC server ----
+
+    /// A replica reports a tombstone as a version: HEAD and read answer that
+    /// the object is not there and give the delete's HLC, and a listing
+    /// shows it when asked to, marked as such. Without being asked it lists
+    /// objects only, which is all a coordinator from before tombstones gets.
+    #[tokio::test]
+    async fn a_replica_reports_a_tombstone_with_its_hlc() {
+        use crate::coordinator::test_pool::{at, Replica, TestPool, BUCKET};
+        use crate::identity::NodeId;
+
+        let pool = TestPool::start(Replica::Up, Replica::Up, 21012).await;
+        pool.put(2, "kept", b"kept", at(10)).await;
+        pool.put(2, "gone", b"gone", at(10)).await;
+        pool.delete(2, "gone", at(20)).await;
+        let node_2 = NodeId(2);
+
+        let head = pool
+            .rpc_client
+            .send_head(
+                node_2,
+                proto::HeadObjectRequest {
+                    bucket: BUCKET.to_string(),
+                    key: "gone".to_string(),
+                    version_id: None,
+                    topology_epoch: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!head.exists && head.tombstone, "{head:?}");
+        assert_eq!(
+            head.hlc.as_ref().map(HlcTimestamp::from_proto),
+            Some(at(20))
+        );
+
+        let read = pool
+            .rpc_client
+            .send_read(
+                node_2,
+                proto::ReadBlobRequest {
+                    bucket: BUCKET.to_string(),
+                    key: "gone".to_string(),
+                    operation_id: uuid::Uuid::new_v4().as_u128().to_be_bytes().to_vec(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!read.success && read.tombstone, "{read:?}");
+        assert_eq!(
+            read.hlc.as_ref().map(HlcTimestamp::from_proto),
+            Some(at(20))
+        );
+
+        let list = |include_tombstones| proto::ListObjectsRequest {
+            bucket: BUCKET.to_string(),
+            max_keys: 10,
+            include_tombstones,
+            ..Default::default()
+        };
+        let listed = pool.rpc_client.send_list_objects(node_2, list(true)).await.unwrap();
+        let entries: Vec<(&str, bool)> =
+            listed.objects.iter().map(|o| (o.key.as_str(), o.tombstone)).collect();
+        assert_eq!(entries, [("gone", true), ("kept", false)]);
+        assert_eq!(
+            listed.objects[0].hlc.as_ref().map(HlcTimestamp::from_proto),
+            Some(at(20))
+        );
+        let listed = pool.rpc_client.send_list_objects(node_2, list(false)).await.unwrap();
+        let entries: Vec<&str> = listed.objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(entries, ["kept"]);
+    }
+
+    /// The fields that report a tombstone are absent from the answers of a
+    /// node before protocol 4, and absent reads as "no tombstone": such a
+    /// node's answer for a key it deleted is what it always was, "not found".
+    #[test]
+    fn an_answer_from_before_tombstones_reports_none() {
+        use prost::Message;
+
+        let old_head = proto::HeadObjectResponse {
+            exists: false,
+            ..Default::default()
+        };
+        let bytes = old_head.encode_to_vec();
+        let decoded = proto::HeadObjectResponse::decode(bytes.as_slice()).unwrap();
+        assert!(!decoded.exists && !decoded.tombstone && decoded.hlc.is_none());
+
+        // Field 12, the tombstone flag, is the one a node at protocol 4 adds
+        // and the only one: a node before it never sends the tag.
+        let marked = proto::HeadObjectResponse {
+            tombstone: true,
+            ..Default::default()
+        };
+        assert_eq!(marked.encode_to_vec(), vec![12 << 3, 1]);
+        assert!(bytes.is_empty());
+
+        let old_read = proto::ReadBlobResponse::decode(
+            proto::ReadBlobResponse {
+                success: false,
+                error: "not found".to_string(),
+                ..Default::default()
+            }
+            .encode_to_vec()
+            .as_slice(),
+        )
+        .unwrap();
+        assert!(!old_read.tombstone && old_read.hlc.is_none());
     }
 }

@@ -2561,6 +2561,21 @@ pub enum EcReadError {
         reason: String,
     },
 
+    /// The object's RF=3 copies hold a version written after the
+    /// replicated-small placement was recorded: the object was overwritten,
+    /// and the placement describes the version before. The copies are the
+    /// object; the placement is stale and the object is read as a hot one.
+    #[error(
+        "EC replicated-small placement of version {placement_hlc:?} is superseded by version \
+         {current_hlc:?}"
+    )]
+    ReplicatedSmallSuperseded {
+        /// The version the placement was recorded for.
+        placement_hlc: HlcTimestamp,
+        /// The version the copies hold now.
+        current_hlc: HlcTimestamp,
+    },
+
     /// EC metadata operation failed.
     #[error(transparent)]
     Metadata(#[from] EcMetadataError),

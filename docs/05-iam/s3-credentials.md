@@ -74,7 +74,15 @@ After revocation, any requests using the old access key will be rejected.
 ## Security Notes
 
 - Access keys are stored in the IAM database
-- Secret keys are stored encrypted (not in plain text)
+- Secret keys are stored encrypted with AES-256-GCM next to their hash: the server needs the key
+  itself to check a request signature. The encryption key is `S4_IAM_ENCRYPTION_KEY`, or one
+  derived from `S4_JWT_SECRET` — see
+  [IAM Encryption Key](../01-getting-started/configuration.md#iam-encryption-key)
+- A secret key appears in clear text only in the answer that issues it: never in another answer,
+  a log or a metric
 - Each user can have at most one active set of S3 credentials
 - Generating new credentials replaces any existing ones
 - Deactivating a user (`is_active: false`) immediately blocks all their S3 requests
+- In cluster mode, credentials work through every node, and every node keeps the secret key,
+  encrypted; the nodes exchange it encrypted too. Every node needs the same encryption key — see
+  [Roles and Permissions → Cluster Mode](roles-and-permissions.md#cluster-mode)
